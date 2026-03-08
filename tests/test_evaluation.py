@@ -184,7 +184,7 @@ class TestEvalScenarios:
         for s in SCENARIOS:
             assert s.name, "Scenario missing name"
             assert s.prompt, "Scenario missing prompt"
-            assert s.expected_agent in ("developer", "ba", "qa"), \
+            assert s.expected_agent in ("coder", "runner", "researcher"), \
                 f"Invalid expected_agent: {s.expected_agent}"
 
     def test_scenario_names_unique(self):

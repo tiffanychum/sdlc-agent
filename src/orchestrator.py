@@ -12,7 +12,7 @@ Architecture:
 from typing import Literal
 from typing_extensions import TypedDict
 
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
 from langgraph.graph import StateGraph, START, END
 
 from src.llm.client import get_llm
@@ -24,6 +24,43 @@ from src.tools.registry import (
     get_git_tools,
     get_web_tools,
 )
+
+
+def _extract_text(content) -> str:
+    """Extract text from LLM response content (handles str or list of blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and "text" in block:
+                parts.append(block["text"])
+        return " ".join(parts)
+    return str(content)
+
+
+def _ensure_messages(messages: list) -> list[BaseMessage]:
+    """Convert dicts to proper LangChain message objects."""
+    result = []
+    for msg in messages:
+        if isinstance(msg, BaseMessage):
+            result.append(msg)
+        elif isinstance(msg, dict):
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "user":
+                result.append(HumanMessage(content=content))
+            elif role == "assistant":
+                result.append(AIMessage(content=content))
+            elif role == "system":
+                result.append(SystemMessage(content=content))
+            else:
+                result.append(HumanMessage(content=content))
+        else:
+            result.append(HumanMessage(content=str(msg)))
+    return result
 
 
 class OrchestratorState(TypedDict):
@@ -59,19 +96,21 @@ async def build_orchestrator():
 
     async def route_request(state: OrchestratorState) -> OrchestratorState:
         """Classify the user request and select the appropriate agent."""
+        msgs = _ensure_messages(state["messages"])
         response = await router_llm.ainvoke([
             SystemMessage(content=ROUTER_PROMPT),
-            *state["messages"],
+            *msgs,
         ])
 
-        selected = response.content.strip().lower().strip('"\'')
+        raw_content = _extract_text(response.content)
+        selected = raw_content.strip().lower().strip('"\'')
         if selected not in AGENT_CONFIGS:
             selected = "coder"
 
         trace_entry = {
             "step": "routing",
             "selected_agent": selected,
-            "reasoning": response.content,
+            "reasoning": raw_content,
         }
 
         return {
@@ -93,7 +132,8 @@ async def build_orchestrator():
         agent_id: str, agent, state: OrchestratorState,
     ) -> OrchestratorState:
         """Execute a specialized agent and record its trace."""
-        result = await agent.ainvoke({"messages": state["messages"]})
+        msgs = _ensure_messages(state["messages"])
+        result = await agent.ainvoke({"messages": msgs})
 
         tool_calls = []
         for msg in result["messages"]:

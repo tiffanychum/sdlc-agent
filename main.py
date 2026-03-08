@@ -65,7 +65,13 @@ async def chat_mode():
                 console.print(f"  [dim]→ {tc['tool']}[/dim]")
 
             last_msg = result["messages"][-1]
-            response = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+            raw = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+            if isinstance(raw, list):
+                response = " ".join(
+                    b if isinstance(b, str) else b.get("text", "") for b in raw
+                )
+            else:
+                response = str(raw)
             console.print(f"\n[bold green]{agent_used}:[/bold green]")
             console.print(Markdown(response))
 
