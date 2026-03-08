@@ -12,12 +12,68 @@ Usage:
 
 import asyncio
 import sys
+import time
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
+from rich.tree import Tree
 
 console = Console()
+
+AGENT_LABELS = {
+    "coder": "Coder Agent (files + git)",
+    "runner": "Runner Agent (shell + tests)",
+    "researcher": "Researcher Agent (web)",
+}
+
+
+def _extract_response(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b if isinstance(b, str) else b.get("text", "") for b in content
+        )
+    return str(content)
+
+
+def _render_trace(trace: list[dict], elapsed: float) -> Tree:
+    """Render the agent execution trace as a Rich tree with step statuses."""
+    tree = Tree("[bold]Agent Workflow[/bold]")
+    step = 1
+
+    for entry in trace:
+        if entry.get("step") == "routing":
+            agent_id = entry.get("selected_agent", "?")
+            label = AGENT_LABELS.get(agent_id, agent_id)
+            tree.add(f"[green]✓[/green] Step {step}: [bold]Route[/bold] → {label}")
+            step += 1
+
+        elif entry.get("step") == "execution":
+            agent_id = entry.get("agent", "?")
+            tool_calls = entry.get("tool_calls", [])
+
+            if tool_calls:
+                for tc in tool_calls:
+                    tool_name = tc.get("tool", "?")
+                    args = tc.get("args", {})
+
+                    args_preview = ", ".join(
+                        f'{k}="{str(v)[:50]}"' for k, v in args.items()
+                    )
+                    node = tree.add(
+                        f"[green]✓[/green] Step {step}: [bold]{tool_name}[/bold]({args_preview})"
+                    )
+                    step += 1
+            else:
+                tree.add(
+                    f"[yellow]![/yellow] Step {step}: [bold]{agent_id}[/bold] responded (no tools called)"
+                )
+                step += 1
+
+    tree.add(f"[blue]●[/blue] Done — {step - 1} step(s) in {elapsed:.1f}s")
+    return tree
 
 
 async def chat_mode():
@@ -28,7 +84,11 @@ async def chat_mode():
         "[bold]SDLC Agent — General-Purpose Coding Assistant[/bold]\n\n"
         "Agents: Coder (files + git), Runner (shell + tests), Researcher (web)\n"
         "Tools: Filesystem, Shell, Git, Web (all via MCP)\n\n"
-        "Type your request and the router will delegate to the right agent.\n"
+        "Try:\n"
+        '  "Read main.py and explain the architecture"\n'
+        '  "List all Python files in src/mcp_servers"\n'
+        '  "Run the tests"\n'
+        '  "Search how to use LangGraph create_react_agent"\n\n'
         "Type 'quit' to exit.",
         title="Welcome",
     ))
@@ -44,39 +104,36 @@ async def chat_mode():
         if user_input.strip().lower() in ("quit", "exit", "q"):
             break
 
-        console.print("[dim]Routing to agent...[/dim]")
+        with console.status("[bold yellow]Working...[/bold yellow]", spinner="dots"):
+            start_time = time.time()
 
-        try:
-            result = await orchestrator.ainvoke({
-                "messages": [{"role": "user", "content": user_input}],
-                "selected_agent": "",
-                "agent_trace": [],
-            })
+            try:
+                result = await orchestrator.ainvoke({
+                    "messages": [{"role": "user", "content": user_input}],
+                    "selected_agent": "",
+                    "agent_trace": [],
+                })
+                elapsed = time.time() - start_time
+            except Exception as e:
+                console.print(f"\n[bold red]Error:[/bold red] {e}")
+                import traceback
+                console.print(f"[dim]{traceback.format_exc()}[/dim]")
+                continue
 
-            agent_used = result.get("selected_agent", "unknown")
-            trace = result.get("agent_trace", [])
-            tool_calls = []
-            for entry in trace:
-                if entry.get("step") == "execution":
-                    tool_calls = entry.get("tool_calls", [])
+        trace = result.get("agent_trace", [])
+        tree = _render_trace(trace, elapsed)
+        console.print()
+        console.print(tree)
 
-            console.print(f"\n[dim]Agent: {agent_used} | Tools called: {len(tool_calls)}[/dim]")
-            for tc in tool_calls:
-                console.print(f"  [dim]→ {tc['tool']}[/dim]")
+        last_msg = result["messages"][-1]
+        response = _extract_response(
+            last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+        )
 
-            last_msg = result["messages"][-1]
-            raw = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
-            if isinstance(raw, list):
-                response = " ".join(
-                    b if isinstance(b, str) else b.get("text", "") for b in raw
-                )
-            else:
-                response = str(raw)
-            console.print(f"\n[bold green]{agent_used}:[/bold green]")
-            console.print(Markdown(response))
-
-        except Exception as e:
-            console.print(f"\n[bold red]Error:[/bold red] {e}")
+        agent_used = result.get("selected_agent", "unknown")
+        console.print()
+        console.print(f"[bold green]{agent_used}:[/bold green]")
+        console.print(Markdown(response))
 
 
 async def eval_mode():
