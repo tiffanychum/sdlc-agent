@@ -1,6 +1,6 @@
-# SDLC Agent — General-Purpose Coding Assistant
+# PoC of SDLC Agent — General-Purpose Coding Assistant
 
-A multi-agent coding assistant (similar to [Manus](https://manus.im) and [Claude Code](https://claude.ai)) that can read/write code, run commands, search the web, and manage git — all through natural language. Built with **LangGraph** for agent orchestration and **MCP (Model Context Protocol)** for standardized agent-to-tool communication.
+A multi-agent coding assistant that can read/write code, run commands, search the web, and manage git — all through natural language. Built with **LangGraph** for agent orchestration and **MCP (Model Context Protocol)** for standardized agent-to-tool communication.
 
 ## What It Does
 
