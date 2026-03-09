@@ -7,4 +7,7 @@ eval/results/
 dist/
 build/
 .ruff_cache/
+data/
+frontend/.next/
+frontend/node_modules/
 venv

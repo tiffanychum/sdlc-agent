@@ -1,15 +1,11 @@
 """
 Automated evaluation pipeline for agent performance assessment.
 
-Runs predefined scenarios against the multi-agent system and measures:
-- Task completion rates
-- Tool-call accuracy
-- Failure recovery
-- Routing correctness
-- Latency
-
-Results are persisted for tracking performance regressions
-across prompt and model updates.
+Supports:
+- Single-model evaluation runs
+- Multi-LLM comparison (run same scenarios with different models)
+- Regression detection between runs
+- Persisting results to DB and JSON
 """
 
 import json
@@ -19,25 +15,33 @@ from datetime import datetime
 
 from src.evaluation.metrics import EvalRunMetric, TaskMetric, ToolCallMetric
 from src.evaluation.scenarios import EvalScenario, SCENARIOS
-from src.orchestrator import build_orchestrator
 from src.config import config
 
 
 class AgentEvaluator:
-    """Runs evaluation scenarios and collects performance metrics."""
 
-    def __init__(self, model: str | None = None, prompt_version: str = "v1"):
+    def __init__(self, model: str = None, prompt_version: str = "v1",
+                 base_url: str = None, api_key: str = None):
         self.model = model or config.llm.model
+        self.base_url = base_url or config.llm.base_url
+        self.api_key = api_key or config.llm.api_key
         self.prompt_version = prompt_version
         self.results_dir = config.eval_output_dir
 
     async def run_evaluation(
         self,
-        scenarios: list[EvalScenario] | None = None,
+        scenarios: list[EvalScenario] = None,
+        team_id: str = "default",
     ) -> EvalRunMetric:
         """Execute all scenarios and return aggregated metrics."""
+        from src.orchestrator import build_orchestrator_from_team
+        from src.db.database import init_db, seed_defaults
+
+        init_db()
+        seed_defaults()
+
         scenarios = scenarios or SCENARIOS
-        orchestrator = await build_orchestrator()
+        orchestrator = await build_orchestrator_from_team(team_id)
 
         run = EvalRunMetric(
             run_id=str(uuid.uuid4())[:8],
@@ -50,14 +54,29 @@ class AgentEvaluator:
             run.tasks.append(task_metric)
 
         self._save_results(run)
+        self._save_to_db(run, team_id)
         return run
 
-    async def _run_scenario(
+    async def run_comparison(
         self,
-        orchestrator,
-        scenario: EvalScenario,
-    ) -> TaskMetric:
-        """Run a single evaluation scenario and collect metrics."""
+        model_configs: list[dict],
+        scenarios: list[EvalScenario] = None,
+        team_id: str = "default",
+    ) -> list[EvalRunMetric]:
+        """Run the same scenarios with multiple LLM configs and return all results."""
+        results = []
+        for mc in model_configs:
+            evaluator = AgentEvaluator(
+                model=mc.get("model", self.model),
+                base_url=mc.get("base_url", self.base_url),
+                api_key=mc.get("api_key", self.api_key),
+                prompt_version=mc.get("prompt_version", self.prompt_version),
+            )
+            run = await evaluator.run_evaluation(scenarios=scenarios, team_id=team_id)
+            results.append(run)
+        return results
+
+    async def _run_scenario(self, orchestrator, scenario: EvalScenario) -> TaskMetric:
         task = TaskMetric(
             task_id=str(uuid.uuid4())[:8],
             scenario_name=scenario.name,
@@ -106,14 +125,14 @@ class AgentEvaluator:
         return task
 
     def _check_success(self, response: str, scenario: EvalScenario) -> bool:
-        """Check if the agent's response meets the success criteria."""
         if not scenario.success_keywords:
             return True
-        response_lower = response.lower()
+        if isinstance(response, list):
+            response = " ".join(str(r) for r in response)
+        response_lower = str(response).lower()
         return any(kw.lower() in response_lower for kw in scenario.success_keywords)
 
     def _save_results(self, run: EvalRunMetric) -> None:
-        """Persist evaluation results for regression tracking."""
         os.makedirs(self.results_dir, exist_ok=True)
         filepath = os.path.join(self.results_dir, f"eval_{run.run_id}_{run.timestamp[:10]}.json")
 
@@ -132,12 +151,8 @@ class AgentEvaluator:
                     "failure_recovery_rate": round(t.failure_recovery_rate, 3),
                     "latency_ms": round(t.latency_ms, 1) if t.latency_ms else None,
                     "tool_calls": [
-                        {
-                            "tool": tc.tool_name,
-                            "correct": tc.was_correct,
-                            "error": tc.error,
-                            "recovered": tc.recovered,
-                        }
+                        {"tool": tc.tool_name, "correct": tc.was_correct,
+                         "error": tc.error, "recovered": tc.recovered}
                         for tc in t.tool_calls
                     ],
                     "error": t.error,
@@ -149,18 +164,42 @@ class AgentEvaluator:
         with open(filepath, "w") as f:
             json.dump(data, f, indent=2)
 
+    def _save_to_db(self, run: EvalRunMetric, team_id: str = None):
+        """Persist evaluation run summary to the database."""
+        try:
+            from src.db.database import get_session
+            from src.db.models import EvalRun
+
+            session = get_session()
+            summary = run.summary()
+            eval_run = EvalRun(
+                id=run.run_id,
+                model=run.model,
+                prompt_version=run.prompt_version,
+                team_id=team_id,
+                num_tasks=summary["num_tasks"],
+                task_completion_rate=summary["task_completion_rate"],
+                routing_accuracy=summary["routing_accuracy"],
+                avg_tool_call_accuracy=summary["avg_tool_call_accuracy"],
+                avg_failure_recovery_rate=summary["avg_failure_recovery_rate"],
+                avg_latency_ms=summary.get("avg_latency_ms"),
+                results_json=summary,
+            )
+            session.add(eval_run)
+            session.commit()
+            session.close()
+        except Exception:
+            pass
+
     @staticmethod
     def compare_runs(run_a: EvalRunMetric, run_b: EvalRunMetric) -> dict:
-        """Compare two evaluation runs to detect performance regressions."""
         a, b = run_a.summary(), run_b.summary()
         comparison = {}
         for key in ["task_completion_rate", "routing_accuracy", "avg_tool_call_accuracy", "avg_failure_recovery_rate"]:
             val_a, val_b = a.get(key, 0), b.get(key, 0)
             delta = val_b - val_a
             comparison[key] = {
-                "before": val_a,
-                "after": val_b,
-                "delta": round(delta, 3),
-                "regression": delta < -0.05,
+                "before": val_a, "after": val_b,
+                "delta": round(delta, 3), "regression": delta < -0.05,
             }
         return comparison
