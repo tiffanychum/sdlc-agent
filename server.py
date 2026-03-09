@@ -498,14 +498,28 @@ def get_eval_run(run_id: str):
     if not run:
         session.close()
         raise HTTPException(404, "Eval run not found")
+    rj = run.results_json or {}
+    import json, os
+    tasks_detail = []
+    results_dir = "eval/results"
+    for fname in os.listdir(results_dir) if os.path.exists(results_dir) else []:
+        if fname.startswith(f"eval_{run_id}"):
+            with open(os.path.join(results_dir, fname)) as f:
+                data = json.load(f)
+                tasks_detail = data.get("tasks", [])
+                break
     result = {
         "id": run.id, "model": run.model, "prompt_version": run.prompt_version,
-        "num_tasks": run.num_tasks, "task_completion_rate": run.task_completion_rate,
-        "routing_accuracy": run.routing_accuracy,
-        "avg_tool_call_accuracy": run.avg_tool_call_accuracy,
-        "avg_failure_recovery_rate": run.avg_failure_recovery_rate,
-        "avg_latency_ms": run.avg_latency_ms,
-        "results_json": run.results_json,
+        "num_tasks": run.num_tasks,
+        "task_success_rate": rj.get("task_success_rate", 0),
+        "tool_accuracy": rj.get("tool_accuracy", 0),
+        "reasoning_quality": rj.get("reasoning_quality", 0),
+        "step_efficiency": rj.get("step_efficiency", 0),
+        "faithfulness": rj.get("faithfulness", 0),
+        "safety_compliance": rj.get("safety_compliance", 0),
+        "routing_accuracy": rj.get("routing_accuracy", 0),
+        "avg_latency_ms": rj.get("avg_latency_ms"),
+        "tasks": tasks_detail,
     }
     session.close()
     return result

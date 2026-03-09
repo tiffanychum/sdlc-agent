@@ -154,32 +154,14 @@ export default function StudioPage() {
 
       {team && (
         <div className="space-y-5">
-          {/* Strategy */}
-          <section className="card">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-sm font-medium">Decision Strategy</h2>
-              <button onClick={rebuild} className="btn-secondary !text-xs !py-1 !px-2.5">Rebuild</button>
-            </div>
-            <div className="grid grid-cols-4 gap-2">
-              {TEAM_STRATEGIES.map(s => (
-                <button key={s.v} onClick={() => updateStrategy(s.v)}
-                  className={`text-left p-2.5 rounded-lg text-xs border transition-all ${
-                    team.decision_strategy === s.v
-                      ? "border-[var(--accent)] bg-[var(--accent-light)] text-[var(--accent)]"
-                      : "border-[var(--border)] text-[var(--text-muted)] hover:border-[var(--text-muted)]"
-                  }`}>
-                  <div className="font-medium">{s.l}</div>
-                  <div className="mt-0.5 opacity-70 text-[11px]">{s.d}</div>
-                </button>
-              ))}
-            </div>
-          </section>
-
           {/* Agents */}
           <section className="card">
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-sm font-medium">Agents ({team.agents?.length || 0})</h2>
-              <button onClick={() => setShowAgent(true)} className="btn-primary !text-xs">+ Add Agent</button>
+              <div className="flex gap-2">
+                <button onClick={rebuild} className="btn-secondary !text-xs">Rebuild</button>
+                <button onClick={() => setShowAgent(true)} className="btn-primary !text-xs">+ Add Agent</button>
+              </div>
             </div>
 
             <div className="space-y-2.5">

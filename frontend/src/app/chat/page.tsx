@@ -10,16 +10,26 @@ interface Message {
   toolCalls?: ToolCall[]; trace?: TraceInfo;
 }
 
+const STORAGE_KEY = "sdlc_agent_chat_history";
 const TYPE_DOT: Record<string, string> = {
-  routing: "bg-blue-500",
-  llm_call: "bg-purple-500",
-  tool_call: "bg-green-500",
+  routing: "bg-blue-500", llm_call: "bg-purple-500", tool_call: "bg-green-500",
 };
+
+function loadHistory(): Message[] {
+  if (typeof window === "undefined") return [];
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"); }
+  catch { return []; }
+}
+
+function saveHistory(msgs: Message[]) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(msgs.slice(-50))); }
+  catch {}
+}
 
 export default function ChatPage() {
   const [teams, setTeams] = useState<any[]>([]);
   const [teamId, setTeamId] = useState("default");
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<Message[]>(loadHistory);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [activeTrace, setActiveTrace] = useState<TraceInfo | null>(null);
@@ -27,6 +37,7 @@ export default function ChatPage() {
 
   useEffect(() => { api.teams.list().then(setTeams); }, []);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+  useEffect(() => { saveHistory(messages); }, [messages]);
 
   async function send() {
     if (!input.trim() || loading) return;
@@ -45,17 +56,28 @@ export default function ChatPage() {
     } finally { setLoading(false); }
   }
 
+  function clearHistory() {
+    setMessages([]);
+    setActiveTrace(null);
+    localStorage.removeItem(STORAGE_KEY);
+  }
+
   const latestTrace = activeTrace || messages.filter(m => m.trace).slice(-1)[0]?.trace;
 
   return (
     <div className="flex gap-5 h-[calc(100vh-4rem)]">
-      {/* Chat Panel - 60% */}
+      {/* Chat Panel */}
       <div className="flex flex-col flex-[3]">
         <div className="flex items-center justify-between mb-3">
           <h1 className="text-xl font-semibold">Chat</h1>
-          <select value={teamId} onChange={e => setTeamId(e.target.value)} className="input !w-auto">
-            {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
-          </select>
+          <div className="flex items-center gap-2">
+            {messages.length > 0 && (
+              <button onClick={clearHistory} className="btn-ghost !text-[11px]">Clear</button>
+            )}
+            <select value={teamId} onChange={e => setTeamId(e.target.value)} className="input !w-auto">
+              {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+          </div>
         </div>
 
         <div className="flex-1 overflow-y-auto space-y-2.5 pb-3">
@@ -113,16 +135,14 @@ export default function ChatPage() {
         </div>
       </div>
 
-      {/* Trace Panel - 40% */}
+      {/* Trace Panel */}
       <div className="flex-[2] border-l border-[var(--border)] pl-5 overflow-y-auto">
         <h2 className="text-sm font-medium text-[var(--text-muted)] mb-3">Trace Inspector</h2>
 
         {loading && (
-          <div className="space-y-2">
-            <div className="flex items-center gap-2 p-2 rounded-lg bg-[var(--accent-light)] text-[var(--accent)] text-xs">
-              <div className="h-2.5 w-2.5 bg-[var(--accent)] rounded-full animate-pulse" />
-              Processing request...
-            </div>
+          <div className="flex items-center gap-2 p-2 rounded-lg bg-[var(--accent-light)] text-[var(--accent)] text-xs">
+            <div className="h-2.5 w-2.5 bg-[var(--accent)] rounded-full animate-pulse" />
+            Processing...
           </div>
         )}
 
@@ -152,11 +172,11 @@ export default function ChatPage() {
                     <div className="font-medium truncate">{s.name}</div>
                     <div className="text-[var(--text-muted)] text-[10px]">{s.span_type}</div>
                   </div>
-                  <div className="text-right text-[10px] text-[var(--text-muted)] flex-shrink-0">
+                  <div className="text-right text-[10px] text-[var(--text-muted)]">
                     {s.tokens_in + s.tokens_out > 0 && <div>{s.tokens_in + s.tokens_out} tok</div>}
                     {s.cost > 0 && <div>${s.cost.toFixed(4)}</div>}
                   </div>
-                  <div className={`h-1.5 w-1.5 rounded-full flex-shrink-0 ${s.status === "completed" ? "bg-green-500" : "bg-red-500"}`} />
+                  <div className={`h-1.5 w-1.5 rounded-full ${s.status === "completed" ? "bg-green-500" : "bg-red-500"}`} />
                 </div>
               ))}
             </div>

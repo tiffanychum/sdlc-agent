@@ -19,6 +19,7 @@ export default function EvaluationPage() {
   const [comparison, setComparison] = useState<any>(null);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState("");
+  const [detail, setDetail] = useState<any>(null);
 
   useEffect(() => { api.eval.runs().then(setRuns); }, []);
 
@@ -47,6 +48,11 @@ export default function EvaluationPage() {
     setComparison(await api.eval.compareRuns(selected[0], selected[1]));
   }
 
+  async function viewDetail(id: string) {
+    const d = await api.eval.get(id);
+    setDetail(d);
+  }
+
   const latest = runs[0];
   const radarData = latest ? METRICS.map(m => ({
     metric: m.label,
@@ -61,6 +67,111 @@ export default function EvaluationPage() {
 
   const tip = { contentStyle: { background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 8, fontSize: 12 } };
 
+  // ── Detail View ──
+  if (detail) {
+    return (
+      <div className="space-y-5 max-w-6xl">
+        <div className="flex items-center gap-3">
+          <button onClick={() => setDetail(null)} className="btn-ghost">&larr; Back</button>
+          <h1 className="text-xl font-semibold">Run {detail.id}</h1>
+          <span className="text-sm text-[var(--text-muted)]">{detail.model}</span>
+        </div>
+
+        {/* Summary Cards */}
+        <div className="grid grid-cols-7 gap-2">
+          {METRICS.map(m => (
+            <div key={m.key} className="card !p-3 text-center">
+              <div className="text-lg font-semibold" style={{ color: m.color }}>{((detail[m.key] || 0) * 100).toFixed(0)}%</div>
+              <div className="text-[10px] text-[var(--text-muted)]">{m.label}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Per-Scenario Details */}
+        <div className="space-y-2">
+          <h2 className="text-sm font-medium">Scenario Details</h2>
+          {(detail.tasks || []).map((t: any, i: number) => (
+            <details key={i} className={`card !p-0 overflow-hidden border-l-4 ${t.completed ? "border-l-green-500" : "border-l-red-500"}`}>
+              <summary className="flex items-center justify-between px-4 py-3 cursor-pointer hover:bg-[var(--bg-hover)]">
+                <div className="flex items-center gap-2">
+                  <span className={`text-xs font-bold ${t.completed ? "text-[var(--success)]" : "text-[var(--error)]"}`}>
+                    {t.completed ? "PASS" : "FAIL"}
+                  </span>
+                  <span className="text-sm font-medium">{t.scenario}</span>
+                </div>
+                <div className="flex gap-3 text-xs text-[var(--text-muted)]">
+                  <span>Routing: {t.routing_correct ? "correct" : "wrong"}</span>
+                  <span>Tool Acc: {((t.tool_call_accuracy || 0) * 100).toFixed(0)}%</span>
+                  <span>Efficiency: {((t.step_efficiency || 0) * 100).toFixed(0)}%</span>
+                  {t.latency_ms && <span>{t.latency_ms.toFixed(0)}ms</span>}
+                </div>
+              </summary>
+              <div className="px-4 py-3 border-t border-[var(--border)] bg-[var(--bg)] space-y-3 text-sm">
+                {/* Scores Grid */}
+                <div className="grid grid-cols-4 gap-2">
+                  {[
+                    { label: "Reasoning", val: t.reasoning_quality },
+                    { label: "Faithfulness", val: t.hallucination_score },
+                    { label: "Safety", val: t.safety_score },
+                    { label: "Step Efficiency", val: t.step_efficiency },
+                  ].map(s => (
+                    <div key={s.label} className="text-center p-2 rounded bg-[var(--bg-card)] border border-[var(--border)]">
+                      <div className="text-base font-semibold">{((s.val || 0) * 100).toFixed(0)}%</div>
+                      <div className="text-[10px] text-[var(--text-muted)]">{s.label}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* LLM Judge Scores */}
+                {t.llm_judge && Object.keys(t.llm_judge).length > 0 && (
+                  <div>
+                    <div className="text-xs font-medium text-[var(--text-muted)] mb-1">LLM-as-Judge Scores</div>
+                    <div className="flex gap-2 flex-wrap">
+                      {Object.entries(t.llm_judge).map(([k, v]: [string, any]) => (
+                        <span key={k} className="badge bg-[var(--accent-light)] text-[var(--accent)]">
+                          {k}: {((v || 0) * 100).toFixed(0)}%
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Trajectory */}
+                {t.trajectory && t.trajectory.reasoning && (
+                  <div>
+                    <div className="text-xs font-medium text-[var(--text-muted)] mb-1">Trajectory Analysis</div>
+                    <div className="text-xs bg-[var(--bg-card)] border border-[var(--border)] rounded p-2">
+                      <div>Score: {((t.trajectory.trajectory_score || 0) * 100).toFixed(0)}%</div>
+                      <div className="text-[var(--text-muted)] mt-1">{t.trajectory.reasoning}</div>
+                      {t.trajectory.step_scores && (
+                        <div className="flex gap-1 mt-1">
+                          {t.trajectory.step_scores.map((s: number, i: number) => (
+                            <span key={i} className="badge bg-[var(--bg-hover)]">Step {i+1}: {(s * 100).toFixed(0)}%</span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Error */}
+                {t.error && (
+                  <div className="text-xs text-[var(--error)] bg-[var(--error-light)] rounded p-2">
+                    Error: {t.error}
+                  </div>
+                )}
+              </div>
+            </details>
+          ))}
+          {(!detail.tasks || detail.tasks.length === 0) && (
+            <div className="text-[var(--text-muted)] text-center py-6">No task details available for this run</div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── List View ──
   return (
     <div className="space-y-5 max-w-6xl">
       <div className="flex items-center justify-between">
@@ -82,32 +193,27 @@ export default function EvaluationPage() {
         </div>
       </div>
 
-      {/* Latest Run Summary */}
       {latest && (
         <div className="grid grid-cols-7 gap-2">
-          {METRICS.map(m => {
-            const val = latest[m.key] || 0;
-            return (
-              <div key={m.key} className="card !p-3 text-center">
-                <div className="text-lg font-semibold" style={{ color: m.color }}>{(val * 100).toFixed(0)}%</div>
-                <div className="text-[10px] text-[var(--text-muted)] mt-0.5">{m.label}</div>
-              </div>
-            );
-          })}
+          {METRICS.map(m => (
+            <div key={m.key} className="card !p-3 text-center">
+              <div className="text-lg font-semibold" style={{ color: m.color }}>{((latest[m.key] || 0) * 100).toFixed(0)}%</div>
+              <div className="text-[10px] text-[var(--text-muted)]">{m.label}</div>
+            </div>
+          ))}
         </div>
       )}
 
-      {/* Charts */}
       {runs.length > 0 && (
         <div className="grid grid-cols-2 gap-4">
           <div className="card">
-            <h3 className="text-xs text-[var(--text-muted)] mb-2">Latest Run — Metric Radar</h3>
+            <h3 className="text-xs text-[var(--text-muted)] mb-2">Latest Run — Radar</h3>
             <ResponsiveContainer width="100%" height={250}>
               <RadarChart data={radarData}>
                 <PolarGrid stroke="var(--border)" />
                 <PolarAngleAxis dataKey="metric" tick={{ fontSize: 10, fill: "var(--text-muted)" }} />
                 <PolarRadiusAxis angle={90} domain={[0, 100]} tick={{ fontSize: 9 }} />
-                <Radar name="Score" dataKey="score" stroke="#2563eb" fill="#2563eb" fillOpacity={0.15} strokeWidth={2} />
+                <Radar dataKey="score" stroke="#2563eb" fill="#2563eb" fillOpacity={0.15} strokeWidth={2} />
               </RadarChart>
             </ResponsiveContainer>
           </div>
@@ -129,7 +235,6 @@ export default function EvaluationPage() {
         </div>
       )}
 
-      {/* Regression */}
       {comparison && (
         <div className="card">
           <h3 className="text-sm font-medium mb-2">Regression: {comparison.run_a} vs {comparison.run_b}</h3>
@@ -158,20 +263,20 @@ export default function EvaluationPage() {
           <thead><tr className="text-[var(--text-muted)] text-xs bg-[var(--bg)]">
             <th className="w-8 px-3 py-2.5"></th><th className="text-left px-3">ID</th><th className="text-left px-3">Model</th>
             {METRICS.map(m => <th key={m.key} className="text-right px-2 py-2.5">{m.label}</th>)}
-            <th className="text-right px-3 py-2.5">Latency</th>
+            <th className="text-right px-3 py-2.5">Latency</th><th className="px-3 py-2.5"></th>
           </tr></thead>
           <tbody>
             {runs.map(r => (
-                <tr key={r.id} className={`border-t border-[var(--border)] hover:bg-[var(--bg-hover)] ${selected.includes(r.id) ? "bg-[var(--accent-light)]" : ""}`}>
-                  <td className="px-3 py-2"><input type="checkbox" checked={selected.includes(r.id)} onChange={() => toggle(r.id)} /></td>
-                  <td className="px-3 py-2 font-mono text-[11px]">{r.id}</td>
-                  <td className="px-3 py-2 text-xs">{r.model}</td>
-                  {METRICS.map(m => {
-                    const val = r[m.key] ?? 0;
-                    return <td key={m.key} className="text-right px-2 py-2 text-xs">{(val * 100).toFixed(0)}%</td>;
-                  })}
-                  <td className="text-right px-3 py-2 text-xs">{r.avg_latency_ms ? `${r.avg_latency_ms.toFixed(0)}ms` : "—"}</td>
-                </tr>
+              <tr key={r.id} className={`border-t border-[var(--border)] hover:bg-[var(--bg-hover)] ${selected.includes(r.id) ? "bg-[var(--accent-light)]" : ""}`}>
+                <td className="px-3 py-2"><input type="checkbox" checked={selected.includes(r.id)} onChange={() => toggle(r.id)} /></td>
+                <td className="px-3 py-2 font-mono text-[11px]">{r.id}</td>
+                <td className="px-3 py-2 text-xs">{r.model}</td>
+                {METRICS.map(m => (
+                  <td key={m.key} className="text-right px-2 py-2 text-xs">{((r[m.key] ?? 0) * 100).toFixed(0)}%</td>
+                ))}
+                <td className="text-right px-3 py-2 text-xs">{r.avg_latency_ms ? `${r.avg_latency_ms.toFixed(0)}ms` : "—"}</td>
+                <td className="px-3 py-2"><button onClick={() => viewDetail(r.id)} className="text-[11px] text-[var(--accent)] hover:underline">Details</button></td>
+              </tr>
             ))}
           </tbody>
         </table>
