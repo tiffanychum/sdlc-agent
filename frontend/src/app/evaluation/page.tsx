@@ -87,84 +87,121 @@ export default function EvaluationPage() {
           ))}
         </div>
 
-        {/* Per-Scenario Details */}
-        <div className="space-y-2">
-          <h2 className="text-sm font-medium">Scenario Details</h2>
-          {(detail.tasks || []).map((t: any, i: number) => (
-            <details key={i} className={`card !p-0 overflow-hidden border-l-4 ${t.completed ? "border-l-green-500" : "border-l-red-500"}`}>
-              <summary className="flex items-center justify-between px-4 py-3 cursor-pointer hover:bg-[var(--bg-hover)]">
-                <div className="flex items-center gap-2">
-                  <span className={`text-xs font-bold ${t.completed ? "text-[var(--success)]" : "text-[var(--error)]"}`}>
-                    {t.completed ? "PASS" : "FAIL"}
-                  </span>
-                  <span className="text-sm font-medium">{t.scenario}</span>
-                </div>
-                <div className="flex gap-3 text-xs text-[var(--text-muted)]">
-                  <span>Routing: {t.routing_correct ? "correct" : "wrong"}</span>
-                  <span>Tool Acc: {((t.tool_call_accuracy || 0) * 100).toFixed(0)}%</span>
-                  <span>Efficiency: {((t.step_efficiency || 0) * 100).toFixed(0)}%</span>
-                  {t.latency_ms && <span>{t.latency_ms.toFixed(0)}ms</span>}
-                </div>
-              </summary>
-              <div className="px-4 py-3 border-t border-[var(--border)] bg-[var(--bg)] space-y-3 text-sm">
-                {/* Scores Grid */}
-                <div className="grid grid-cols-4 gap-2">
-                  {[
-                    { label: "Reasoning", val: t.reasoning_quality },
-                    { label: "Faithfulness", val: t.hallucination_score },
-                    { label: "Safety", val: t.safety_score },
-                    { label: "Step Efficiency", val: t.step_efficiency },
-                  ].map(s => (
-                    <div key={s.label} className="text-center p-2 rounded bg-[var(--bg-card)] border border-[var(--border)]">
-                      <div className="text-base font-semibold">{((s.val || 0) * 100).toFixed(0)}%</div>
-                      <div className="text-[10px] text-[var(--text-muted)]">{s.label}</div>
-                    </div>
-                  ))}
-                </div>
+        {/* Per-Request Details */}
+        <div className="space-y-3">
+          <h2 className="text-sm font-medium">Requests ({(detail.tasks || []).length})</h2>
+          {(detail.tasks || []).map((t: any, i: number) => {
+            const scores = t.scores || {};
+            return (
+              <details key={i} className={`card !p-0 overflow-hidden border-l-4 ${t.completed ? "border-l-green-500" : "border-l-red-500"}`}>
+                <summary className="flex items-center justify-between px-4 py-3 cursor-pointer hover:bg-[var(--bg-hover)]">
+                  <div className="flex items-center gap-2 flex-1 min-w-0">
+                    <span className={`badge flex-shrink-0 ${t.completed ? "bg-[var(--success-light)] text-[var(--success)]" : "bg-[var(--error-light)] text-[var(--error)]"}`}>
+                      {t.completed ? "PASS" : "FAIL"}
+                    </span>
+                    <span className="text-sm truncate">{t.prompt || t.scenario}</span>
+                  </div>
+                  <div className="flex gap-2 text-xs text-[var(--text-muted)] flex-shrink-0 ml-3">
+                    {t.actual_agent && <span className="badge bg-[var(--accent-light)] text-[var(--accent)]">{t.actual_agent}</span>}
+                    {t.latency_ms && <span>{t.latency_ms.toFixed(0)}ms</span>}
+                  </div>
+                </summary>
 
-                {/* LLM Judge Scores */}
-                {t.llm_judge && Object.keys(t.llm_judge).length > 0 && (
-                  <div>
-                    <div className="text-xs font-medium text-[var(--text-muted)] mb-1">LLM-as-Judge Scores</div>
-                    <div className="flex gap-2 flex-wrap">
-                      {Object.entries(t.llm_judge).map(([k, v]: [string, any]) => (
-                        <span key={k} className="badge bg-[var(--accent-light)] text-[var(--accent)]">
-                          {k}: {((v || 0) * 100).toFixed(0)}%
-                        </span>
+                <div className="border-t border-[var(--border)] bg-[var(--bg)]">
+                  {/* User Question */}
+                  <div className="px-4 py-2.5 border-b border-[var(--border)]">
+                    <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide mb-1">User Request</div>
+                    <div className="text-sm">{t.prompt || "—"}</div>
+                  </div>
+
+                  {/* Agent Trace (tool calls) */}
+                  {t.tool_calls && t.tool_calls.length > 0 && (
+                    <div className="px-4 py-2.5 border-b border-[var(--border)]">
+                      <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide mb-1.5">Agent Trace</div>
+                      <div className="space-y-1">
+                        {t.routing_correct !== undefined && (
+                          <div className="flex items-center gap-2 text-xs">
+                            <span className={t.routing_correct ? "text-[var(--success)]" : "text-[var(--error)]"}>
+                              {t.routing_correct ? "✓" : "✗"}
+                            </span>
+                            <span className="text-[var(--text-muted)]">Route to</span>
+                            <span className="font-medium">{t.actual_agent || "?"}</span>
+                            {!t.routing_correct && <span className="text-[var(--text-muted)]">(expected: {t.expected_agent})</span>}
+                          </div>
+                        )}
+                        {t.tool_calls.map((tc: any, j: number) => (
+                          <div key={j} className="flex items-center gap-2 text-xs">
+                            <span className={tc.correct ? "text-[var(--success)]" : "text-[var(--warning)]"}>
+                              {tc.correct ? "✓" : "~"}
+                            </span>
+                            <span className="font-mono">{tc.tool}</span>
+                            <span className="text-[var(--text-muted)] truncate">
+                              ({Object.entries(tc.args || {}).map(([k,v]) => `${k}="${String(v).slice(0,30)}"`).join(", ")})
+                            </span>
+                            {tc.error && <span className="text-[var(--error)]">err</span>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Agent Response */}
+                  {t.agent_response && (
+                    <div className="px-4 py-2.5 border-b border-[var(--border)]">
+                      <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide mb-1">Agent Output</div>
+                      <div className="text-xs bg-[var(--bg-card)] border border-[var(--border)] rounded p-2 max-h-32 overflow-y-auto whitespace-pre-wrap">
+                        {t.agent_response.slice(0, 800)}
+                        {t.agent_response.length > 800 && "..."}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Evaluation Scores */}
+                  <div className="px-4 py-2.5">
+                    <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide mb-1.5">Evaluation Scores</div>
+                    <div className="grid grid-cols-6 gap-1.5">
+                      {Object.entries(scores).map(([k, v]: [string, any]) => (
+                        <div key={k} className="text-center p-1.5 rounded bg-[var(--bg-card)] border border-[var(--border)]">
+                          <div className={`text-sm font-semibold ${(v || 0) >= 0.7 ? "text-[var(--success)]" : (v || 0) >= 0.4 ? "text-[var(--warning)]" : "text-[var(--error)]"}`}>
+                            {((v || 0) * 100).toFixed(0)}%
+                          </div>
+                          <div className="text-[9px] text-[var(--text-muted)]">{k.replace(/_/g, " ")}</div>
+                        </div>
                       ))}
                     </div>
-                  </div>
-                )}
 
-                {/* Trajectory */}
-                {t.trajectory && t.trajectory.reasoning && (
-                  <div>
-                    <div className="text-xs font-medium text-[var(--text-muted)] mb-1">Trajectory Analysis</div>
-                    <div className="text-xs bg-[var(--bg-card)] border border-[var(--border)] rounded p-2">
-                      <div>Score: {((t.trajectory.trajectory_score || 0) * 100).toFixed(0)}%</div>
-                      <div className="text-[var(--text-muted)] mt-1">{t.trajectory.reasoning}</div>
-                      {t.trajectory.step_scores && (
-                        <div className="flex gap-1 mt-1">
-                          {t.trajectory.step_scores.map((s: number, i: number) => (
-                            <span key={i} className="badge bg-[var(--bg-hover)]">Step {i+1}: {(s * 100).toFixed(0)}%</span>
+                    {/* LLM Judge */}
+                    {t.llm_judge && Object.keys(t.llm_judge).length > 0 && (
+                      <div className="mt-2">
+                        <div className="text-[10px] text-[var(--text-muted)] mb-1">LLM Judge</div>
+                        <div className="flex gap-1.5 flex-wrap">
+                          {Object.entries(t.llm_judge).map(([k, v]: [string, any]) => (
+                            <span key={k} className="badge bg-[var(--accent-light)] text-[var(--accent)]">{k}: {((v||0)*100).toFixed(0)}%</span>
                           ))}
                         </div>
-                      )}
-                    </div>
-                  </div>
-                )}
+                      </div>
+                    )}
 
-                {/* Error */}
-                {t.error && (
-                  <div className="text-xs text-[var(--error)] bg-[var(--error-light)] rounded p-2">
-                    Error: {t.error}
+                    {/* Trajectory */}
+                    {t.trajectory && t.trajectory.reasoning && (
+                      <div className="mt-2 text-xs bg-[var(--bg-card)] border border-[var(--border)] rounded p-2">
+                        <span className="font-medium">Trajectory: {((t.trajectory.trajectory_score||0)*100).toFixed(0)}%</span>
+                        <span className="text-[var(--text-muted)] ml-2">{t.trajectory.reasoning}</span>
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
-            </details>
-          ))}
+
+                  {t.error && (
+                    <div className="px-4 py-2 text-xs text-[var(--error)] bg-[var(--error-light)] border-t border-[var(--border)]">
+                      Error: {t.error}
+                    </div>
+                  )}
+                </div>
+              </details>
+            );
+          })}
           {(!detail.tasks || detail.tasks.length === 0) && (
-            <div className="text-[var(--text-muted)] text-center py-6">No task details available for this run</div>
+            <div className="text-[var(--text-muted)] text-center py-6">No details available. Run a new evaluation to see per-request breakdowns.</div>
           )}
         </div>
       </div>

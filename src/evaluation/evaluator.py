@@ -180,13 +180,27 @@ class AgentEvaluator:
         filepath = os.path.join(self.results_dir, f"eval_{run.run_id}_{run.timestamp[:10]}.json")
         data = {"summary": run.summary(), "tasks": [
             {
-                "task_id": t.task_id, "scenario": t.scenario_name,
-                "completed": t.completed, "routing_correct": t.routing_correct,
-                "tool_call_accuracy": round(t.tool_call_accuracy, 3),
-                "step_efficiency": round(t.step_efficiency, 3),
-                "hallucination_score": round(t.hallucination_score, 3),
-                "safety_score": round(t.safety_score, 3),
-                "reasoning_quality": round(t.reasoning_quality, 3),
+                "task_id": t.task_id,
+                "scenario": t.scenario_name,
+                "prompt": t.prompt,
+                "expected_agent": t.expected_agent,
+                "actual_agent": t.actual_agent,
+                "agent_response": str(t.final_response)[:2000] if t.final_response else "",
+                "completed": t.completed,
+                "routing_correct": t.routing_correct,
+                "tool_calls": [
+                    {"tool": tc.tool_name, "args": tc.arguments, "correct": tc.was_correct, "error": tc.error}
+                    for tc in t.tool_calls
+                ],
+                "tool_outputs": [o[:300] for o in t.tool_outputs[:5]],
+                "scores": {
+                    "tool_call_accuracy": round(t.tool_call_accuracy, 3),
+                    "step_efficiency": round(t.step_efficiency, 3),
+                    "faithfulness": round(t.hallucination_score, 3),
+                    "safety": round(t.safety_score, 3),
+                    "reasoning_quality": round(t.reasoning_quality, 3),
+                    "failure_recovery": round(t.failure_recovery_rate, 3),
+                },
                 "latency_ms": round(t.latency_ms, 1) if t.latency_ms else None,
                 "llm_judge": getattr(t, "llm_judge_scores", {}),
                 "trajectory": getattr(t, "trajectory_scores", {}),
