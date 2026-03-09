@@ -1,6 +1,11 @@
-# Print Fibonacci sequence up to 10 terms
-n = 10
-a, b = 0, 1
-for i in range(n):
-    print(a)
-    a, b = b, a + b
+def fibonacci(n):
+    a, b = 0, 1
+    seq = []
+    for _ in range(n):
+        seq.append(a)
+        a, b = b, a + b
+    return seq
+
+if __name__ == __main__:
+    n = 10
+    print(

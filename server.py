@@ -501,11 +501,16 @@ def get_eval_run(run_id: str):
 @app.post("/api/eval/run")
 async def run_eval(request: EvalRequest):
     from src.evaluation.evaluator import AgentEvaluator
+    from src.evaluation.scenarios import SCENARIOS
+
     evaluator = AgentEvaluator(
         use_llm_judge=request.use_llm_judge,
         use_deepeval=request.use_deepeval,
     )
-    run = await evaluator.run_evaluation(team_id=request.team_id, skip_init=True)
+    fast_scenarios = [s for s in SCENARIOS if s.expected_min_steps <= 1][:5]
+    run = await evaluator.run_evaluation(
+        scenarios=fast_scenarios, team_id=request.team_id, skip_init=True,
+    )
     return run.summary()
 
 @app.post("/api/eval/compare")

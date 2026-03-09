@@ -1,13 +1,8 @@
-#!/usr/bin/env python3
-
-def fibonacci(n):
-    a, b = 0, 1
-    seq = []
-    for _ in range(n):
-        seq.append(a)
-        a, b = b, a + b
-    return seq
-
-if __name__ == "__main__":
-    terms = 10
-    print(" ".join(str(x) for x in fibonacci(terms)))
+# Print Fibonacci sequence up to n terms
+n = 10
+f1, f2 = 0, 1
+count = 0
+while count < n:
+    print(f1)
+    f1, f2 = f2, f1 + f2
+    count += 1
