@@ -22,6 +22,9 @@ from src.mcp_servers.git_server import (
 from src.mcp_servers.web_server import (
     call_tool as web_call, list_tools as web_list,
 )
+from src.mcp_servers.memory_server import (
+    call_tool as mem_call, list_tools as mem_list,
+)
 
 
 JSON_TYPE_MAP = {
@@ -94,6 +97,11 @@ async def get_web_tools() -> list[StructuredTool]:
     return [_make_tool(t.name, t.description, t.inputSchema, web_call) for t in mcp_tools]
 
 
+async def get_memory_tools() -> list[StructuredTool]:
+    mcp_tools = await mem_list()
+    return [_make_tool(t.name, t.description, t.inputSchema, mem_call) for t in mcp_tools]
+
+
 async def get_all_tools() -> dict[str, list[StructuredTool]]:
     """Returns all tools grouped by MCP server origin."""
     return {
@@ -101,4 +109,5 @@ async def get_all_tools() -> dict[str, list[StructuredTool]]:
         "shell": await get_shell_tools(),
         "git": await get_git_tools(),
         "web": await get_web_tools(),
+        "memory": await get_memory_tools(),
     }

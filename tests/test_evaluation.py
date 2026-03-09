@@ -194,4 +194,4 @@ class TestEvalScenarios:
         assert len(names) == len(set(names)), "Duplicate scenario names found"
 
     def test_minimum_scenario_count(self):
-        assert len(SCENARIOS) >= 5, "Need at least 5 eval scenarios for meaningful coverage"
+        assert len(SCENARIOS) >= 10, "Need at least 10 eval scenarios for meaningful coverage"

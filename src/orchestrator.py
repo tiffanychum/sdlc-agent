@@ -56,6 +56,25 @@ def _ensure_messages(messages: list) -> list[BaseMessage]:
     return result
 
 
+STRATEGY_INSTRUCTIONS = {
+    "react": """## Decision Strategy: ReAct (Reason + Act)
+Think step by step: 1) Reason about what to do next 2) Take ONE action using a tool 3) Observe the result 4) Repeat until done. Always act, never just describe.""",
+
+    "plan_execute": """## Decision Strategy: Plan-and-Execute
+ALWAYS create a plan first: 1) Use create_plan to break the task into steps 2) Execute each step one at a time 3) Use update_plan_step to track progress 4) Store intermediate results in memory.""",
+
+    "reflexion": """## Decision Strategy: Self-Reflection (Reflexion)
+After each action: 1) Review what you just did 2) Check if it's correct by reading the actual result 3) If something seems wrong, investigate before proceeding 4) Store your review findings in memory.""",
+
+    "cot": """## Decision Strategy: Chain-of-Thought
+Think through the problem thoroughly before acting: 1) List all considerations 2) Reason about the best approach 3) Explain your reasoning 4) Then execute with tools.""",
+}
+
+
+def _strategy_instruction(strategy: str) -> str:
+    return STRATEGY_INSTRUCTIONS.get(strategy, STRATEGY_INSTRUCTIONS["react"])
+
+
 class OrchestratorState(TypedDict):
     messages: list
     selected_agent: str
@@ -119,6 +138,7 @@ async def build_orchestrator_from_team(team_id: str = "default"):
                 "description": a.description, "system_prompt": a.system_prompt,
                 "tool_groups": tool_groups,
                 "model": getattr(a, "model", "") or "",
+                "decision_strategy": getattr(a, "decision_strategy", "react") or "react",
             })
 
         strategy = team.decision_strategy or "router_decides"
@@ -132,7 +152,9 @@ async def build_orchestrator_from_team(team_id: str = "default"):
         agent_tools: list[StructuredTool] = []
         for group in ac["tool_groups"]:
             agent_tools.extend(tool_map.get(group, []))
-        final_prompt = build_agent_prompt(ac["id"], ac["system_prompt"])
+        strategy_hint = _strategy_instruction(ac["decision_strategy"])
+        base_prompt = ac["system_prompt"] + (f"\n\n{strategy_hint}" if strategy_hint else "")
+        final_prompt = build_agent_prompt(ac["id"], base_prompt)
         llm = get_llm(model=ac["model"] if ac["model"] else None)
         built_agents[ac["role"]] = create_react_agent(
             model=llm, tools=agent_tools, prompt=final_prompt,

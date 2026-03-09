@@ -46,6 +46,7 @@ class Agent(Base):
     description = Column(Text, default="")
     system_prompt = Column(Text, default="")
     model = Column(String, default="")
+    decision_strategy = Column(String, default="react")
     created_at = Column(DateTime, default=datetime.utcnow)
 
     team = relationship("Team", back_populates="agents")

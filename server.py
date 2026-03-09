@@ -61,6 +61,7 @@ class AgentCreate(BaseModel):
     system_prompt: str = ""
     tool_groups: list[str] = []
     model: str = ""
+    decision_strategy: str = "react"
 
 class AgentUpdate(BaseModel):
     name: Optional[str] = None
@@ -69,6 +70,7 @@ class AgentUpdate(BaseModel):
     system_prompt: Optional[str] = None
     tool_groups: Optional[list[str]] = None
     model: Optional[str] = None
+    decision_strategy: Optional[str] = None
 
 class SkillCreate(BaseModel):
     name: str
@@ -143,6 +145,7 @@ def get_team(team_id: str):
             "description": a.description, "system_prompt": a.system_prompt,
             "tool_groups": tools, "skills": skills,
             "model": getattr(a, "model", "") or "",
+            "decision_strategy": getattr(a, "decision_strategy", "react") or "react",
         })
     result = {
         "id": team.id, "name": team.name, "description": team.description,
@@ -188,7 +191,7 @@ def create_agent(team_id: str, data: AgentCreate):
         raise HTTPException(404, "Team not found")
     agent = Agent(team_id=team_id, name=data.name, role=data.role,
                   description=data.description, system_prompt=data.system_prompt,
-                  model=data.model)
+                  model=data.model, decision_strategy=data.decision_strategy)
     session.add(agent)
     session.flush()
     for tg in data.tool_groups:
@@ -210,6 +213,7 @@ def update_agent(agent_id: str, data: AgentUpdate):
     if data.description is not None: agent.description = data.description
     if data.system_prompt is not None: agent.system_prompt = data.system_prompt
     if data.model is not None: agent.model = data.model
+    if data.decision_strategy is not None: agent.decision_strategy = data.decision_strategy
     if data.tool_groups is not None:
         session.query(AgentToolMapping).filter_by(agent_id=agent_id).delete()
         for tg in data.tool_groups:
@@ -501,15 +505,14 @@ def get_eval_run(run_id: str):
 @app.post("/api/eval/run")
 async def run_eval(request: EvalRequest):
     from src.evaluation.evaluator import AgentEvaluator
-    from src.evaluation.scenarios import SCENARIOS
+    from src.evaluation.scenarios import FAST_SCENARIOS
 
     evaluator = AgentEvaluator(
         use_llm_judge=request.use_llm_judge,
         use_deepeval=request.use_deepeval,
     )
-    fast_scenarios = [s for s in SCENARIOS if s.expected_min_steps <= 1][:5]
     run = await evaluator.run_evaluation(
-        scenarios=fast_scenarios, team_id=request.team_id, skip_init=True,
+        scenarios=FAST_SCENARIOS, team_id=request.team_id, skip_init=True,
     )
     return run.summary()
 

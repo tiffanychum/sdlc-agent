@@ -12,11 +12,18 @@ const LLM_MODELS = [
   { value: "gpt-4o-mini-search", label: "GPT-4o Mini (Search)" },
 ];
 
-const STRATEGIES = [
+const TEAM_STRATEGIES = [
   { v: "router_decides", l: "Router", d: "LLM picks the best agent" },
   { v: "sequential", l: "Sequential", d: "Agents run in order" },
   { v: "parallel", l: "Parallel", d: "All agents run at once" },
   { v: "supervisor", l: "Supervisor", d: "Supervisor delegates and reviews" },
+];
+
+const AGENT_STRATEGIES = [
+  { value: "react", label: "ReAct", desc: "Reason + Act loop" },
+  { value: "plan_execute", label: "Plan & Execute", desc: "Plan first, then execute" },
+  { value: "reflexion", label: "Reflexion", desc: "Self-reflection after each step" },
+  { value: "cot", label: "Chain-of-Thought", desc: "Think thoroughly before acting" },
 ];
 
 export default function StudioPage() {
@@ -154,7 +161,7 @@ export default function StudioPage() {
               <button onClick={rebuild} className="btn-secondary !text-xs !py-1 !px-2.5">Rebuild</button>
             </div>
             <div className="grid grid-cols-4 gap-2">
-              {STRATEGIES.map(s => (
+              {TEAM_STRATEGIES.map(s => (
                 <button key={s.v} onClick={() => updateStrategy(s.v)}
                   className={`text-left p-2.5 rounded-lg text-xs border transition-all ${
                     team.decision_strategy === s.v
@@ -187,13 +194,23 @@ export default function StudioPage() {
                   </div>
                   <p className="text-xs text-[var(--text-muted)] mt-1">{a.description}</p>
 
-                  {/* Model Selector */}
-                  <div className="flex items-center gap-2 mt-2.5">
-                    <span className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide">Model:</span>
-                    <select value={a.model || ""} onChange={e => updateAgentModel(a.id, e.target.value)}
-                      className="input !w-auto !py-1 !text-xs">
-                      {LLM_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
-                    </select>
+                  {/* Model + Strategy Selectors */}
+                  <div className="flex items-center gap-4 mt-2.5">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide">Model:</span>
+                      <select value={a.model || ""} onChange={e => updateAgentModel(a.id, e.target.value)}
+                        className="input !w-auto !py-1 !text-xs">
+                        {LLM_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                      </select>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide">Strategy:</span>
+                      <select value={a.decision_strategy || "react"}
+                        onChange={async e => { await api.agents.update(a.id, { decision_strategy: e.target.value }); if (team) setTeam(await api.teams.get(team.id)); }}
+                        className="input !w-auto !py-1 !text-xs">
+                        {AGENT_STRATEGIES.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
+                      </select>
+                    </div>
                   </div>
 
                   <div className="flex flex-wrap gap-1 mt-2">
