@@ -377,6 +377,63 @@ def list_traces(limit: int = 50, offset: int = 0):
     session.close()
     return result
 
+@app.get("/api/traces/stats")
+def trace_stats(days: int = 30, team_id: str = None):
+    session = get_session()
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    q = session.query(Trace).filter(Trace.created_at >= cutoff)
+    if team_id:
+        q = q.filter(Trace.team_id == team_id)
+    traces = q.all()
+
+    if not traces:
+        session.close()
+        return {"total_runs": 0, "failures": 0, "avg_latency_ms": 0,
+                "total_cost": 0, "total_tokens": 0, "success_rate": 0,
+                "p50_latency_ms": 0, "p95_latency_ms": 0, "p99_latency_ms": 0,
+                "avg_tokens": 0, "daily": {}}
+
+    total = len(traces)
+    failures = sum(1 for t in traces if t.status == "error")
+    latencies = sorted([t.total_latency_ms for t in traces])
+    costs = [t.total_cost for t in traces]
+    tokens = [t.total_tokens for t in traces]
+
+    def percentile(data, p):
+        if not data: return 0
+        k = (len(data) - 1) * p / 100
+        f, c = int(k), int(k) + 1
+        if c >= len(data): return data[-1]
+        return data[f] + (k - f) * (data[c] - data[f])
+
+    daily = {}
+    for t in traces:
+        day = t.created_at.strftime("%Y-%m-%d") if t.created_at else "unknown"
+        daily.setdefault(day, {"runs": 0, "cost": 0, "tokens": 0, "latency": []})
+        daily[day]["runs"] += 1
+        daily[day]["cost"] += t.total_cost
+        daily[day]["tokens"] += t.total_tokens
+        daily[day]["latency"].append(t.total_latency_ms)
+
+    for d in daily.values():
+        d["avg_latency"] = round(sum(d["latency"]) / len(d["latency"]), 1) if d["latency"] else 0
+        del d["latency"]
+
+    result = {
+        "total_runs": total, "failures": failures,
+        "success_rate": round((total - failures) / total, 3) if total else 0,
+        "avg_latency_ms": round(sum(latencies) / total, 1),
+        "p50_latency_ms": round(percentile(latencies, 50), 1),
+        "p95_latency_ms": round(percentile(latencies, 95), 1),
+        "p99_latency_ms": round(percentile(latencies, 99), 1),
+        "total_cost": round(sum(costs), 4),
+        "total_tokens": sum(tokens),
+        "avg_tokens": round(sum(tokens) / total),
+        "daily": daily,
+    }
+    session.close()
+    return result
+
 @app.get("/api/traces/{trace_id}")
 def get_trace(trace_id: str):
     session = get_session()
@@ -401,64 +458,6 @@ def get_trace(trace_id: str):
             "cost": round(s.cost, 6), "model": s.model,
             "status": s.status, "error": s.error,
         } for s in spans],
-    }
-    session.close()
-    return result
-
-@app.get("/api/traces/stats")
-def trace_stats(days: int = 30, team_id: str = None):
-    session = get_session()
-    cutoff = datetime.utcnow() - timedelta(days=days)
-    q = session.query(Trace).filter(Trace.created_at >= cutoff)
-    if team_id:
-        q = q.filter(Trace.team_id == team_id)
-    traces = q.all()
-
-    if not traces:
-        session.close()
-        return {"total_runs": 0, "failures": 0, "avg_latency_ms": 0,
-                "total_cost": 0, "total_tokens": 0, "success_rate": 0}
-
-    total = len(traces)
-    failures = sum(1 for t in traces if t.status == "error")
-    latencies = sorted([t.total_latency_ms for t in traces])
-    costs = [t.total_cost for t in traces]
-    tokens = [t.total_tokens for t in traces]
-
-    def percentile(data, p):
-        if not data:
-            return 0
-        k = (len(data) - 1) * p / 100
-        f, c = int(k), int(k) + 1
-        if c >= len(data):
-            return data[-1]
-        return data[f] + (k - f) * (data[c] - data[f])
-
-    daily = {}
-    for t in traces:
-        day = t.created_at.strftime("%Y-%m-%d") if t.created_at else "unknown"
-        daily.setdefault(day, {"runs": 0, "cost": 0, "tokens": 0, "latency": []})
-        daily[day]["runs"] += 1
-        daily[day]["cost"] += t.total_cost
-        daily[day]["tokens"] += t.total_tokens
-        daily[day]["latency"].append(t.total_latency_ms)
-
-    for d in daily.values():
-        d["avg_latency"] = round(sum(d["latency"]) / len(d["latency"]), 1) if d["latency"] else 0
-        del d["latency"]
-
-    result = {
-        "total_runs": total,
-        "failures": failures,
-        "success_rate": round((total - failures) / total, 3) if total else 0,
-        "avg_latency_ms": round(sum(latencies) / total, 1),
-        "p50_latency_ms": round(percentile(latencies, 50), 1),
-        "p95_latency_ms": round(percentile(latencies, 95), 1),
-        "p99_latency_ms": round(percentile(latencies, 99), 1),
-        "total_cost": round(sum(costs), 4),
-        "total_tokens": sum(tokens),
-        "avg_tokens": round(sum(tokens) / total),
-        "daily": daily,
     }
     session.close()
     return result
