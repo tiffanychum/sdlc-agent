@@ -2,257 +2,248 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 
-interface Agent {
-  id: string; name: string; role: string; description: string;
-  system_prompt: string; tool_groups: string[]; skills: { id: string; name: string }[];
-}
-interface Team {
-  id: string; name: string; description: string; decision_strategy: string; agents: Agent[];
-}
-interface Skill { id: string; name: string; description: string; instructions: string; trigger_pattern: string; }
-interface ToolGroup { [group: string]: { name: string; description: string }[] }
-
 export default function StudioPage() {
   const [teams, setTeams] = useState<any[]>([]);
-  const [selectedTeam, setSelectedTeam] = useState<Team | null>(null);
-  const [skills, setSkills] = useState<Skill[]>([]);
-  const [tools, setTools] = useState<ToolGroup>({});
-  const [newTeamName, setNewTeamName] = useState("");
-  const [showNewAgent, setShowNewAgent] = useState(false);
-  const [showNewSkill, setShowNewSkill] = useState(false);
-  const [newAgent, setNewAgent] = useState({ name: "", role: "", description: "", system_prompt: "", tool_groups: [] as string[] });
-  const [newSkill, setNewSkill] = useState({ name: "", description: "", instructions: "", trigger_pattern: "" });
+  const [team, setTeam] = useState<any>(null);
+  const [skills, setSkills] = useState<any[]>([]);
+  const [tools, setTools] = useState<any>({});
+  const [newTeam, setNewTeam] = useState("");
+  const [showAgent, setShowAgent] = useState(false);
+  const [showSkill, setShowSkill] = useState(false);
+  const [agent, setAgent] = useState({ name: "", role: "", description: "", system_prompt: "", tool_groups: [] as string[] });
+  const [skill, setSkill] = useState({ name: "", description: "", instructions: "", trigger_pattern: "" });
 
   useEffect(() => { load(); }, []);
 
   async function load() {
     const [t, s, tl] = await Promise.all([api.teams.list(), api.skills.list(), api.tools.list()]);
     setTeams(t); setSkills(s); setTools(tl);
-    if (t.length > 0) { const full = await api.teams.get(t[0].id); setSelectedTeam(full); }
+    if (t.length > 0 && !team) setTeam(await api.teams.get(t[0].id));
   }
 
-  async function selectTeam(id: string) { setSelectedTeam(await api.teams.get(id)); }
+  async function selectTeam(id: string) { setTeam(await api.teams.get(id)); }
 
   async function createTeam() {
-    if (!newTeamName) return;
-    await api.teams.create({ name: newTeamName, description: "", decision_strategy: "router_decides" });
-    setNewTeamName(""); await load();
+    if (!newTeam.trim()) return;
+    await api.teams.create({ name: newTeam });
+    setNewTeam("");
+    const t = await api.teams.list(); setTeams(t);
+    setTeam(await api.teams.get(t[t.length - 1].id));
   }
 
-  async function updateStrategy(strategy: string) {
-    if (!selectedTeam) return;
-    await api.teams.update(selectedTeam.id, { decision_strategy: strategy });
-    setSelectedTeam({ ...selectedTeam, decision_strategy: strategy });
+  async function updateStrategy(s: string) {
+    if (!team) return;
+    await api.teams.update(team.id, { decision_strategy: s });
+    setTeam({ ...team, decision_strategy: s });
   }
 
   async function addAgent() {
-    if (!selectedTeam) return;
-    await api.teams.addAgent(selectedTeam.id, newAgent);
-    setShowNewAgent(false); setNewAgent({ name: "", role: "", description: "", system_prompt: "", tool_groups: [] });
-    setSelectedTeam(await api.teams.get(selectedTeam.id));
+    if (!team) return;
+    await api.teams.addAgent(team.id, agent);
+    setShowAgent(false); setAgent({ name: "", role: "", description: "", system_prompt: "", tool_groups: [] });
+    setTeam(await api.teams.get(team.id));
   }
 
-  async function deleteAgent(id: string) {
+  async function removeAgent(id: string) {
     await api.agents.delete(id);
-    if (selectedTeam) setSelectedTeam(await api.teams.get(selectedTeam.id));
+    if (team) setTeam(await api.teams.get(team.id));
   }
 
   async function createSkill() {
-    await api.skills.create(newSkill);
-    setShowNewSkill(false); setNewSkill({ name: "", description: "", instructions: "", trigger_pattern: "" });
+    await api.skills.create(skill);
+    setShowSkill(false); setSkill({ name: "", description: "", instructions: "", trigger_pattern: "" });
     setSkills(await api.skills.list());
   }
 
-  async function assignSkill(agentId: string, skillId: string, assigned: boolean) {
-    if (!selectedTeam) return;
-    const agent = selectedTeam.agents.find(a => a.id === agentId);
-    if (!agent) return;
-    const currentIds = agent.skills.map(s => s.id);
-    const newIds = assigned ? currentIds.filter(id => id !== skillId) : [...currentIds, skillId];
-    await api.agents.assignSkills(agentId, newIds);
-    setSelectedTeam(await api.teams.get(selectedTeam.id));
+  async function toggleSkill(agentId: string, skillId: string, on: boolean) {
+    if (!team) return;
+    const a = team.agents.find((x: any) => x.id === agentId);
+    if (!a) return;
+    const ids = a.skills.map((s: any) => s.id);
+    const next = on ? ids.filter((i: string) => i !== skillId) : [...ids, skillId];
+    await api.agents.assignSkills(agentId, next);
+    setTeam(await api.teams.get(team.id));
   }
 
-  async function rebuildTeam() {
-    if (!selectedTeam) return;
-    await api.teams.rebuild(selectedTeam.id);
-  }
+  async function rebuild() { if (team) await api.teams.rebuild(team.id); }
 
   const STRATEGIES = [
-    { value: "router_decides", label: "Router Decides", desc: "LLM classifies request and routes to one agent" },
-    { value: "sequential", label: "Sequential", desc: "Agents run in order, passing context" },
-    { value: "parallel", label: "Parallel", desc: "All agents run simultaneously" },
-    { value: "supervisor", label: "Supervisor", desc: "Supervisor reviews and can re-delegate" },
+    { v: "router_decides", l: "Router", d: "LLM picks the best agent" },
+    { v: "sequential", l: "Sequential", d: "Agents run in order" },
+    { v: "parallel", l: "Parallel", d: "All agents run at once" },
+    { v: "supervisor", l: "Supervisor", d: "Supervisor delegates and reviews" },
   ];
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold">Agent Studio</h1>
+    <div className="space-y-8 max-w-5xl">
+      <div>
+        <h1 className="text-xl font-semibold">Agent Studio</h1>
+        <p className="text-sm text-[var(--text-muted)] mt-1">Configure teams, agents, skills, and tools</p>
+      </div>
 
-      {/* Teams Sidebar + Main */}
-      <div className="grid grid-cols-4 gap-6">
-        {/* Team List */}
-        <div className="space-y-3">
-          <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wide">Teams</h2>
-          {teams.map(t => (
-            <button key={t.id} onClick={() => selectTeam(t.id)}
-              className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-colors ${selectedTeam?.id === t.id ? "bg-blue-600/20 text-blue-400 border border-blue-500/30" : "bg-gray-800/50 hover:bg-gray-800 text-gray-300"}`}>
-              <div className="font-medium">{t.name}</div>
-              <div className="text-xs text-gray-500">{t.agents_count} agent(s) · {t.decision_strategy}</div>
-            </button>
-          ))}
-          <div className="flex gap-2">
-            <input value={newTeamName} onChange={e => setNewTeamName(e.target.value)} placeholder="New team name"
-              className="flex-1 px-2 py-1.5 text-sm bg-gray-800 border border-gray-700 rounded-md" />
-            <button onClick={createTeam} className="px-3 py-1.5 text-sm bg-blue-600 rounded-md hover:bg-blue-500">+</button>
-          </div>
+      {/* Team Tabs */}
+      <div className="flex items-center gap-2 border-b border-[var(--border)] pb-3">
+        {teams.map(t => (
+          <button key={t.id} onClick={() => selectTeam(t.id)}
+            className={`px-3 py-1.5 rounded-md text-sm transition-all ${team?.id === t.id ? "bg-[var(--accent)]/10 text-[var(--accent)] font-medium" : "text-[var(--text-muted)] hover:text-[var(--text)]"}`}>
+            {t.name}
+          </button>
+        ))}
+        <div className="flex items-center gap-1.5 ml-auto">
+          <input value={newTeam} onChange={e => setNewTeam(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && createTeam()}
+            placeholder="New team..." className="input !w-36 !text-xs !py-1.5" />
+          <button onClick={createTeam} className="btn-primary !py-1.5 !px-3">+</button>
         </div>
+      </div>
 
-        {/* Team Detail */}
-        <div className="col-span-3 space-y-6">
-          {selectedTeam ? (
-            <>
-              {/* Decision Strategy */}
-              <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <h2 className="font-semibold">Decision Strategy</h2>
-                  <button onClick={rebuildTeam} className="px-3 py-1 text-xs bg-green-600/20 text-green-400 border border-green-500/30 rounded-md hover:bg-green-600/30">Rebuild Orchestrator</button>
+      {team && (
+        <div className="space-y-6">
+          {/* Strategy */}
+          <section className="card">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-sm font-medium">Decision Strategy</h2>
+              <button onClick={rebuild} className="text-xs text-[var(--success)] hover:underline">Rebuild Orchestrator</button>
+            </div>
+            <div className="grid grid-cols-4 gap-2">
+              {STRATEGIES.map(s => (
+                <button key={s.v} onClick={() => updateStrategy(s.v)}
+                  className={`text-left p-3 rounded-lg text-xs transition-all border ${
+                    team.decision_strategy === s.v
+                      ? "border-[var(--accent)] bg-[var(--accent)]/5 text-[var(--accent)]"
+                      : "border-[var(--border)] text-[var(--text-muted)] hover:border-[var(--text-muted)]"
+                  }`}>
+                  <div className="font-medium text-sm">{s.l}</div>
+                  <div className="mt-0.5 opacity-70">{s.d}</div>
+                </button>
+              ))}
+            </div>
+          </section>
+
+          {/* Agents */}
+          <section className="card">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-sm font-medium">Agents ({team.agents?.length || 0})</h2>
+              <button onClick={() => setShowAgent(true)} className="btn-primary !text-xs">Add Agent</button>
+            </div>
+
+            <div className="space-y-3">
+              {team.agents?.map((a: any) => (
+                <div key={a.id} className="p-4 rounded-lg bg-[var(--bg)] border border-[var(--border)]">
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium text-sm">{a.name}</span>
+                        <span className="badge bg-[var(--accent)]/10 text-[var(--accent)]">{a.role}</span>
+                      </div>
+                      <p className="text-xs text-[var(--text-muted)] mt-1">{a.description}</p>
+                    </div>
+                    <button onClick={() => removeAgent(a.id)} className="text-xs text-[var(--error)] hover:underline">Remove</button>
+                  </div>
+
+                  <div className="flex flex-wrap gap-1.5 mt-3">
+                    <span className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide mr-1 self-center">Tools:</span>
+                    {a.tool_groups?.map((g: string) => (
+                      <span key={g} className="badge bg-purple-500/10 text-purple-400">{g}</span>
+                    ))}
+                  </div>
+
+                  <div className="flex flex-wrap gap-1.5 mt-2">
+                    <span className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide mr-1 self-center">Skills:</span>
+                    {skills.map(s => {
+                      const on = a.skills?.some((x: any) => x.id === s.id);
+                      return (
+                        <button key={s.id} onClick={() => toggleSkill(a.id, s.id, on)}
+                          className={`badge border transition-all ${on ? "bg-[var(--success)]/10 text-[var(--success)] border-[var(--success)]/30" : "bg-transparent text-[var(--text-muted)] border-[var(--border)] hover:text-[var(--text)]"}`}>
+                          {s.name}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
-                <div className="grid grid-cols-2 gap-2">
-                  {STRATEGIES.map(s => (
-                    <button key={s.value} onClick={() => updateStrategy(s.value)}
-                      className={`text-left px-3 py-2 rounded-lg text-sm border transition-colors ${selectedTeam.decision_strategy === s.value ? "bg-blue-600/20 border-blue-500/30 text-blue-400" : "bg-gray-800/50 border-gray-700 hover:bg-gray-800 text-gray-400"}`}>
-                      <div className="font-medium">{s.label}</div>
-                      <div className="text-xs opacity-70">{s.desc}</div>
+              ))}
+            </div>
+
+            {showAgent && (
+              <div className="mt-4 p-4 rounded-lg bg-[var(--bg)] border border-[var(--border)] space-y-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <input value={agent.name} onChange={e => setAgent({ ...agent, name: e.target.value })} placeholder="Name" className="input" />
+                  <input value={agent.role} onChange={e => setAgent({ ...agent, role: e.target.value })} placeholder="Role (e.g. coder)" className="input" />
+                </div>
+                <input value={agent.description} onChange={e => setAgent({ ...agent, description: e.target.value })} placeholder="Description" className="input" />
+                <textarea value={agent.system_prompt} onChange={e => setAgent({ ...agent, system_prompt: e.target.value })} placeholder="System prompt" rows={3} className="input" />
+                <div className="flex gap-2">
+                  {Object.keys(tools).map(g => (
+                    <button key={g} onClick={() => setAgent({ ...agent, tool_groups: agent.tool_groups.includes(g) ? agent.tool_groups.filter(x => x !== g) : [...agent.tool_groups, g] })}
+                      className={`badge border transition-all cursor-pointer ${agent.tool_groups.includes(g) ? "bg-purple-500/10 text-purple-400 border-purple-500/30" : "text-[var(--text-muted)] border-[var(--border)]"}`}>
+                      {g}
                     </button>
                   ))}
                 </div>
-              </div>
-
-              {/* Agents */}
-              <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <h2 className="font-semibold">Team Members (Agents)</h2>
-                  <button onClick={() => setShowNewAgent(true)} className="px-3 py-1 text-xs bg-blue-600 rounded-md hover:bg-blue-500">+ Add Agent</button>
+                <div className="flex gap-2">
+                  <button onClick={addAgent} className="btn-primary">Create</button>
+                  <button onClick={() => setShowAgent(false)} className="btn-ghost">Cancel</button>
                 </div>
-
-                {selectedTeam.agents.map(agent => (
-                  <div key={agent.id} className="bg-gray-800/50 border border-gray-700 rounded-lg p-4 space-y-2">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <span className="font-medium">{agent.name}</span>
-                        <span className="ml-2 text-xs px-2 py-0.5 bg-gray-700 rounded-full">{agent.role}</span>
-                      </div>
-                      <button onClick={() => deleteAgent(agent.id)} className="text-xs text-red-400 hover:text-red-300">Delete</button>
-                    </div>
-                    <p className="text-sm text-gray-400">{agent.description}</p>
-
-                    {/* Tool Groups */}
-                    <div className="flex gap-1 flex-wrap">
-                      <span className="text-xs text-gray-500">MCP Tools:</span>
-                      {agent.tool_groups.map(tg => (
-                        <span key={tg} className="text-xs px-2 py-0.5 bg-purple-600/20 text-purple-400 border border-purple-500/30 rounded-full">{tg}</span>
-                      ))}
-                    </div>
-
-                    {/* Skills */}
-                    <div className="flex gap-1 flex-wrap">
-                      <span className="text-xs text-gray-500">Skills:</span>
-                      {skills.map(skill => {
-                        const assigned = agent.skills.some(s => s.id === skill.id);
-                        return (
-                          <button key={skill.id} onClick={() => assignSkill(agent.id, skill.id, assigned)}
-                            className={`text-xs px-2 py-0.5 rounded-full border transition-colors ${assigned ? "bg-green-600/20 text-green-400 border-green-500/30" : "bg-gray-700/50 text-gray-500 border-gray-600 hover:text-gray-300"}`}>
-                            {skill.name}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                ))}
-
-                {/* New Agent Form */}
-                {showNewAgent && (
-                  <div className="bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-3">
-                    <input value={newAgent.name} onChange={e => setNewAgent({ ...newAgent, name: e.target.value })} placeholder="Agent name" className="w-full px-3 py-2 text-sm bg-gray-900 border border-gray-700 rounded-md" />
-                    <input value={newAgent.role} onChange={e => setNewAgent({ ...newAgent, role: e.target.value })} placeholder="Role (e.g., coder)" className="w-full px-3 py-2 text-sm bg-gray-900 border border-gray-700 rounded-md" />
-                    <input value={newAgent.description} onChange={e => setNewAgent({ ...newAgent, description: e.target.value })} placeholder="Description" className="w-full px-3 py-2 text-sm bg-gray-900 border border-gray-700 rounded-md" />
-                    <textarea value={newAgent.system_prompt} onChange={e => setNewAgent({ ...newAgent, system_prompt: e.target.value })} placeholder="System prompt" rows={3} className="w-full px-3 py-2 text-sm bg-gray-900 border border-gray-700 rounded-md" />
-                    <div className="flex gap-2 flex-wrap">
-                      {Object.keys(tools).map(group => (
-                        <button key={group} onClick={() => {
-                          const tgs = newAgent.tool_groups.includes(group)
-                            ? newAgent.tool_groups.filter(g => g !== group)
-                            : [...newAgent.tool_groups, group];
-                          setNewAgent({ ...newAgent, tool_groups: tgs });
-                        }} className={`text-xs px-2 py-1 rounded-md border ${newAgent.tool_groups.includes(group) ? "bg-purple-600/20 text-purple-400 border-purple-500/30" : "bg-gray-700 text-gray-400 border-gray-600"}`}>
-                          {group}
-                        </button>
-                      ))}
-                    </div>
-                    <div className="flex gap-2">
-                      <button onClick={addAgent} className="px-4 py-1.5 text-sm bg-blue-600 rounded-md hover:bg-blue-500">Create</button>
-                      <button onClick={() => setShowNewAgent(false)} className="px-4 py-1.5 text-sm bg-gray-700 rounded-md hover:bg-gray-600">Cancel</button>
-                    </div>
-                  </div>
-                )}
               </div>
+            )}
+          </section>
 
-              {/* Skills Library */}
-              <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <h2 className="font-semibold">Skills Library</h2>
-                  <button onClick={() => setShowNewSkill(true)} className="px-3 py-1 text-xs bg-blue-600 rounded-md hover:bg-blue-500">+ New Skill</button>
-                </div>
-                <p className="text-xs text-gray-500">Skills define HOW agents should behave. They inject instructions only — no tools.</p>
-
-                <div className="grid grid-cols-2 gap-2">
-                  {skills.map(skill => (
-                    <div key={skill.id} className="bg-gray-800/50 border border-gray-700 rounded-lg p-3">
-                      <div className="font-medium text-sm">{skill.name}</div>
-                      <p className="text-xs text-gray-400 mt-1">{skill.description}</p>
-                      {skill.trigger_pattern && <span className="text-xs text-yellow-400 mt-1 inline-block">Trigger: &quot;{skill.trigger_pattern}&quot;</span>}
-                    </div>
-                  ))}
-                </div>
-
-                {showNewSkill && (
-                  <div className="bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-3">
-                    <input value={newSkill.name} onChange={e => setNewSkill({ ...newSkill, name: e.target.value })} placeholder="Skill name" className="w-full px-3 py-2 text-sm bg-gray-900 border border-gray-700 rounded-md" />
-                    <input value={newSkill.description} onChange={e => setNewSkill({ ...newSkill, description: e.target.value })} placeholder="Description" className="w-full px-3 py-2 text-sm bg-gray-900 border border-gray-700 rounded-md" />
-                    <textarea value={newSkill.instructions} onChange={e => setNewSkill({ ...newSkill, instructions: e.target.value })} placeholder="Instructions (injected into agent prompt)" rows={3} className="w-full px-3 py-2 text-sm bg-gray-900 border border-gray-700 rounded-md" />
-                    <input value={newSkill.trigger_pattern} onChange={e => setNewSkill({ ...newSkill, trigger_pattern: e.target.value })} placeholder="Trigger pattern (optional)" className="w-full px-3 py-2 text-sm bg-gray-900 border border-gray-700 rounded-md" />
-                    <div className="flex gap-2">
-                      <button onClick={createSkill} className="px-4 py-1.5 text-sm bg-blue-600 rounded-md hover:bg-blue-500">Create</button>
-                      <button onClick={() => setShowNewSkill(false)} className="px-4 py-1.5 text-sm bg-gray-700 rounded-md hover:bg-gray-600">Cancel</button>
-                    </div>
-                  </div>
-                )}
+          {/* Skills */}
+          <section className="card">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <h2 className="text-sm font-medium">Skills Library</h2>
+                <p className="text-[11px] text-[var(--text-muted)] mt-0.5">Skills define HOW agents behave (instructions only, no tools)</p>
               </div>
+              <button onClick={() => setShowSkill(true)} className="btn-primary !text-xs">New Skill</button>
+            </div>
 
-              {/* Tool Registry */}
-              <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
-                <h2 className="font-semibold">MCP Tool Registry</h2>
-                <p className="text-xs text-gray-500">MCP tools define WHAT agents can do. Assign tool groups to agents above.</p>
+            <div className="grid grid-cols-3 gap-2">
+              {skills.map(s => (
+                <div key={s.id} className="p-3 rounded-lg bg-[var(--bg)] border border-[var(--border)]">
+                  <div className="text-sm font-medium">{s.name}</div>
+                  <p className="text-xs text-[var(--text-muted)] mt-1 line-clamp-2">{s.description}</p>
+                  {s.trigger_pattern && <div className="text-[10px] text-[var(--warning)] mt-1">trigger: &quot;{s.trigger_pattern}&quot;</div>}
+                </div>
+              ))}
+            </div>
+
+            {showSkill && (
+              <div className="mt-3 p-4 rounded-lg bg-[var(--bg)] border border-[var(--border)] space-y-3">
                 <div className="grid grid-cols-2 gap-3">
-                  {Object.entries(tools).map(([group, groupTools]) => (
-                    <div key={group} className="bg-gray-800/50 border border-gray-700 rounded-lg p-3">
-                      <div className="font-medium text-sm text-purple-400 mb-2">{group}</div>
-                      {(groupTools as any[]).map((t: any) => (
-                        <div key={t.name} className="text-xs text-gray-400 py-0.5">
-                          <span className="text-gray-300">{t.name}</span> — {t.description.slice(0, 60)}...
-                        </div>
-                      ))}
+                  <input value={skill.name} onChange={e => setSkill({ ...skill, name: e.target.value })} placeholder="Skill name" className="input" />
+                  <input value={skill.trigger_pattern} onChange={e => setSkill({ ...skill, trigger_pattern: e.target.value })} placeholder="Trigger pattern (optional)" className="input" />
+                </div>
+                <input value={skill.description} onChange={e => setSkill({ ...skill, description: e.target.value })} placeholder="Description" className="input" />
+                <textarea value={skill.instructions} onChange={e => setSkill({ ...skill, instructions: e.target.value })} placeholder="Instructions (injected into agent prompt)" rows={3} className="input" />
+                <div className="flex gap-2">
+                  <button onClick={createSkill} className="btn-primary">Create</button>
+                  <button onClick={() => setShowSkill(false)} className="btn-ghost">Cancel</button>
+                </div>
+              </div>
+            )}
+          </section>
+
+          {/* Tools */}
+          <section className="card">
+            <h2 className="text-sm font-medium mb-3">MCP Tool Registry</h2>
+            <p className="text-[11px] text-[var(--text-muted)] mb-4">MCP tools define WHAT agents can do. Assign tool groups to agents above.</p>
+            <div className="grid grid-cols-2 gap-3">
+              {Object.entries(tools).map(([group, groupTools]) => (
+                <div key={group} className="p-3 rounded-lg bg-[var(--bg)] border border-[var(--border)]">
+                  <div className="text-sm font-medium text-purple-400 mb-2">{group}</div>
+                  {(groupTools as any[]).map((t: any) => (
+                    <div key={t.name} className="text-xs text-[var(--text-muted)] py-0.5 flex gap-1">
+                      <span className="text-[var(--text)] font-mono">{t.name}</span>
+                      <span className="truncate">{t.description.slice(0, 50)}</span>
                     </div>
                   ))}
                 </div>
-              </div>
-            </>
-          ) : (
-            <div className="text-gray-500 text-center py-20">Select a team to configure</div>
-          )}
+              ))}
+            </div>
+          </section>
         </div>
-      </div>
+      )}
     </div>
   );
 }

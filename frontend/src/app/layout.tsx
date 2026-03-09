@@ -1,44 +1,54 @@
-import type { Metadata } from "next";
+"use client";
 import { Inter } from "next/font/google";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import "./globals.css";
 
 const inter = Inter({ subsets: ["latin"] });
 
-export const metadata: Metadata = {
-  title: "SDLC Agent Studio",
-  description: "Multi-agent coding assistant with MCP, evaluation, and observability",
-};
-
-const NAV_ITEMS = [
-  { href: "/", label: "Studio" },
-  { href: "/chat", label: "Chat" },
-  { href: "/monitoring", label: "Monitoring" },
-  { href: "/evaluation", label: "Evaluation" },
-  { href: "/traces", label: "Traces" },
+const NAV = [
+  { href: "/", label: "Studio", icon: "⚙" },
+  { href: "/chat", label: "Chat", icon: "💬" },
+  { href: "/monitoring", label: "Monitoring", icon: "📊" },
+  { href: "/evaluation", label: "Evaluation", icon: "🧪" },
+  { href: "/traces", label: "Traces", icon: "🔍" },
 ];
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+
   return (
     <html lang="en">
-      <body className={`${inter.className} bg-gray-950 text-gray-100 min-h-screen`}>
-        <nav className="border-b border-gray-800 bg-gray-900/50 backdrop-blur sticky top-0 z-50">
-          <div className="max-w-7xl mx-auto px-4 flex items-center h-14 gap-8">
-            <span className="font-bold text-lg text-white">SDLC Agent</span>
-            <div className="flex gap-1">
-              {NAV_ITEMS.map((item) => (
-                <Link
-                  key={item.href}
-                  href={item.href}
-                  className="px-3 py-1.5 text-sm text-gray-400 hover:text-white hover:bg-gray-800 rounded-md transition-colors"
-                >
+      <body className={`${inter.className} min-h-screen flex`}>
+        {/* Sidebar */}
+        <aside className="w-56 border-r border-[var(--border)] bg-[var(--bg-card)] flex flex-col fixed h-screen">
+          <div className="p-5 border-b border-[var(--border)]">
+            <div className="text-base font-semibold text-white tracking-tight">SDLC Agent</div>
+            <div className="text-[11px] text-[var(--text-muted)] mt-0.5">Multi-Agent Platform</div>
+          </div>
+          <nav className="flex-1 p-3 space-y-0.5">
+            {NAV.map((item) => {
+              const active = pathname === item.href;
+              return (
+                <Link key={item.href} href={item.href}
+                  className={`flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] transition-all ${
+                    active
+                      ? "bg-[var(--accent)]/10 text-[var(--accent)] font-medium"
+                      : "text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-[var(--bg-hover)]"
+                  }`}>
+                  <span className="text-sm">{item.icon}</span>
                   {item.label}
                 </Link>
-              ))}
-            </div>
+              );
+            })}
+          </nav>
+          <div className="p-4 border-t border-[var(--border)] text-[11px] text-[var(--text-muted)]">
+            LangGraph + MCP
           </div>
-        </nav>
-        <main className="max-w-7xl mx-auto px-4 py-6">{children}</main>
+        </aside>
+
+        {/* Main */}
+        <main className="ml-56 flex-1 p-8 min-h-screen">{children}</main>
       </body>
     </html>
   );
