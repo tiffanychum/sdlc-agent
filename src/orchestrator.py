@@ -118,6 +118,7 @@ async def build_orchestrator_from_team(team_id: str = "default"):
                 "id": a.id, "name": a.name, "role": a.role,
                 "description": a.description, "system_prompt": a.system_prompt,
                 "tool_groups": tool_groups,
+                "model": getattr(a, "model", "") or "",
             })
 
         strategy = team.decision_strategy or "router_decides"
@@ -132,7 +133,7 @@ async def build_orchestrator_from_team(team_id: str = "default"):
         for group in ac["tool_groups"]:
             agent_tools.extend(tool_map.get(group, []))
         final_prompt = build_agent_prompt(ac["id"], ac["system_prompt"])
-        llm = get_llm()
+        llm = get_llm(model=ac["model"] if ac["model"] else None)
         built_agents[ac["role"]] = create_react_agent(
             model=llm, tools=agent_tools, prompt=final_prompt,
         )

@@ -60,6 +60,7 @@ class AgentCreate(BaseModel):
     description: str = ""
     system_prompt: str = ""
     tool_groups: list[str] = []
+    model: str = ""
 
 class AgentUpdate(BaseModel):
     name: Optional[str] = None
@@ -67,6 +68,7 @@ class AgentUpdate(BaseModel):
     description: Optional[str] = None
     system_prompt: Optional[str] = None
     tool_groups: Optional[list[str]] = None
+    model: Optional[str] = None
 
 class SkillCreate(BaseModel):
     name: str
@@ -138,6 +140,7 @@ def get_team(team_id: str):
             "id": a.id, "name": a.name, "role": a.role,
             "description": a.description, "system_prompt": a.system_prompt,
             "tool_groups": tools, "skills": skills,
+            "model": getattr(a, "model", "") or "",
         })
     result = {
         "id": team.id, "name": team.name, "description": team.description,
@@ -182,7 +185,8 @@ def create_agent(team_id: str, data: AgentCreate):
         session.close()
         raise HTTPException(404, "Team not found")
     agent = Agent(team_id=team_id, name=data.name, role=data.role,
-                  description=data.description, system_prompt=data.system_prompt)
+                  description=data.description, system_prompt=data.system_prompt,
+                  model=data.model)
     session.add(agent)
     session.flush()
     for tg in data.tool_groups:
@@ -203,6 +207,7 @@ def update_agent(agent_id: str, data: AgentUpdate):
     if data.role is not None: agent.role = data.role
     if data.description is not None: agent.description = data.description
     if data.system_prompt is not None: agent.system_prompt = data.system_prompt
+    if data.model is not None: agent.model = data.model
     if data.tool_groups is not None:
         session.query(AgentToolMapping).filter_by(agent_id=agent_id).delete()
         for tg in data.tool_groups:
@@ -385,10 +390,13 @@ def get_trace(trace_id: str):
     return result
 
 @app.get("/api/traces/stats")
-def trace_stats(days: int = 30):
+def trace_stats(days: int = 30, team_id: str = None):
     session = get_session()
     cutoff = datetime.utcnow() - timedelta(days=days)
-    traces = session.query(Trace).filter(Trace.created_at >= cutoff).all()
+    q = session.query(Trace).filter(Trace.created_at >= cutoff)
+    if team_id:
+        q = q.filter(Trace.team_id == team_id)
+    traces = q.all()
 
     if not traces:
         session.close()
@@ -482,7 +490,7 @@ def get_eval_run(run_id: str):
 async def run_eval(request: EvalRequest):
     from src.evaluation.evaluator import AgentEvaluator
     evaluator = AgentEvaluator()
-    run = await evaluator.run_evaluation(team_id=request.team_id)
+    run = await evaluator.run_evaluation(team_id=request.team_id, skip_init=True)
     return run.summary()
 
 @app.post("/api/eval/compare")

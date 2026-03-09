@@ -1,11 +1,8 @@
 """
 Automated evaluation pipeline for agent performance assessment.
 
-Supports:
-- Single-model evaluation runs
-- Multi-LLM comparison (run same scenarios with different models)
-- Regression detection between runs
-- Persisting results to DB and JSON
+Supports single-model runs, multi-LLM comparison, and regression detection.
+Computes 7 industry-standard metrics per the evaluation plan.
 """
 
 import json
@@ -32,13 +29,14 @@ class AgentEvaluator:
         self,
         scenarios: list[EvalScenario] = None,
         team_id: str = "default",
+        skip_init: bool = False,
     ) -> EvalRunMetric:
-        """Execute all scenarios and return aggregated metrics."""
         from src.orchestrator import build_orchestrator_from_team
-        from src.db.database import init_db, seed_defaults
 
-        init_db()
-        seed_defaults()
+        if not skip_init:
+            from src.db.database import init_db, seed_defaults
+            init_db()
+            seed_defaults()
 
         scenarios = scenarios or SCENARIOS
         orchestrator = await build_orchestrator_from_team(team_id)
@@ -63,7 +61,6 @@ class AgentEvaluator:
         scenarios: list[EvalScenario] = None,
         team_id: str = "default",
     ) -> list[EvalRunMetric]:
-        """Run the same scenarios with multiple LLM configs and return all results."""
         results = []
         for mc in model_configs:
             evaluator = AgentEvaluator(
@@ -72,7 +69,7 @@ class AgentEvaluator:
                 api_key=mc.get("api_key", self.api_key),
                 prompt_version=mc.get("prompt_version", self.prompt_version),
             )
-            run = await evaluator.run_evaluation(scenarios=scenarios, team_id=team_id)
+            run = await evaluator.run_evaluation(scenarios=scenarios, team_id=team_id, skip_init=True)
             results.append(run)
         return results
 
@@ -83,6 +80,7 @@ class AgentEvaluator:
             prompt=scenario.prompt,
             expected_agent=scenario.expected_agent,
             expected_tools=scenario.expected_tools,
+            expected_min_steps=scenario.expected_min_steps,
         )
         task.start_time = datetime.now()
 
@@ -109,11 +107,14 @@ class AgentEvaluator:
                             )
                             task.tool_calls.append(tool_metric)
 
+            for msg in result.get("messages", []):
+                if hasattr(msg, "content") and hasattr(msg, "type") and msg.type == "tool":
+                    task.tool_outputs.append(str(msg.content)[:500])
+
             last_msg = result["messages"][-1] if result.get("messages") else None
             if last_msg:
-                task.final_response = (
-                    last_msg.content if hasattr(last_msg, "content") else str(last_msg)
-                )
+                content = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+                task.final_response = str(content) if not isinstance(content, str) else content
 
             task.completed = self._check_success(task.final_response, scenario)
 
@@ -135,53 +136,36 @@ class AgentEvaluator:
     def _save_results(self, run: EvalRunMetric) -> None:
         os.makedirs(self.results_dir, exist_ok=True)
         filepath = os.path.join(self.results_dir, f"eval_{run.run_id}_{run.timestamp[:10]}.json")
-
-        data = {
-            "summary": run.summary(),
-            "tasks": [
-                {
-                    "task_id": t.task_id,
-                    "scenario": t.scenario_name,
-                    "prompt": t.prompt,
-                    "expected_agent": t.expected_agent,
-                    "actual_agent": t.actual_agent,
-                    "routing_correct": t.routing_correct,
-                    "completed": t.completed,
-                    "tool_call_accuracy": round(t.tool_call_accuracy, 3),
-                    "failure_recovery_rate": round(t.failure_recovery_rate, 3),
-                    "latency_ms": round(t.latency_ms, 1) if t.latency_ms else None,
-                    "tool_calls": [
-                        {"tool": tc.tool_name, "correct": tc.was_correct,
-                         "error": tc.error, "recovered": tc.recovered}
-                        for tc in t.tool_calls
-                    ],
-                    "error": t.error,
-                }
-                for t in run.tasks
-            ],
-        }
-
+        data = {"summary": run.summary(), "tasks": [
+            {
+                "task_id": t.task_id, "scenario": t.scenario_name,
+                "completed": t.completed, "routing_correct": t.routing_correct,
+                "tool_call_accuracy": round(t.tool_call_accuracy, 3),
+                "step_efficiency": round(t.step_efficiency, 3),
+                "hallucination_score": round(t.hallucination_score, 3),
+                "safety_score": round(t.safety_score, 3),
+                "reasoning_quality": round(t.reasoning_quality, 3),
+                "latency_ms": round(t.latency_ms, 1) if t.latency_ms else None,
+                "error": t.error,
+            }
+            for t in run.tasks
+        ]}
         with open(filepath, "w") as f:
             json.dump(data, f, indent=2)
 
     def _save_to_db(self, run: EvalRunMetric, team_id: str = None):
-        """Persist evaluation run summary to the database."""
         try:
             from src.db.database import get_session
             from src.db.models import EvalRun
-
             session = get_session()
             summary = run.summary()
             eval_run = EvalRun(
-                id=run.run_id,
-                model=run.model,
-                prompt_version=run.prompt_version,
-                team_id=team_id,
-                num_tasks=summary["num_tasks"],
-                task_completion_rate=summary["task_completion_rate"],
+                id=run.run_id, model=run.model, prompt_version=run.prompt_version,
+                team_id=team_id, num_tasks=summary["num_tasks"],
+                task_completion_rate=summary["task_success_rate"],
                 routing_accuracy=summary["routing_accuracy"],
-                avg_tool_call_accuracy=summary["avg_tool_call_accuracy"],
-                avg_failure_recovery_rate=summary["avg_failure_recovery_rate"],
+                avg_tool_call_accuracy=summary["tool_accuracy"],
+                avg_failure_recovery_rate=summary["failure_recovery"],
                 avg_latency_ms=summary.get("avg_latency_ms"),
                 results_json=summary,
             )
@@ -195,7 +179,8 @@ class AgentEvaluator:
     def compare_runs(run_a: EvalRunMetric, run_b: EvalRunMetric) -> dict:
         a, b = run_a.summary(), run_b.summary()
         comparison = {}
-        for key in ["task_completion_rate", "routing_accuracy", "avg_tool_call_accuracy", "avg_failure_recovery_rate"]:
+        for key in ["task_success_rate", "tool_accuracy", "reasoning_quality", "step_efficiency",
+                     "faithfulness", "safety_compliance", "routing_accuracy"]:
             val_a, val_b = a.get(key, 0), b.get(key, 0)
             delta = val_b - val_a
             comparison[key] = {

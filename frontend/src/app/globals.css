@@ -1,17 +1,24 @@
 @import "tailwindcss";
 
 :root {
-  --bg: #0a0a0f;
-  --bg-card: #12121a;
-  --bg-hover: #1a1a25;
-  --border: #1e1e2e;
-  --text: #e4e4e7;
-  --text-muted: #71717a;
-  --accent: #3b82f6;
-  --accent-hover: #2563eb;
-  --success: #22c55e;
-  --warning: #eab308;
-  --error: #ef4444;
+  --bg: #f8f9fb;
+  --bg-card: #ffffff;
+  --bg-hover: #f1f3f5;
+  --bg-sidebar: #fafbfc;
+  --border: #e5e7eb;
+  --text: #111827;
+  --text-muted: #6b7280;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-light: #eff6ff;
+  --success: #16a34a;
+  --success-light: #f0fdf4;
+  --warning: #ca8a04;
+  --warning-light: #fefce8;
+  --error: #dc2626;
+  --error-light: #fef2f2;
+  --purple: #7c3aed;
+  --purple-light: #f5f3ff;
 }
 
 body {
@@ -24,45 +31,72 @@ body {
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 20px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
 }
 
 .btn-primary {
   background: var(--accent);
   color: white;
-  padding: 8px 16px;
-  border-radius: 8px;
+  padding: 7px 14px;
+  border-radius: 7px;
   font-size: 13px;
   font-weight: 500;
   transition: background 0.15s;
+  cursor: pointer;
 }
 .btn-primary:hover { background: var(--accent-hover); }
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
 
+.btn-secondary {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 7px 14px;
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all 0.15s;
+  cursor: pointer;
+}
+.btn-secondary:hover { background: var(--bg-hover); }
+
 .btn-ghost {
   color: var(--text-muted);
-  padding: 8px 16px;
-  border-radius: 8px;
+  padding: 7px 14px;
+  border-radius: 7px;
   font-size: 13px;
   transition: all 0.15s;
+  cursor: pointer;
 }
 .btn-ghost:hover { color: var(--text); background: var(--bg-hover); }
 
+.btn-danger {
+  color: var(--error);
+  padding: 7px 14px;
+  border-radius: 7px;
+  font-size: 13px;
+  transition: all 0.15s;
+  cursor: pointer;
+}
+.btn-danger:hover { background: var(--error-light); }
+
 .input {
-  background: var(--bg);
+  background: var(--bg-card);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px 12px;
+  border-radius: 7px;
+  padding: 7px 11px;
   font-size: 13px;
   color: var(--text);
   width: 100%;
   outline: none;
   transition: border-color 0.15s;
 }
-.input:focus { border-color: var(--accent); }
+.input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-light); }
 
 .badge {
   font-size: 11px;
   padding: 2px 8px;
   border-radius: 99px;
   font-weight: 500;
+  display: inline-block;
 }

@@ -138,8 +138,10 @@ class TestEvalRunMetrics:
         summary = run.summary()
         expected_keys = {
             "run_id", "model", "prompt_version", "timestamp",
-            "num_tasks", "task_completion_rate", "routing_accuracy",
-            "avg_tool_call_accuracy", "avg_failure_recovery_rate", "avg_latency_ms",
+            "num_tasks", "task_success_rate", "tool_accuracy",
+            "reasoning_quality", "step_efficiency", "faithfulness",
+            "routing_accuracy", "failure_recovery", "safety_compliance",
+            "avg_latency_ms",
         }
         assert set(summary.keys()) == expected_keys
 
@@ -163,7 +165,7 @@ class TestRegressionDetection:
             )],
         )
         comparison = AgentEvaluator.compare_runs(run_a, run_b)
-        assert comparison["task_completion_rate"]["regression"] is True
+        assert comparison["task_success_rate"]["regression"] is True
         assert comparison["routing_accuracy"]["regression"] is True
 
     def test_no_regression(self):

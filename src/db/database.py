@@ -21,7 +21,20 @@ def get_engine():
 def init_db():
     engine = get_engine()
     Base.metadata.create_all(engine)
+    _migrate(engine)
     return engine
+
+
+def _migrate(engine):
+    """Add columns that may be missing in older DBs."""
+    from sqlalchemy import text, inspect
+    insp = inspect(engine)
+    if "agents" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("agents")}
+        if "model" not in cols:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN model TEXT DEFAULT ''"))
+                conn.commit()
 
 
 def get_session() -> Session:

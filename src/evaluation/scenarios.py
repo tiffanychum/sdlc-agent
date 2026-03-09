@@ -1,11 +1,7 @@
 """
 Evaluation scenarios for testing agent performance.
 
-Each scenario simulates a real developer workflow:
-- A user prompt (what the developer asks)
-- The expected agent routing (which agent should handle it)
-- Expected tool calls (which MCP tools should be invoked)
-- Success criteria (how to verify the task was completed)
+Each scenario includes expected_min_steps for step efficiency scoring.
 """
 
 from dataclasses import dataclass, field
@@ -18,18 +14,18 @@ class EvalScenario:
     expected_agent: str
     expected_tools: list[str]
     success_keywords: list[str]
+    expected_min_steps: int = 1
     description: str = ""
 
 
 SCENARIOS: list[EvalScenario] = [
-    # --- Routing Accuracy ---
     EvalScenario(
         name="route_to_coder_read_file",
         prompt="Read the main.py file and explain what it does",
         expected_agent="coder",
         expected_tools=["read_file"],
         success_keywords=["main", "chat", "eval"],
-        description="Simple file reading task should route to coder",
+        expected_min_steps=1,
     ),
     EvalScenario(
         name="route_to_runner_run_tests",
@@ -37,7 +33,7 @@ SCENARIOS: list[EvalScenario] = [
         expected_agent="runner",
         expected_tools=["run_tests"],
         success_keywords=["test", "pass", "fail"],
-        description="Test execution should route to runner",
+        expected_min_steps=1,
     ),
     EvalScenario(
         name="route_to_researcher_lookup",
@@ -45,7 +41,7 @@ SCENARIOS: list[EvalScenario] = [
         expected_agent="researcher",
         expected_tools=["web_search", "fetch_url"],
         success_keywords=["langgraph", "install", "pip"],
-        description="Library research should route to researcher",
+        expected_min_steps=1,
     ),
     EvalScenario(
         name="route_to_coder_git_operation",
@@ -53,17 +49,15 @@ SCENARIOS: list[EvalScenario] = [
         expected_agent="coder",
         expected_tools=["git_status", "git_diff"],
         success_keywords=["modified", "change", "diff"],
-        description="Git operations should route to coder",
+        expected_min_steps=1,
     ),
-
-    # --- Tool-Call Accuracy ---
     EvalScenario(
         name="explore_before_edit",
         prompt="Find where the router prompt is defined and add a new agent type called 'devops'",
         expected_agent="coder",
         expected_tools=["search_files", "read_file", "edit_file"],
         success_keywords=["prompts.py", "devops"],
-        description="Agent should search → read → edit (not blindly edit)",
+        expected_min_steps=3,
     ),
     EvalScenario(
         name="multi_tool_research",
@@ -71,7 +65,7 @@ SCENARIOS: list[EvalScenario] = [
         expected_agent="researcher",
         expected_tools=["web_search", "fetch_url"],
         success_keywords=["FastMCP", "example", "python"],
-        description="Research should search then fetch relevant pages",
+        expected_min_steps=2,
     ),
     EvalScenario(
         name="write_and_execute",
@@ -79,17 +73,15 @@ SCENARIOS: list[EvalScenario] = [
         expected_agent="coder",
         expected_tools=["write_file"],
         success_keywords=["fibonacci", "print"],
-        description="Code generation task — write then potentially hand off to runner",
+        expected_min_steps=1,
     ),
-
-    # --- Failure Recovery ---
     EvalScenario(
         name="handle_missing_file",
         prompt="Read the file src/nonexistent_module.py",
         expected_agent="coder",
         expected_tools=["read_file"],
         success_keywords=["not found", "error", "doesn't exist", "does not exist"],
-        description="Agent should handle missing file gracefully",
+        expected_min_steps=1,
     ),
     EvalScenario(
         name="handle_failing_command",
@@ -97,17 +89,15 @@ SCENARIOS: list[EvalScenario] = [
         expected_agent="runner",
         expected_tools=["run_command"],
         success_keywords=["error", "no such file", "not found"],
-        description="Agent should report command failure clearly",
+        expected_min_steps=1,
     ),
-
-    # --- Complex Multi-Step Workflows ---
     EvalScenario(
         name="understand_project_structure",
         prompt="Give me an overview of this project — what are the main components and how do they connect?",
         expected_agent="coder",
         expected_tools=["list_directory", "read_file"],
         success_keywords=["agent", "mcp", "tool"],
-        description="Agent should explore directory structure then read key files",
+        expected_min_steps=2,
     ),
     EvalScenario(
         name="debug_workflow",
@@ -115,6 +105,6 @@ SCENARIOS: list[EvalScenario] = [
         expected_agent="runner",
         expected_tools=["run_tests"],
         success_keywords=["test"],
-        description="Debug workflow: run → analyze → report",
+        expected_min_steps=1,
     ),
 ]
