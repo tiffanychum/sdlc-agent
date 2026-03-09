@@ -1,334 +1,376 @@
-# PoC of SDLC Agent — General-Purpose Coding Assistant
+# SDLC Agent — Multi-Agent Coding Platform
 
-A multi-agent coding assistant that can read/write code, run commands, search the web, and manage git — all through natural language. Built with **LangGraph** for agent orchestration and **MCP (Model Context Protocol)** for standardized agent-to-tool communication.
+A full-stack multi-agent platform for automating software development workflows. Features a **5-agent team** with per-agent decision strategies, **MCP (Model Context Protocol)** for standardized tool integration, an **industry-standard evaluation pipeline** with LLM-as-Judge scoring, and a **Next.js dashboard** for configuration, monitoring, and observability.
 
-## What It Does
-
-Ask it anything a developer would do:
-
-```
-You: "Read main.py and explain the architecture"
-→ Coder Agent reads the file via Filesystem MCP → explains the code
-
-You: "Run the tests and tell me what's failing"
-→ Runner Agent executes pytest via Shell MCP → reports failures
-
-You: "How do I use LangGraph's create_react_agent?"
-→ Researcher Agent searches the web via Web MCP → fetches docs → summarizes
-
-You: "Create a new branch, add a docstring to config.py, and commit"
-→ Coder Agent uses Git MCP + Filesystem MCP → branch, edit, commit
-```
+Built with LangGraph, MCP, FastAPI, SQLite, DeepEval, Langfuse, and Next.js.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                      User Request                             │
-│            "Run the tests and fix any failures"               │
-└───────────────────────────┬──────────────────────────────────┘
-                            │
-                            ▼
-┌──────────────────────────────────────────────────────────────┐
-│                     Router Agent (LLM)                        │
-│                                                               │
-│   Classifies request → selects the best agent                 │
-│   "This involves running tests → route to Runner"             │
-└──────────┬─────────────────┬─────────────────┬───────────────┘
-           │                 │                 │
-           ▼                 ▼                 ▼
-┌────────────────┐ ┌────────────────┐ ┌────────────────────┐
-│  Coder Agent   │ │  Runner Agent  │ │ Researcher Agent   │
-│                │ │                │ │                    │
-│ Read code      │ │ Run commands   │ │ Search the web     │
-│ Write code     │ │ Execute tests  │ │ Fetch docs         │
-│ Edit files     │ │ Build projects │ │ Look up errors     │
-│ Search code    │ │ Run scripts    │ │ Read API refs      │
-│ Git operations │ │                │ │                    │
-└───────┬────────┘ └───────┬────────┘ └──────────┬─────────┘
-        │                  │                      │
-        ▼                  ▼                      ▼
-┌──────────────────────────────────────────────────────────────┐
-│                  MCP Communication Layer                      │
-│                                                               │
-│  Standardized tool discovery, schema validation,              │
-│  invocation, error handling, and observability                 │
-└──────┬──────────────┬──────────────┬──────────────┬──────────┘
-       │              │              │              │
-       ▼              ▼              ▼              ▼
-┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐
-│ Filesystem │ │   Shell    │ │    Git     │ │    Web     │
-│ MCP Server │ │ MCP Server │ │ MCP Server │ │ MCP Server │
-│            │ │            │ │            │ │            │
-│ read_file  │ │ run_command│ │ git_status │ │ fetch_url  │
-│ write_file │ │ run_script │ │ git_diff   │ │ web_search │
-│ edit_file  │ │ run_tests  │ │ git_log    │ │ check_url  │
-│ search     │ │            │ │ git_commit │ │            │
-│ find       │ │            │ │ git_branch │ │            │
-│ list_dir   │ │            │ │ git_show   │ │            │
-└────────────┘ └────────────┘ └────────────┘ └────────────┘
+                         User Request
+                              │
+                              ▼
+                    ┌───────────────────┐
+                    │   Router (LLM)    │  Classifies intent,
+                    │                   │  selects best agent
+                    └─────────┬─────────┘
+                              │
+          ┌───────────┬───────┼───────┬────────────┐
+          ▼           ▼       ▼       ▼            ▼
+     ┌─────────┐ ┌────────┐ ┌────────┐ ┌─────────┐ ┌──────────┐
+     │ Coder   │ │ Runner │ │Research│ │ Planner │ │ Reviewer │
+     │ (ReAct) │ │(ReAct) │ │(ReAct) │ │(Plan+Ex)│ │(Reflexn) │
+     └────┬────┘ └───┬────┘ └───┬────┘ └────┬────┘ └─────┬────┘
+          │          │          │           │            │
+          ▼          ▼          ▼           ▼            ▼
+     ┌──────────────────────────────────────────────────────┐
+     │              MCP Communication Layer                  │
+     │  Tool discovery · Schema validation · Error handling  │
+     └──┬─────────┬──────────┬──────────┬──────────┬───────┘
+        ▼         ▼          ▼          ▼          ▼
+   Filesystem   Shell       Git        Web      Memory
+   (6 tools)  (3 tools)  (6 tools)  (3 tools)  (6 tools)
 ```
 
-### How It Works — Step by Step
+## How the Agent Team Works
 
-1. **User sends a request** (e.g., "Find the bug in auth.py and fix it")
-2. **Router Agent** — A lightweight LLM call classifies the request and picks the best agent
-3. **Specialized Agent** — Uses the ReAct pattern (Reasoning + Acting) via LangGraph to decide which tools to call
-4. **MCP Layer** — Handles tool discovery (what tools exist?), schema validation (are the args correct?), invocation (execute the tool), and error handling (what if it fails?)
-5. **MCP Servers** — Execute the actual operations against the filesystem, shell, git, or web
-6. **Agent synthesizes** the tool results into a coherent response
-7. **Trace is recorded** — Every routing decision and tool call is logged for the evaluation pipeline
+### 5 Specialized Agents
 
-### Why MCP (Model Context Protocol)?
+Each agent has a specific role, decision strategy, MCP tool set, and skills:
 
-[MCP](https://modelcontextprotocol.io/) is the open standard (created by Anthropic) for connecting AI agents to external tools. Instead of hardcoding tool integrations, MCP gives us:
+| Agent | Strategy | Tools | Role |
+|-------|----------|-------|------|
+| **Coder** | ReAct | filesystem, git | Reads/writes code, navigates codebases, manages version control |
+| **Runner** | ReAct | shell | Executes commands, runs tests, builds projects |
+| **Researcher** | ReAct | web | Searches documentation, fetches API references, finds solutions |
+| **Planner** | Plan-and-Execute | memory, filesystem | Creates structured task plans, tracks progress, stores context |
+| **Reviewer** | Reflexion | filesystem, shell, git, memory | Reviews code quality, runs tests, reflects on correctness |
 
-| Benefit | How |
-|---------|-----|
-| **Tool Discovery** | Agents dynamically discover available tools and their schemas at runtime |
-| **Standardized Interface** | Same request/response format for all tools, regardless of what they do |
-| **Error Propagation** | Consistent error handling from tools back to agents |
-| **Observability** | Every tool call is recorded with inputs, outputs, and success/failure |
-| **Extensibility** | Add a new tool by deploying a new MCP server — zero agent code changes |
+### Per-Agent Decision Strategies
 
-This is the same protocol used by Claude, Cursor, and other AI coding tools.
+Each agent uses the decision strategy best suited to its role:
+
+| Strategy | How It Works | Best For |
+|----------|-------------|----------|
+| **ReAct** | Think → Act → Observe → Repeat | Quick, focused tasks (reading files, running commands) |
+| **Plan-and-Execute** | Create a numbered plan first, then execute step by step | Complex multi-step tasks that need decomposition |
+| **Reflexion** | After each action, reflect on whether it was correct | Quality-critical tasks (code review, verification) |
+| **Chain-of-Thought** | Reason thoroughly before taking any action | Tasks requiring careful analysis |
+
+### MCP vs Skills — Clear Separation
+
+Following the [Claude Code principle](https://docs.anthropic.com/): **"MCP gives power. Skills control power."**
+
+**MCP Tools** (what agents CAN do):
+- 24 tools across 5 MCP servers (filesystem, shell, git, web, memory)
+- Each tool has a JSON Schema defining its parameters
+- Agents discover tools dynamically at runtime via the MCP protocol
+
+**Skills** (HOW agents SHOULD behave):
+- Instruction-only injections appended to the agent's system prompt
+- No tools, no execution — just behavioral guidance
+- 7 default skills: Code Review, Git Conventions, Error Recovery, Plan First, Security Awareness, Documentation Citation, Test-Driven Approach
+- Skills can be assigned to specific agents and auto-triggered by prompt patterns
+
+### Routing: How Requests Reach the Right Agent
+
+1. User sends a request (e.g., "Create a plan for refactoring the config module")
+2. A lightweight **Router LLM call** classifies the intent and selects the best agent
+3. The selected agent runs with its assigned tools and strategy
+4. Every step is traced (routing decision, tool calls, response) for evaluation
+
+### LLM Configuration
+
+The platform uses any **OpenAI-compatible API** as its LLM backbone. Each agent can use a different model:
+
+```
+# .env — Global default
+LLM_BASE_URL=https://api.poe.com/v1
+LLM_MODEL=gpt-5-nano
+
+# Per-agent model selection (via Studio UI)
+# Coder → gemini-2.5-flash-lite
+# Runner → llama-3.1-8b-cs
+# Researcher → gpt-4o-mini-search
+```
+
+Supported models: `gemini-2.5-flash-lite`, `llama-3.1-8b-cs`, `mistral-small-3`, `grok-4.1-fast-reasoning`, `claude-haiku-3`, `gpt-4o-mini-search`, or any model available through the configured API.
+
+## Evaluation System
+
+### 7 Industry-Standard Metrics
+
+| Metric | What It Measures | How |
+|--------|-----------------|-----|
+| **Task Success Rate** | Did the agent complete the task accurately? | Keyword matching against expected outputs |
+| **Tool Accuracy** | Did it select the right tools with correct parameters? | Compare actual vs expected tool calls |
+| **Reasoning Quality** | Were the intermediate steps coherent and logical? | Composite: routing correct + tools used + task completed |
+| **Step Efficiency** | Did it complete with minimum necessary steps? | Ratio of expected min steps to actual steps |
+| **Faithfulness** | Is the output grounded in tool data, not hallucinated? | Keyword overlap between tool outputs and response |
+| **Safety/Compliance** | Any PII leakage or prompt injection in output? | Regex patterns for SSN, credit cards, emails, injection markers |
+| **Routing Accuracy** | Was the request sent to the correct agent? | Compare actual agent vs expected agent |
+
+### Evaluation Approaches
+
+The evaluation system uses multiple complementary approaches:
+
+**1. Rule-Based Metrics**
+- Automated checks for task completion, tool accuracy, step efficiency, safety
+- Fast, deterministic, no LLM cost
+- Run on every evaluation
+
+**2. LLM-as-Judge (G-Eval)**
+- Uses the LLM itself to score agent responses on 5 criteria:
+  - Correctness, Relevance, Coherence, Tool Usage Quality, Completeness
+- Each criterion has a rubric (1-5 scale), normalized to 0-1
+- Following the [DeepEval G-Eval methodology](https://docs.confident-ai.com/)
+
+**3. Trajectory/Step Evaluation**
+- Scores each step individually (routing decision, each tool call, final response)
+- Assesses whether steps were necessary, in logical order, and non-redundant
+- Returns per-step scores + overall trajectory quality + reasoning explanation
+
+**4. DeepEval Integration**
+- Answer Relevancy metric (is the response relevant to the input?)
+- Faithfulness metric (is the response grounded in tool outputs?)
+- Formal evaluation via the DeepEval SDK
+
+**5. Langfuse Integration**
+- Auto-exports every chat trace as a Langfuse trace with spans
+- Auto-exports evaluation runs with metric scores
+- Enables production observability at [cloud.langfuse.com](https://cloud.langfuse.com)
+
+### 16 Evaluation Scenarios
+
+Organized by complexity to test different agent capabilities:
+
+| Complexity | Count | What It Tests | Example |
+|-----------|-------|---------------|---------|
+| **Quick** | 5 | Single-step routing accuracy | "Read main.py and explain what it does" |
+| **Medium** | 5 | 2-3 step tool selection | "Find where AgentConfig is defined, then read and explain it" |
+| **Complex** | 6 | 4+ step multi-tool workflows | "Explore project structure, read 3 key files, write a summary" |
+
+### Regression Detection
+
+Compare evaluation runs before/after prompt or model changes:
+
+```python
+comparison = AgentEvaluator.compare_runs(run_v1, run_v2)
+# Flags any metric that dropped by >5% as a regression
+# {"task_success_rate": {"before": 1.0, "after": 0.8, "regression": True}}
+```
+
+### Multi-LLM Comparison
+
+Run the same scenarios with different models and compare side-by-side:
+
+```python
+configs = [
+    {"model": "gemini-2.5-flash-lite"},
+    {"model": "gpt-4o-mini-search"},
+    {"model": "claude-haiku-3"},
+]
+results = await evaluator.run_comparison(configs)
+```
+
+## Observability & Tracing
+
+Every agent interaction is traced following the **OpenTelemetry trace/span model**:
+
+- **Trace**: One complete user request → response cycle
+- **Spans**: Individual operations (routing decision, LLM call, tool invocation)
+- Each span records: input/output data, tokens, cost, latency, status
+
+Traces are persisted to SQLite and exported to Langfuse for production monitoring.
+
+### Monitoring Dashboard
+
+The dashboard shows per-team metrics:
+- Application Runs, Failures, Pass Rate, Total Cost
+- Task Quality trends (success, tool accuracy, safety over time)
+- Operational Efficiency (latency P50/P95/P99, tokens, cost per run)
+- Recent trace list with latency and status
 
 ## Project Structure
 
 ```
 sdlc-agent/
 ├── main.py                          # CLI: chat, eval, health check
-├── server.py                        # FastAPI server: REST + WebSocket
-├── requirements.txt
-├── pyproject.toml
+├── server.py                        # FastAPI: 25+ REST endpoints
+├── frontend/                        # Next.js dashboard (4 pages)
 │
 ├── src/
-│   ├── config.py                    # Environment + app configuration
-│   │
-│   ├── llm/
-│   │   └── client.py                # LLM client (OpenAI-compatible API)
+│   ├── config.py                    # Environment configuration
+│   ├── orchestrator.py              # LangGraph multi-agent router + 4 strategies
 │   │
 │   ├── agents/
-│   │   ├── prompts.py               # System prompts per agent role
-│   │   └── definitions.py           # Agent configs + factory functions
+│   │   ├── prompts.py               # Per-agent system prompts + strategy instructions
+│   │   └── definitions.py           # Agent configs + factory
 │   │
 │   ├── tools/
-│   │   └── registry.py              # MCP tools → LangChain bridge
+│   │   └── registry.py              # MCP → LangChain bridge (JSON Schema → Pydantic)
 │   │
 │   ├── mcp_servers/
-│   │   ├── filesystem_server.py     # Read, write, edit, search files
-│   │   ├── shell_server.py          # Execute commands, run tests
-│   │   ├── git_server.py            # Git status, diff, commit, branch
-│   │   └── web_server.py            # Fetch URLs, web search
+│   │   ├── filesystem_server.py     # 6 tools: read, write, edit, search, find, list
+│   │   ├── shell_server.py          # 3 tools: command, script, tests
+│   │   ├── git_server.py            # 6 tools: status, diff, log, commit, branch, show
+│   │   ├── web_server.py            # 3 tools: fetch, search, check
+│   │   └── memory_server.py         # 6 tools: store, retrieve, list, delete, plan, update
+│   │
+│   ├── skills/
+│   │   └── engine.py                # Skill injection + trigger matching
 │   │
 │   ├── evaluation/
-│   │   ├── metrics.py               # Metric definitions
-│   │   ├── scenarios.py             # Test scenarios
-│   │   ├── evaluator.py             # Evaluation pipeline runner
+│   │   ├── metrics.py               # 7 metrics + PII/injection detection
+│   │   ├── scenarios.py             # 16 scenarios (quick/medium/complex)
+│   │   ├── evaluator.py             # Pipeline: rule-based + LLM-judge + trajectory
+│   │   ├── llm_judge.py             # G-Eval: 5-criteria LLM scoring + trajectory eval
+│   │   ├── integrations.py          # DeepEval + Langfuse wrappers
 │   │   └── reporter.py              # Rich console reports
 │   │
-│   └── orchestrator.py              # LangGraph multi-agent router
+│   ├── tracing/
+│   │   ├── collector.py             # OpenTelemetry-style trace/span recording
+│   │   └── callbacks.py             # LangChain callback handler
+│   │
+│   └── db/
+│       ├── models.py                # SQLAlchemy: teams, agents, skills, traces, evals
+│       └── database.py              # SQLite connection + auto-migration + seeding
 │
 ├── tests/
-│   ├── test_mcp_communication.py    # E2E tests for MCP layer
-│   └── test_evaluation.py           # Unit tests for eval pipeline
+│   ├── test_mcp_communication.py    # 28 E2E tests for MCP layer
+│   └── test_evaluation.py           # 16 unit tests for eval pipeline
 │
-└── eval/
-    └── results/                     # Persisted evaluation results
+└── frontend/src/app/
+    ├── page.tsx                      # Agent Studio: team config, agents, skills, tools
+    ├── chat/page.tsx                 # Chat + real-time trace inspector
+    ├── monitoring/page.tsx           # Monitoring: metrics, charts, efficiency
+    └── evaluation/page.tsx           # Evaluation: run, compare, detail view
 ```
-
-## MCP Servers — The Tool Layer
-
-### Filesystem MCP Server
-The core tool for any coding agent:
-
-| Tool | Description |
-|------|-------------|
-| `read_file` | Read file contents with optional line range |
-| `write_file` | Create or overwrite files |
-| `edit_file` | Precise string replacement (like sed) — rejects ambiguous matches |
-| `list_directory` | List directory contents (recursive optional) |
-| `search_files` | Grep-like pattern search across codebase |
-| `find_files` | Find files by glob pattern |
-
-**Safety**: All paths are sandboxed to the workspace root. Directory traversal (`../../etc/passwd`) is blocked.
-
-### Shell MCP Server
-Command execution for builds, tests, and system operations:
-
-| Tool | Description |
-|------|-------------|
-| `run_command` | Execute any shell command with timeout enforcement |
-| `run_script` | Run a Python script file |
-| `run_tests` | Execute pytest with verbose output and pattern matching |
-
-**Safety**: Destructive commands (`rm -rf /`, `mkfs`, etc.) are blocked. Timeout enforcement prevents hangs.
-
-### Git MCP Server
-Version control for code changes:
-
-| Tool | Description |
-|------|-------------|
-| `git_status` | Show modified, staged, and untracked files |
-| `git_diff` | View changes (staged/unstaged, between commits) |
-| `git_log` | Commit history (oneline or detailed) |
-| `git_commit` | Stage and commit changes |
-| `git_branch` | List, create, or switch branches |
-| `git_show` | View commit details |
-
-### Web MCP Server
-Information gathering from the internet:
-
-| Tool | Description |
-|------|-------------|
-| `fetch_url` | Read web pages as clean text (HTML → text conversion) |
-| `web_search` | Search the web (DuckDuckGo, swap with Google/Brave API) |
-| `check_url` | Verify URL reachability and headers |
-
-## Evaluation Pipeline
-
-### What It Measures
-
-| Metric | Description |
-|--------|-------------|
-| **Task Completion Rate** | % of scenarios completed successfully |
-| **Routing Accuracy** | % of requests routed to the correct agent |
-| **Tool-Call Accuracy** | % of tool invocations matching expected tools |
-| **Failure Recovery Rate** | % of errors where the agent recovered gracefully |
-| **Latency** | End-to-end time per task |
-
-### How It Works
-
-```python
-from src.evaluation.evaluator import AgentEvaluator
-
-# Run evaluation
-evaluator = AgentEvaluator(model="gpt-5.3-codex", prompt_version="v1")
-run = await evaluator.run_evaluation()
-
-print(run.summary())
-# {
-#   "task_completion_rate": 0.818,
-#   "routing_accuracy": 0.909,
-#   "avg_tool_call_accuracy": 0.85,
-#   "avg_failure_recovery_rate": 1.0,
-#   "avg_latency_ms": 1250.3
-# }
-```
-
-### Regression Detection
-
-Compare runs before/after prompt or model changes:
-
-```python
-# Baseline
-run_v1 = await evaluator.run_evaluation()
-
-# After modifying prompts
-evaluator_v2 = AgentEvaluator(prompt_version="v2")
-run_v2 = await evaluator_v2.run_evaluation()
-
-# Compare — flags any metric that dropped >5%
-comparison = AgentEvaluator.compare_runs(run_v1, run_v2)
-# {"task_completion_rate": {"before": 0.82, "after": 0.73, "regression": True}}
-```
-
-### Evaluation Scenarios
-
-11 scenarios covering:
-- **Routing**: Does the router pick the right agent?
-- **Tool selection**: Does the agent call the right tools?
-- **Multi-step**: Can the agent chain operations (search → read → edit)?
-- **Failure recovery**: Does the agent handle errors gracefully?
-- **Cross-server**: Workflows spanning filesystem + shell + git
-
-## Testing
-
-### Run All Tests
-
-```bash
-# Full test suite
-pytest tests/ -v
-
-# MCP communication E2E tests only
-pytest tests/test_mcp_communication.py -v
-
-# Evaluation pipeline unit tests only
-pytest tests/test_evaluation.py -v
-```
-
-### Test Coverage
-
-| Test Class | What It Validates |
-|------------|-------------------|
-| `TestFilesystemMCPServer` | File CRUD, search, edit precision, path security, observability |
-| `TestShellMCPServer` | Command execution, stderr capture, timeouts, safety blocks |
-| `TestWebMCPServer` | URL fetching, JSON handling, error recovery |
-| `TestCrossServerWorkflows` | Multi-server flows: read → run, write → execute, search → read |
-| `TestTaskMetrics` | Metric calculations: accuracy, recovery rate, latency |
-| `TestEvalRunMetrics` | Aggregated run metrics, summary generation |
-| `TestRegressionDetection` | Before/after comparison, regression flagging |
-| `TestEvalScenarios` | Scenario well-formedness, uniqueness, coverage |
 
 ## Getting Started
 
 ### Prerequisites
 
-- Python 3.11+
-- An OpenAI-compatible API key (Poe, OpenAI, etc.)
+- Python 3.10+
+- Node.js 18+
+- An OpenAI-compatible API key
 
 ### Installation
 
 ```bash
+git clone https://github.com/tiffanychum/sdlc-agent.git
 cd sdlc-agent
-python -m venv venv
-source venv/bin/activate  # or `venv\Scripts\activate` on Windows
-pip install -r requirements.txt
 
+# Backend
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 cp .env.example .env
-# Edit .env with your API key
+# Edit .env with your API keys
+
+# Frontend
+cd frontend
+npm install
 ```
 
-### Usage
+### Configuration (.env)
 
 ```bash
-# Interactive chat
-python main.py chat
+POE_API_KEY=your_api_key           # LLM API key
+LLM_BASE_URL=https://api.poe.com/v1
+LLM_MODEL=gpt-5-nano              # Default model
+GITHUB_TOKEN=your_github_token     # Optional: for GitHub MCP server
 
-# Run evaluation pipeline
-python main.py eval
-
-# MCP server health check
-python main.py test-mcp
-
-# Start REST API server
-python server.py
-# Docs at http://localhost:8000/docs
+# Optional: evaluation integrations
+DEEPEVAL_KEY=your_deepeval_key
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_BASE_URL=https://cloud.langfuse.com
 ```
 
-### API Endpoints
+### Running
+
+```bash
+# Terminal 1 — Backend API
+source venv/bin/activate
+python server.py
+# API at http://localhost:8000/docs
+
+# Terminal 2 — Frontend
+cd frontend
+npm run dev
+# UI at http://localhost:3000
+
+# Or use the CLI
+python main.py chat      # Interactive chat
+python main.py eval      # Run evaluation
+python main.py test-mcp  # MCP health check
+```
+
+### Example Prompts to Test
+
+```
+# Simple (1-2 steps)
+"Read main.py and explain the architecture"
+"Run the tests and tell me the results"
+
+# Medium (2-3 steps)
+"Find where decision strategies are defined and list them"
+"Check git status and show me the diff"
+
+# Complex (4+ steps, long trajectory)
+"Create a plan for refactoring the config module"
+"Review recent git changes for issues"
+"Explore the project, read 3 key files, write a summary"
+```
+
+## API Reference
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/api/agents` | List available agents |
-| `GET` | `/api/health/mcp` | MCP server health check |
-| `POST` | `/api/chat` | Send a message |
-| `POST` | `/api/eval` | Run evaluation pipeline |
-| `WS` | `/ws/chat` | Real-time streaming chat |
+| `GET` | `/api/teams` | List teams |
+| `POST` | `/api/teams` | Create team |
+| `GET` | `/api/teams/{id}` | Team detail with agents |
+| `POST` | `/api/teams/{id}/agents` | Add agent to team |
+| `PUT` | `/api/agents/{id}` | Update agent (model, strategy, prompt) |
+| `GET` | `/api/skills` | List skills |
+| `POST` | `/api/skills` | Create skill |
+| `PUT` | `/api/agents/{id}/skills` | Assign skills |
+| `GET` | `/api/tools` | List all MCP tools (24 total) |
+| `POST` | `/api/teams/{id}/chat` | Chat with a team |
+| `GET` | `/api/traces` | List traces |
+| `GET` | `/api/traces/stats` | Aggregated metrics |
+| `POST` | `/api/eval/run` | Run evaluation |
+| `GET` | `/api/eval/runs` | List eval runs |
+| `GET` | `/api/eval/runs/{id}` | Eval detail (per-request breakdown) |
+| `GET` | `/api/eval/compare/{a}/{b}` | Regression comparison |
 
 ## Design Decisions
 
 ### Why Multi-Agent over Single Agent?
-Specialized agents with focused tool sets produce better results than one agent with 20+ tools. The router adds minimal latency (~200ms) but significantly improves tool selection accuracy — the coder never accidentally runs `rm` and the runner never tries to edit files.
+Following the principle of **"do the simplest thing that works"** — each agent has a focused tool set (3-12 tools) instead of one agent with 24+ tools. The router adds ~200ms but significantly improves tool selection accuracy. Specialized agents also allow per-agent strategies (Planner uses Plan-Execute while Coder uses ReAct).
 
 ### Why MCP over Direct Tool Calls?
-MCP provides a standardized protocol that decouples agents from tools. Adding a new capability (e.g., Docker, database, Slack) requires only a new MCP server — the agents and orchestrator don't change. This is the same architecture used by production AI coding tools.
+MCP provides a standardized protocol that decouples agents from tools. Adding a new capability (Docker, database, Slack) requires only a new MCP server — the agents and orchestrator don't change. This is the same architecture used by Claude, Cursor, and other production AI tools.
 
-### Why LangGraph over LangChain AgentExecutor?
-LangGraph provides explicit, debuggable control flow as a state graph. Each agent is a node with conditional routing edges. This makes the system testable, observable, and easy to extend with new agents.
+### Why Per-Agent Decision Strategies?
+Different tasks require different reasoning approaches. A code reader benefits from quick ReAct loops, while a project planner needs structured Plan-and-Execute, and a code reviewer benefits from self-reflection (Reflexion). One-size-fits-all strategies leave performance on the table.
 
-### Why Evaluation Pipeline?
-AI agents are non-deterministic. Without systematic evaluation, prompt changes or model swaps can silently degrade performance. The evaluation pipeline catches regressions before they reach users.
+### Why LLM-as-Judge + Rule-Based Evaluation?
+Rule-based metrics (tool accuracy, step efficiency, safety) are fast and deterministic. LLM-as-Judge (G-Eval) catches nuanced quality issues (coherence, completeness) that rules miss. Using both gives comprehensive coverage without over-relying on either approach.
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|-----------|
+| Agent Orchestration | LangGraph |
+| Tool Protocol | MCP (Model Context Protocol) |
+| LLM Client | LangChain OpenAI (any OpenAI-compatible API) |
+| Backend API | FastAPI + Uvicorn |
+| Database | SQLite + SQLAlchemy |
+| Evaluation | Custom + DeepEval + Langfuse |
+| Frontend | Next.js 16 + Tailwind CSS + Recharts |
+| Testing | pytest (44 tests) |
 
 ## License
 
