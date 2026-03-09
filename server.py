@@ -87,6 +87,8 @@ class ChatRequest(BaseModel):
 
 class EvalRequest(BaseModel):
     team_id: str = "default"
+    use_llm_judge: bool = True
+    use_deepeval: bool = False
 
 class EvalCompareRequest(BaseModel):
     team_id: str = "default"
@@ -334,6 +336,16 @@ async def chat(team_id: str, request: ChatRequest):
 
     collector.save()
 
+    try:
+        from src.evaluation.integrations import export_trace_to_langfuse
+        export_trace_to_langfuse(
+            trace_id=collector.trace_id, user_prompt=request.message,
+            agent_used=agent_used, tool_calls=tool_calls,
+            response=response, latency_ms=collector.to_dict()["total_latency_ms"],
+        )
+    except Exception:
+        pass
+
     return {
         "response": response, "agent_used": agent_used,
         "tool_calls": tool_calls, "trace": collector.to_dict(),
@@ -489,7 +501,10 @@ def get_eval_run(run_id: str):
 @app.post("/api/eval/run")
 async def run_eval(request: EvalRequest):
     from src.evaluation.evaluator import AgentEvaluator
-    evaluator = AgentEvaluator()
+    evaluator = AgentEvaluator(
+        use_llm_judge=request.use_llm_judge,
+        use_deepeval=request.use_deepeval,
+    )
     run = await evaluator.run_evaluation(team_id=request.team_id, skip_init=True)
     return run.summary()
 

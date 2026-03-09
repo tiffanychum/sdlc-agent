@@ -57,6 +57,9 @@ class TaskMetric:
     error: str | None = None
     final_response: str = ""
     tool_outputs: list[str] = field(default_factory=list)
+    llm_judge_scores: dict = field(default_factory=dict)
+    trajectory_scores: dict = field(default_factory=dict)
+    deepeval_scores: dict = field(default_factory=dict)
 
     @property
     def routing_correct(self) -> bool:

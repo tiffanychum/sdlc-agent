@@ -1,8 +1,12 @@
 """
-Automated evaluation pipeline for agent performance assessment.
+Automated evaluation pipeline for agent performance.
 
-Supports single-model runs, multi-LLM comparison, and regression detection.
-Computes 7 industry-standard metrics per the evaluation plan.
+Evaluation approaches:
+1. Rule-based metrics (task success, tool accuracy, step efficiency, safety)
+2. LLM-as-Judge / G-Eval (correctness, relevance, coherence, tool quality)
+3. Trajectory/Step evaluation (score each decision in the agent trace)
+4. DeepEval integration (answer relevancy, faithfulness)
+5. Langfuse integration (trace export for observability)
 """
 
 import json
@@ -18,12 +22,15 @@ from src.config import config
 class AgentEvaluator:
 
     def __init__(self, model: str = None, prompt_version: str = "v1",
-                 base_url: str = None, api_key: str = None):
+                 base_url: str = None, api_key: str = None,
+                 use_llm_judge: bool = True, use_deepeval: bool = False):
         self.model = model or config.llm.model
         self.base_url = base_url or config.llm.base_url
         self.api_key = api_key or config.llm.api_key
         self.prompt_version = prompt_version
         self.results_dir = config.eval_output_dir
+        self.use_llm_judge = use_llm_judge
+        self.use_deepeval = use_deepeval
 
     async def run_evaluation(
         self,
@@ -53,6 +60,7 @@ class AgentEvaluator:
 
         self._save_results(run)
         self._save_to_db(run, team_id)
+        self._export_to_langfuse(run)
         return run
 
     async def run_comparison(
@@ -68,6 +76,8 @@ class AgentEvaluator:
                 base_url=mc.get("base_url", self.base_url),
                 api_key=mc.get("api_key", self.api_key),
                 prompt_version=mc.get("prompt_version", self.prompt_version),
+                use_llm_judge=self.use_llm_judge,
+                use_deepeval=self.use_deepeval,
             )
             run = await evaluator.run_evaluation(scenarios=scenarios, team_id=team_id, skip_init=True)
             results.append(run)
@@ -87,25 +97,22 @@ class AgentEvaluator:
         try:
             result = await orchestrator.ainvoke({
                 "messages": [{"role": "user", "content": scenario.prompt}],
-                "selected_agent": "",
-                "agent_trace": [],
+                "selected_agent": "", "agent_trace": [],
             })
-
             task.end_time = datetime.now()
 
-            if trace := result.get("agent_trace", []):
-                for entry in trace:
-                    if entry.get("step") == "routing":
-                        task.actual_agent = entry.get("selected_agent")
-                    elif entry.get("step") == "execution":
-                        for tc in entry.get("tool_calls", []):
-                            tool_metric = ToolCallMetric(
-                                tool_name=tc["tool"],
-                                arguments=tc.get("args", {}),
-                                expected_tool=tc["tool"] if tc["tool"] in scenario.expected_tools else None,
-                                was_correct=tc["tool"] in scenario.expected_tools,
-                            )
-                            task.tool_calls.append(tool_metric)
+            trace_steps = result.get("agent_trace", [])
+            for entry in trace_steps:
+                if entry.get("step") == "routing":
+                    task.actual_agent = entry.get("selected_agent")
+                elif entry.get("step") == "execution":
+                    for tc in entry.get("tool_calls", []):
+                        task.tool_calls.append(ToolCallMetric(
+                            tool_name=tc["tool"],
+                            arguments=tc.get("args", {}),
+                            expected_tool=tc["tool"] if tc["tool"] in scenario.expected_tools else None,
+                            was_correct=tc["tool"] in scenario.expected_tools,
+                        ))
 
             for msg in result.get("messages", []):
                 if hasattr(msg, "content") and hasattr(msg, "type") and msg.type == "tool":
@@ -117,6 +124,42 @@ class AgentEvaluator:
                 task.final_response = str(content) if not isinstance(content, str) else content
 
             task.completed = self._check_success(task.final_response, scenario)
+
+            # ── LLM-as-Judge (G-Eval) ──
+            if self.use_llm_judge and task.final_response:
+                try:
+                    from src.evaluation.llm_judge import judge_response, judge_trajectory
+
+                    judge_scores = await judge_response(
+                        user_prompt=scenario.prompt,
+                        agent_response=task.final_response,
+                        tool_calls=[{"tool": tc.tool_name, "args": tc.arguments} for tc in task.tool_calls],
+                        tool_outputs=task.tool_outputs,
+                    )
+                    task.llm_judge_scores = judge_scores
+
+                    trajectory_result = await judge_trajectory(
+                        user_prompt=scenario.prompt,
+                        trace_steps=trace_steps,
+                        final_response=task.final_response,
+                    )
+                    task.trajectory_scores = trajectory_result
+
+                except Exception:
+                    task.llm_judge_scores = {}
+                    task.trajectory_scores = {}
+
+            # ── DeepEval Metrics ──
+            if self.use_deepeval and task.final_response:
+                try:
+                    from src.evaluation.integrations import run_deepeval_metrics
+                    task.deepeval_scores = run_deepeval_metrics(
+                        user_prompt=scenario.prompt,
+                        agent_response=task.final_response,
+                        tool_outputs=task.tool_outputs,
+                    )
+                except Exception:
+                    task.deepeval_scores = {}
 
         except Exception as e:
             task.end_time = datetime.now()
@@ -130,8 +173,7 @@ class AgentEvaluator:
             return True
         if isinstance(response, list):
             response = " ".join(str(r) for r in response)
-        response_lower = str(response).lower()
-        return any(kw.lower() in response_lower for kw in scenario.success_keywords)
+        return any(kw.lower() in str(response).lower() for kw in scenario.success_keywords)
 
     def _save_results(self, run: EvalRunMetric) -> None:
         os.makedirs(self.results_dir, exist_ok=True)
@@ -146,6 +188,9 @@ class AgentEvaluator:
                 "safety_score": round(t.safety_score, 3),
                 "reasoning_quality": round(t.reasoning_quality, 3),
                 "latency_ms": round(t.latency_ms, 1) if t.latency_ms else None,
+                "llm_judge": getattr(t, "llm_judge_scores", {}),
+                "trajectory": getattr(t, "trajectory_scores", {}),
+                "deepeval": getattr(t, "deepeval_scores", {}),
                 "error": t.error,
             }
             for t in run.tasks
@@ -175,6 +220,15 @@ class AgentEvaluator:
         except Exception:
             pass
 
+    def _export_to_langfuse(self, run: EvalRunMetric):
+        try:
+            from src.evaluation.integrations import export_eval_run_to_langfuse
+            summary = run.summary()
+            tasks = [{"scenario": t.scenario_name, "completed": t.completed} for t in run.tasks]
+            export_eval_run_to_langfuse(summary, tasks)
+        except Exception:
+            pass
+
     @staticmethod
     def compare_runs(run_a: EvalRunMetric, run_b: EvalRunMetric) -> dict:
         a, b = run_a.summary(), run_b.summary()
@@ -183,8 +237,5 @@ class AgentEvaluator:
                      "faithfulness", "safety_compliance", "routing_accuracy"]:
             val_a, val_b = a.get(key, 0), b.get(key, 0)
             delta = val_b - val_a
-            comparison[key] = {
-                "before": val_a, "after": val_b,
-                "delta": round(delta, 3), "regression": delta < -0.05,
-            }
+            comparison[key] = {"before": val_a, "after": val_b, "delta": round(delta, 3), "regression": delta < -0.05}
         return comparison
