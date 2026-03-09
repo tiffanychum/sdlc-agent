@@ -47,16 +47,15 @@ export default function EvaluationPage() {
     setComparison(await api.eval.compareRuns(selected[0], selected[1]));
   }
 
-  const latest = runs[0]?.results_json || runs[0];
+  const latest = runs[0];
   const radarData = latest ? METRICS.map(m => ({
     metric: m.label,
     score: +((latest[m.key] || 0) * 100).toFixed(1),
   })) : [];
 
   const barData = runs.slice(0, 6).reverse().map(r => {
-    const rj = r.results_json || r;
     const d: any = { label: `${(r.model || "").slice(0, 8)}(${r.id.slice(0, 4)})` };
-    METRICS.slice(0, 4).forEach(m => { d[m.key] = +((rj[m.key] || 0) * 100).toFixed(1); });
+    METRICS.slice(0, 4).forEach(m => { d[m.key] = +((r[m.key] || 0) * 100).toFixed(1); });
     return d;
   });
 
@@ -162,21 +161,18 @@ export default function EvaluationPage() {
             <th className="text-right px-3 py-2.5">Latency</th>
           </tr></thead>
           <tbody>
-            {runs.map(r => {
-              const rj = r.results_json || r;
-              return (
+            {runs.map(r => (
                 <tr key={r.id} className={`border-t border-[var(--border)] hover:bg-[var(--bg-hover)] ${selected.includes(r.id) ? "bg-[var(--accent-light)]" : ""}`}>
                   <td className="px-3 py-2"><input type="checkbox" checked={selected.includes(r.id)} onChange={() => toggle(r.id)} /></td>
                   <td className="px-3 py-2 font-mono text-[11px]">{r.id}</td>
                   <td className="px-3 py-2 text-xs">{r.model}</td>
                   {METRICS.map(m => {
-                    const val = rj[m.key] ?? 0;
+                    const val = r[m.key] ?? 0;
                     return <td key={m.key} className="text-right px-2 py-2 text-xs">{(val * 100).toFixed(0)}%</td>;
                   })}
                   <td className="text-right px-3 py-2 text-xs">{r.avg_latency_ms ? `${r.avg_latency_ms.toFixed(0)}ms` : "—"}</td>
                 </tr>
-              );
-            })}
+            ))}
           </tbody>
         </table>
         {runs.length === 0 && <div className="text-center py-10 text-[var(--text-muted)]">No runs yet. Click &quot;Run Evaluation&quot;.</div>}

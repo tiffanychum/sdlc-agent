@@ -40,18 +40,15 @@ export default function MonitoringPage() {
   const avgLatency = stats?.avg_latency_ms || (traces.length > 0 ? traces.reduce((s: number, t: any) => s + (t.total_latency_ms || 0), 0) / traces.length : 0);
   const totalCost = stats?.total_cost || traces.reduce((s: number, t: any) => s + (t.total_cost || 0), 0);
 
-  const qualityData = evalRuns.slice(0, 12).reverse().map((r: any) => {
-    const rj = r.results_json || {};
-    return {
-      run: r.id?.slice(0, 6) || "?",
-      success: +((rj.task_success_rate ?? r.task_completion_rate ?? 0) * 100).toFixed(1),
-      toolAcc: +((rj.tool_accuracy ?? r.avg_tool_call_accuracy ?? 0) * 100).toFixed(1),
-      routing: +((rj.routing_accuracy ?? r.routing_accuracy ?? 0) * 100).toFixed(1),
-      reasoning: +((rj.reasoning_quality ?? 0) * 100).toFixed(1),
-      safety: +((rj.safety_compliance ?? 0) * 100).toFixed(1),
-      faithfulness: +((rj.faithfulness ?? 0) * 100).toFixed(1),
-    };
-  });
+  const qualityData = evalRuns.slice(0, 12).reverse().map((r: any) => ({
+    run: r.id?.slice(0, 6) || "?",
+    success: +((r.task_success_rate || 0) * 100).toFixed(1),
+    toolAcc: +((r.tool_accuracy || 0) * 100).toFixed(1),
+    routing: +((r.routing_accuracy || 0) * 100).toFixed(1),
+    reasoning: +((r.reasoning_quality || 0) * 100).toFixed(1),
+    safety: +((r.safety_compliance || 0) * 100).toFixed(1),
+    faithfulness: +((r.faithfulness || 0) * 100).toFixed(1),
+  }));
 
   const latencyData = traces.slice(0, 20).reverse().map((t: any, i: number) => ({
     idx: i + 1,

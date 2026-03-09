@@ -469,16 +469,25 @@ def get_trace(trace_id: str):
 def list_eval_runs():
     session = get_session()
     runs = session.query(EvalRun).order_by(EvalRun.created_at.desc()).all()
-    result = [{
-        "id": r.id, "model": r.model, "prompt_version": r.prompt_version,
-        "team_id": r.team_id, "num_tasks": r.num_tasks,
-        "task_completion_rate": r.task_completion_rate,
-        "routing_accuracy": r.routing_accuracy,
-        "avg_tool_call_accuracy": r.avg_tool_call_accuracy,
-        "avg_latency_ms": r.avg_latency_ms,
-        "total_cost": r.total_cost,
-        "created_at": r.created_at.isoformat() if r.created_at else None,
-    } for r in runs]
+    result = []
+    for r in runs:
+        rj = r.results_json or {}
+        result.append({
+            "id": r.id, "model": r.model, "prompt_version": r.prompt_version,
+            "team_id": r.team_id, "num_tasks": r.num_tasks,
+            "task_success_rate": rj.get("task_success_rate", r.task_completion_rate or 0),
+            "tool_accuracy": rj.get("tool_accuracy", r.avg_tool_call_accuracy or 0),
+            "reasoning_quality": rj.get("reasoning_quality", 0),
+            "step_efficiency": rj.get("step_efficiency", 0),
+            "faithfulness": rj.get("faithfulness", 0),
+            "safety_compliance": rj.get("safety_compliance", 0),
+            "routing_accuracy": rj.get("routing_accuracy", r.routing_accuracy or 0),
+            "failure_recovery": rj.get("failure_recovery", 0),
+            "avg_latency_ms": rj.get("avg_latency_ms", r.avg_latency_ms),
+            "total_cost": r.total_cost or 0,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "results_json": rj,
+        })
     session.close()
     return result
 
