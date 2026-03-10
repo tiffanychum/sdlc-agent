@@ -96,10 +96,15 @@ class Trace(Base):
     id = Column(String, primary_key=True, default=_uuid)
     team_id = Column(String, ForeignKey("teams.id"), nullable=True)
     user_prompt = Column(Text, default="")
+    agent_used = Column(String, default="")
+    agent_response = Column(Text, default="")
+    tool_calls_json = Column(JSON, default=list)
     total_latency_ms = Column(Float, default=0.0)
     total_tokens = Column(Integer, default=0)
     total_cost = Column(Float, default=0.0)
     status = Column(String, default="running")
+    eval_scores = Column(JSON, default=dict)
+    eval_status = Column(String, default="pending")  # pending | evaluated
     created_at = Column(DateTime, default=datetime.utcnow)
 
     spans = relationship("Span", back_populates="trace", cascade="all, delete-orphan")

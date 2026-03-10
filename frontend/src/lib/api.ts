@@ -41,6 +41,7 @@ export const api = {
     list: (limit = 50) => fetchJSON(`/api/traces?limit=${limit}`),
     get: (id: string) => fetchJSON(`/api/traces/${id}`),
     stats: (days = 30) => fetchJSON(`/api/traces/stats?days=${days}`),
+    evaluate: () => fetchJSON("/api/traces/evaluate", { method: "POST" }),
   },
   eval: {
     runs: () => fetchJSON("/api/eval/runs"),

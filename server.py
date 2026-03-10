@@ -338,7 +338,49 @@ async def chat(team_id: str, request: ChatRequest):
     last_msg = result["messages"][-1]
     response = _extract_text(last_msg.content if hasattr(last_msg, "content") else str(last_msg))
 
+    # Collect tool outputs for faithfulness scoring
+    tool_outputs = []
+    for msg in result.get("messages", []):
+        if hasattr(msg, "content") and hasattr(msg, "type") and msg.type == "tool":
+            tool_outputs.append(str(msg.content)[:300])
+
     collector.save()
+
+    # Save full details to trace record + quick rule-based eval
+    try:
+        from src.evaluation.metrics import TaskMetric, ToolCallMetric
+        quick_task = TaskMetric(
+            task_id=collector.trace_id, scenario_name="chat",
+            prompt=request.message, expected_agent=agent_used,
+            actual_agent=agent_used, completed=True,
+            expected_tools=[tc.get("tool", "") for tc in tool_calls],
+            final_response=response, tool_outputs=tool_outputs,
+        )
+        for tc in tool_calls:
+            quick_task.tool_calls.append(ToolCallMetric(
+                tool_name=tc.get("tool", ""), arguments=tc.get("args", {}),
+                was_correct=True,
+            ))
+        quick_scores = {
+            "tool_accuracy": round(quick_task.tool_call_accuracy, 3),
+            "step_efficiency": round(quick_task.step_efficiency, 3),
+            "faithfulness": round(quick_task.hallucination_score, 3),
+            "safety": round(quick_task.safety_score, 3),
+            "reasoning_quality": round(quick_task.reasoning_quality, 3),
+        }
+
+        session = get_session()
+        tr = session.query(Trace).filter_by(id=collector.trace_id).first()
+        if tr:
+            tr.agent_used = agent_used
+            tr.agent_response = response[:2000]
+            tr.tool_calls_json = [{"tool": tc.get("tool",""), "args": tc.get("args",{})} for tc in tool_calls]
+            tr.eval_scores = quick_scores
+            tr.eval_status = "quick"
+            session.commit()
+        session.close()
+    except Exception:
+        pass
 
     try:
         from src.evaluation.integrations import export_trace_to_langfuse
@@ -370,9 +412,15 @@ def list_traces(limit: int = 50, offset: int = 0):
     traces = session.query(Trace).order_by(Trace.created_at.desc()).offset(offset).limit(limit).all()
     result = [{
         "id": t.id, "team_id": t.team_id, "user_prompt": t.user_prompt,
+        "agent_used": getattr(t, "agent_used", "") or "",
+        "agent_response": (getattr(t, "agent_response", "") or "")[:500],
+        "tool_calls": getattr(t, "tool_calls_json", []) or [],
         "total_latency_ms": round(t.total_latency_ms, 1),
         "total_tokens": t.total_tokens, "total_cost": round(t.total_cost, 6),
-        "status": t.status, "created_at": t.created_at.isoformat() if t.created_at else None,
+        "status": t.status,
+        "eval_scores": getattr(t, "eval_scores", {}) or {},
+        "eval_status": getattr(t, "eval_status", "pending") or "pending",
+        "created_at": t.created_at.isoformat() if t.created_at else None,
     } for t in traces]
     session.close()
     return result
@@ -461,6 +509,44 @@ def get_trace(trace_id: str):
     }
     session.close()
     return result
+
+
+# ── Trace Evaluation ────────────────────────────────────────────
+
+@app.post("/api/traces/evaluate")
+async def evaluate_traces():
+    """Run full LLM-judge evaluation on traces that haven't been fully evaluated."""
+    session = get_session()
+    pending = session.query(Trace).filter(
+        Trace.eval_status.in_(["pending", "quick"]),
+        Trace.agent_response != "",
+        Trace.agent_response != None,
+    ).order_by(Trace.created_at.desc()).limit(10).all()
+
+    evaluated = 0
+    for tr in pending:
+        try:
+            from src.evaluation.llm_judge import judge_response
+            scores = await judge_response(
+                user_prompt=tr.user_prompt or "",
+                agent_response=tr.agent_response or "",
+                tool_calls=tr.tool_calls_json or [],
+            )
+            existing = tr.eval_scores or {}
+            if isinstance(existing, str):
+                import json
+                existing = json.loads(existing) if existing else {}
+            existing.update({f"judge_{k}": v for k, v in scores.items()})
+            tr.eval_scores = existing
+            tr.eval_status = "evaluated"
+            evaluated += 1
+        except Exception:
+            pass
+
+    session.commit()
+    total_pending = session.query(Trace).filter(Trace.eval_status.in_(["pending", "quick"])).count()
+    session.close()
+    return {"evaluated": evaluated, "remaining": total_pending}
 
 
 # ── Evaluation API ──────────────────────────────────────────────

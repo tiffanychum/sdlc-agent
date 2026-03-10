@@ -38,6 +38,16 @@ def _migrate(engine):
                 conn.execute(text("ALTER TABLE agents ADD COLUMN decision_strategy TEXT DEFAULT 'react'"))
             conn.commit()
 
+    if "traces" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("traces")}
+        with engine.connect() as conn:
+            for col, default in [("agent_used", "''"), ("agent_response", "''"),
+                                 ("tool_calls_json", "'[]'"), ("eval_scores", "'{}'"),
+                                 ("eval_status", "'pending'")]:
+                if col not in cols:
+                    conn.execute(text(f"ALTER TABLE traces ADD COLUMN {col} TEXT DEFAULT {default}"))
+            conn.commit()
+
 
 def get_session() -> Session:
     engine = get_engine()
