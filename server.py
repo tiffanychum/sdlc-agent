@@ -325,20 +325,34 @@ async def chat(team_id: str, request: ChatRequest):
     agent_used = result.get("selected_agent", "unknown")
     collector.end_span(routing_span, output_data={"selected_agent": agent_used})
 
-    trace = result.get("agent_trace", [])
+    agent_trace = result.get("agent_trace", [])
     tool_calls = []
-    for entry in trace:
+    all_agents_used = []
+    for entry in agent_trace:
         if entry.get("step") == "execution":
+            agent_name = entry.get("agent", "unknown")
+            if agent_name not in all_agents_used:
+                all_agents_used.append(agent_name)
+            agent_span = collector.start_span(f"agent:{agent_name}", "agent_execution",
+                                              input_data={"agent": agent_name})
             for tc in entry.get("tool_calls", []):
-                tool_calls.append(tc)
+                tool_calls.append({**tc, "agent": agent_name})
                 span_id = collector.start_span(f"tool:{tc['tool']}", "tool_call",
-                                               input_data={"args": str(tc.get("args", {}))[:200]})
+                                               input_data={"args": str(tc.get("args", {}))[:200], "agent": agent_name})
                 collector.end_span(span_id, output_data={"result": "completed"})
+            collector.end_span(agent_span, output_data={"tool_calls": len(entry.get("tool_calls", []))})
+        elif entry.get("step") == "routing":
+            pass  # already captured above
+        elif entry.get("step") == "supervisor":
+            sup_span = collector.start_span("supervisor_decision", "supervisor",
+                                            input_data={"decision": entry.get("decision", "")})
+            collector.end_span(sup_span, output_data={"decision": entry.get("decision", "")})
+
+    agents_label = " > ".join(all_agents_used) if all_agents_used else agent_used
 
     last_msg = result["messages"][-1]
     response = _extract_text(last_msg.content if hasattr(last_msg, "content") else str(last_msg))
 
-    # Collect tool outputs for faithfulness scoring
     tool_outputs = []
     for msg in result.get("messages", []):
         if hasattr(msg, "content") and hasattr(msg, "type") and msg.type == "tool":
@@ -346,7 +360,7 @@ async def chat(team_id: str, request: ChatRequest):
 
     collector.save()
 
-    # Save full details to trace record + quick rule-based eval
+    # Save full agent_trace + quick rule-based eval
     try:
         from src.evaluation.metrics import TaskMetric, ToolCallMetric
         quick_task = TaskMetric(
@@ -372,9 +386,9 @@ async def chat(team_id: str, request: ChatRequest):
         session = get_session()
         tr = session.query(Trace).filter_by(id=collector.trace_id).first()
         if tr:
-            tr.agent_used = agent_used
+            tr.agent_used = agents_label
             tr.agent_response = response[:2000]
-            tr.tool_calls_json = [{"tool": tc.get("tool",""), "args": tc.get("args",{})} for tc in tool_calls]
+            tr.tool_calls_json = agent_trace
             tr.eval_scores = quick_scores
             tr.eval_status = "quick"
             session.commit()
@@ -393,8 +407,9 @@ async def chat(team_id: str, request: ChatRequest):
         pass
 
     return {
-        "response": response, "agent_used": agent_used,
-        "tool_calls": tool_calls, "trace": collector.to_dict(),
+        "response": response, "agent_used": agents_label,
+        "tool_calls": tool_calls, "agent_trace": agent_trace,
+        "trace": collector.to_dict(),
     }
 
 @app.post("/api/teams/{team_id}/rebuild")
@@ -410,18 +425,32 @@ async def rebuild_team(team_id: str):
 def list_traces(limit: int = 50, offset: int = 0):
     session = get_session()
     traces = session.query(Trace).order_by(Trace.created_at.desc()).offset(offset).limit(limit).all()
-    result = [{
-        "id": t.id, "team_id": t.team_id, "user_prompt": t.user_prompt,
-        "agent_used": getattr(t, "agent_used", "") or "",
-        "agent_response": (getattr(t, "agent_response", "") or "")[:500],
-        "tool_calls": getattr(t, "tool_calls_json", []) or [],
-        "total_latency_ms": round(t.total_latency_ms, 1),
-        "total_tokens": t.total_tokens, "total_cost": round(t.total_cost, 6),
-        "status": t.status,
-        "eval_scores": getattr(t, "eval_scores", {}) or {},
-        "eval_status": getattr(t, "eval_status", "pending") or "pending",
-        "created_at": t.created_at.isoformat() if t.created_at else None,
-    } for t in traces]
+    result = []
+    for t in traces:
+        spans = session.query(Span).filter_by(trace_id=t.id).order_by(Span.start_time).all()
+        spans_data = [{
+            "id": s.id, "name": s.name, "span_type": s.span_type,
+            "input_data": s.input_data or {}, "output_data": s.output_data or {},
+            "tokens_in": s.tokens_in or 0, "tokens_out": s.tokens_out or 0,
+            "cost": round(s.cost or 0, 6), "status": s.status or "completed",
+            "start_time": s.start_time.isoformat() if s.start_time else None,
+            "end_time": s.end_time.isoformat() if s.end_time else None,
+        } for s in spans]
+        agent_trace = getattr(t, "tool_calls_json", []) or []
+        result.append({
+            "id": t.id, "team_id": t.team_id, "user_prompt": t.user_prompt,
+            "agent_used": getattr(t, "agent_used", "") or "",
+            "agent_response": (getattr(t, "agent_response", "") or ""),
+            "agent_trace": agent_trace,
+            "tool_calls": agent_trace,
+            "spans": spans_data,
+            "total_latency_ms": round(t.total_latency_ms, 1),
+            "total_tokens": t.total_tokens, "total_cost": round(t.total_cost, 6),
+            "status": t.status,
+            "eval_scores": getattr(t, "eval_scores", {}) or {},
+            "eval_status": getattr(t, "eval_status", "pending") or "pending",
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        })
     session.close()
     return result
 

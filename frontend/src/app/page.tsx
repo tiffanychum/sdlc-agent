@@ -154,6 +154,35 @@ export default function StudioPage() {
 
       {team && (
         <div className="space-y-5">
+          {/* Team Strategy */}
+          <section className="card">
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <h2 className="text-sm font-medium">Team Strategy</h2>
+                <p className="text-[11px] text-[var(--text-muted)]">Controls which agents run, when, and in what order</p>
+              </div>
+            </div>
+            <div className="grid grid-cols-4 gap-2">
+              {TEAM_STRATEGIES.map(s => (
+                <button key={s.v} onClick={() => updateStrategy(s.v)}
+                  className={`p-3 rounded-lg border text-left transition-all ${
+                    team.decision_strategy === s.v
+                      ? "border-[var(--accent)] bg-[var(--accent-light)]"
+                      : "border-[var(--border)] hover:border-[var(--accent)]/50"
+                  }`}>
+                  <div className={`text-sm font-medium ${team.decision_strategy === s.v ? "text-[var(--accent)]" : ""}`}>{s.l}</div>
+                  <div className="text-[10px] text-[var(--text-muted)] mt-0.5">{s.d}</div>
+                </button>
+              ))}
+            </div>
+            <div className="mt-2 text-[10px] text-[var(--text-muted)] flex items-center gap-1.5">
+              <span className="font-medium">Active:</span>
+              <span className="text-[var(--accent)]">{TEAM_STRATEGIES.find(s => s.v === team.decision_strategy)?.l || team.decision_strategy}</span>
+              <span className="mx-1">|</span>
+              <span>Each agent below has its own reasoning strategy (ReAct, Plan-Execute, etc.)</span>
+            </div>
+          </section>
+
           {/* Agents */}
           <section className="card">
             <div className="flex items-center justify-between mb-3">
