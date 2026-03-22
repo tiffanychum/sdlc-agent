@@ -22,6 +22,12 @@ const GEVAL_KEYS = [
 const DEEPEVAL_KEYS = [
   { key: "deepeval_relevancy", label: "Relevancy", color: "#0891b2" },
   { key: "deepeval_faithfulness", label: "Faithfulness", color: "#7c3aed" },
+  { key: "tool_correctness", label: "Tool Correct.", color: "#059669" },
+  { key: "argument_correctness", label: "Arg Correct.", color: "#2563eb" },
+  { key: "task_completion", label: "Task Complete", color: "#dc2626" },
+  { key: "step_efficiency_de", label: "Step Effic.", color: "#ca8a04" },
+  { key: "plan_quality", label: "Plan Quality", color: "#0d9488" },
+  { key: "plan_adherence", label: "Plan Adhere.", color: "#7c3aed" },
 ];
 
 const SPAN_COLORS: Record<string, string> = {
@@ -291,7 +297,7 @@ export default function EvaluationPage() {
               <h3 className="text-xs font-medium text-[var(--text-muted)] mb-2">G-Eval / LLM Judge (avg)</h3>
               {hasGEval ? (
                 <div className="grid grid-cols-2 gap-1.5">
-                  {gevalAvgs.map(s => (
+                  {gevalAvgs.filter(s => s.score > 0).map(s => (
                     <ScoreBadge key={s.metric} value={Number(s.score) / 100} label={s.metric} />
                   ))}
                 </div>
@@ -299,10 +305,10 @@ export default function EvaluationPage() {
             </div>
             {/* DeepEval */}
             <div className="card">
-              <h3 className="text-xs font-medium text-[var(--text-muted)] mb-2">DeepEval (avg)</h3>
+              <h3 className="text-xs font-medium text-[var(--text-muted)] mb-2">DeepEval Agentic (avg)</h3>
               {hasDeepEval ? (
-                <div className="grid grid-cols-2 gap-1.5">
-                  {deepevalAvgs.map(s => (
+                <div className="grid grid-cols-3 gap-1.5">
+                  {deepevalAvgs.filter(s => s.score > 0).map(s => (
                     <ScoreBadge key={s.metric} value={Number(s.score) / 100} label={s.metric} />
                   ))}
                 </div>
@@ -386,20 +392,36 @@ export default function EvaluationPage() {
                 </RadarChart>
               </ResponsiveContainer>
             </div>
-            <div className="card">
-              <h3 className="text-xs text-[var(--text-muted)] mb-2">DeepEval Method</h3>
-              <div className="text-xs space-y-2 text-[var(--text-muted)]">
+            <div className="card space-y-2">
+              <h3 className="text-xs text-[var(--text-muted)] mb-2">DeepEval Agentic Metrics</h3>
+              <div className="text-xs space-y-1.5 text-[var(--text-muted)]">
                 <div className="p-2 rounded bg-purple-50 border border-purple-100">
-                  <div className="font-medium text-purple-700 mb-1">Answer Relevancy</div>
-                  <div>Measures whether the response directly addresses the user query. Uses DeepEval's independent LLM backend for cross-validation against self-evaluation bias.</div>
+                  <div className="font-medium text-purple-700 mb-0.5">Task Completion</div>
+                  <div>Evaluates whether the agent accomplished the user&apos;s task by analyzing execution trace and final output.</div>
                 </div>
                 <div className="p-2 rounded bg-purple-50 border border-purple-100">
-                  <div className="font-medium text-purple-700 mb-1">Faithfulness</div>
-                  <div>Decomposes response into atomic claims and verifies each against tool outputs (retrieval context). Catches hallucinations that keyword matching misses.</div>
+                  <div className="font-medium text-purple-700 mb-0.5">Tool Correctness</div>
+                  <div>Assesses whether the right tools were called, in the right order, with optimal selection.</div>
                 </div>
                 <div className="p-2 rounded bg-purple-50 border border-purple-100">
-                  <div className="font-medium text-purple-700 mb-1">Why Cross-Validate?</div>
-                  <div>G-Eval uses the same model that generated the answer (self-evaluation bias). DeepEval uses an independent model + methodology, creating triangulation.</div>
+                  <div className="font-medium text-purple-700 mb-0.5">Argument Correctness</div>
+                  <div>Evaluates whether tool arguments (input parameters) were correctly generated from the user&apos;s request.</div>
+                </div>
+                <div className="p-2 rounded bg-purple-50 border border-purple-100">
+                  <div className="font-medium text-purple-700 mb-0.5">Step Efficiency</div>
+                  <div>Scores execution efficiency — penalizes redundant or unnecessary steps in the agent trace.</div>
+                </div>
+                <div className="p-2 rounded bg-purple-50 border border-purple-100">
+                  <div className="font-medium text-purple-700 mb-0.5">Plan Quality</div>
+                  <div>Assesses whether the agent&apos;s generated plan is logical, complete, and efficient for the task.</div>
+                </div>
+                <div className="p-2 rounded bg-purple-50 border border-purple-100">
+                  <div className="font-medium text-purple-700 mb-0.5">Plan Adherence</div>
+                  <div>Checks if the agent followed its own plan. Detects deviations and evaluates if they were justified.</div>
+                </div>
+                <div className="p-2 rounded bg-purple-50 border border-purple-100">
+                  <div className="font-medium text-purple-700 mb-0.5">Answer Relevancy + Faithfulness</div>
+                  <div>Cross-validates against self-evaluation bias using DeepEval&apos;s independent LLM for hallucination and relevancy checks.</div>
                 </div>
               </div>
             </div>
@@ -544,13 +566,28 @@ export default function EvaluationPage() {
                       {/* DeepEval */}
                       <div className="px-4 py-2.5">
                         <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide mb-1.5">
-                          <span className="inline-block w-2 h-2 rounded-full bg-purple-500 mr-1" />DeepEval (External Cross-Validation)
+                          <span className="inline-block w-2 h-2 rounded-full bg-purple-500 mr-1" />DeepEval Agentic Metrics
                         </div>
                         {hasD ? (
-                          <div className="flex gap-1.5 flex-wrap">
-                            {DEEPEVAL_KEYS.map(dk => dScores[dk.key] !== undefined && (
-                              <ScoreBadge key={dk.key} value={dScores[dk.key]} label={dk.label} />
-                            ))}
+                          <div className="space-y-2">
+                            <div className="flex gap-1.5 flex-wrap">
+                              {DEEPEVAL_KEYS.map(dk => dScores[dk.key] !== undefined && (
+                                <ScoreBadge key={dk.key} value={dScores[dk.key] as number} label={dk.label} />
+                              ))}
+                            </div>
+                            {Object.keys(dScores).some(k => k.endsWith("_reason") && dScores[k]) && (
+                              <details className="text-[10px]">
+                                <summary className="cursor-pointer text-purple-600 hover:underline">Show DeepEval reasoning</summary>
+                                <div className="mt-1 space-y-1">
+                                  {Object.entries(dScores).filter(([k, v]) => k.endsWith("_reason") && v).map(([k, v]) => (
+                                    <div key={k} className="p-1.5 rounded bg-purple-50 border border-purple-100">
+                                      <div className="font-medium text-purple-700 capitalize">{k.replace(/_reason$/, "").replace(/_/g, " ")}</div>
+                                      <div className="text-[var(--text-muted)] mt-0.5">{String(v).slice(0, 400)}</div>
+                                    </div>
+                                  ))}
+                                </div>
+                              </details>
+                            )}
                           </div>
                         ) : <div className="text-[10px] text-[var(--text-muted)]">Not yet evaluated</div>}
                       </div>

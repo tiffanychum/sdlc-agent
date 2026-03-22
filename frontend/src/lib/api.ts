@@ -51,4 +51,7 @@ export const api = {
       fetchJSON("/api/eval/compare", { method: "POST", body: JSON.stringify({ team_id: teamId, model_configs: configs }) }),
     compareRuns: (a: string, b: string) => fetchJSON(`/api/eval/compare/${a}/${b}`),
   },
+  otel: {
+    spanStats: (days = 30) => fetchJSON(`/api/otel/spans/stats?days=${days}`),
+  },
 };

@@ -540,11 +540,81 @@ def get_trace(trace_id: str):
     return result
 
 
+@app.get("/api/otel/spans/stats")
+def otel_span_stats(days: int = 30):
+    """OTel span-level analytics with GenAI semantic convention breakdowns."""
+    session = get_session()
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    spans = session.query(Span).join(Trace).filter(Trace.created_at >= cutoff).all()
+    traces = session.query(Trace).filter(Trace.created_at >= cutoff).all()
+
+    if not spans:
+        session.close()
+        return {"total_spans": 0, "by_type": {}, "by_model": {}, "token_flow": [],
+                "cost_breakdown": [], "latency_by_type": {}, "error_spans": 0}
+
+    by_type: dict = {}
+    by_model: dict = {}
+    errors = 0
+    for s in spans:
+        st = s.span_type or "unknown"
+        by_type.setdefault(st, {"count": 0, "tokens_in": 0, "tokens_out": 0, "cost": 0.0, "latency_ms": []})
+        by_type[st]["count"] += 1
+        by_type[st]["tokens_in"] += s.tokens_in or 0
+        by_type[st]["tokens_out"] += s.tokens_out or 0
+        by_type[st]["cost"] += s.cost or 0
+        if s.start_time and s.end_time:
+            dur = (s.end_time - s.start_time).total_seconds() * 1000
+            by_type[st]["latency_ms"].append(dur)
+        if s.status == "error":
+            errors += 1
+        if s.model:
+            by_model.setdefault(s.model, {"count": 0, "tokens_in": 0, "tokens_out": 0, "cost": 0.0})
+            by_model[s.model]["count"] += 1
+            by_model[s.model]["tokens_in"] += s.tokens_in or 0
+            by_model[s.model]["tokens_out"] += s.tokens_out or 0
+            by_model[s.model]["cost"] += s.cost or 0
+
+    for st_data in by_type.values():
+        lats = st_data.pop("latency_ms")
+        st_data["avg_latency_ms"] = round(sum(lats) / len(lats), 1) if lats else 0
+        st_data["cost"] = round(st_data["cost"], 6)
+
+    for m_data in by_model.values():
+        m_data["cost"] = round(m_data["cost"], 6)
+
+    token_flow = []
+    for t in sorted(traces, key=lambda x: x.created_at or datetime.min)[-30:]:
+        token_flow.append({
+            "id": t.id[:6],
+            "tokens_in": t.total_tokens // 2 if t.total_tokens else 0,
+            "tokens_out": t.total_tokens - (t.total_tokens // 2) if t.total_tokens else 0,
+            "cost": round(t.total_cost or 0, 6),
+            "latency_ms": round(t.total_latency_ms or 0, 1),
+            "time": t.created_at.isoformat() if t.created_at else "",
+        })
+
+    session.close()
+    return {
+        "total_spans": len(spans),
+        "total_traces": len(traces),
+        "error_spans": errors,
+        "by_type": by_type,
+        "by_model": by_model,
+        "token_flow": token_flow,
+    }
+
+
 # ── Trace Evaluation ────────────────────────────────────────────
 
 @app.post("/api/traces/evaluate")
 async def evaluate_traces():
     """Run G-Eval + DeepEval on traces that haven't been fully evaluated."""
+    import json as _json
+    import copy
+    from sqlalchemy.orm.attributes import flag_modified
+
     session = get_session()
     pending = session.query(Trace).filter(
         Trace.eval_status.in_(["pending", "quick"]),
@@ -553,9 +623,9 @@ async def evaluate_traces():
     ).order_by(Trace.created_at.desc()).limit(10).all()
 
     evaluated = 0
+    errors = []
     for tr in pending:
-        import json as _json
-        existing = tr.eval_scores or {}
+        existing = copy.deepcopy(tr.eval_scores) if tr.eval_scores else {}
         if isinstance(existing, str):
             existing = _json.loads(existing) if existing else {}
 
@@ -574,12 +644,12 @@ async def evaluate_traces():
             existing["geval_overall"] = geval_result.get("overall", 0.5)
             for k, v in geval_scores.items():
                 existing[f"judge_{k}"] = v
-        except Exception:
-            pass
+        except Exception as e:
+            errors.append(f"geval:{tr.id}:{str(e)[:100]}")
 
-        # ── DeepEval (External Validation) ──
+        # ── DeepEval (All Agentic Metrics) ──
         try:
-            from src.evaluation.integrations import run_deepeval_metrics
+            from src.evaluation.integrations import run_all_deepeval_metrics
 
             tool_outputs = []
             for span_row in session.query(Span).filter_by(trace_id=tr.id).all():
@@ -588,23 +658,33 @@ async def evaluate_traces():
                         if v:
                             tool_outputs.append(str(v)[:300])
 
-            deepeval_scores = run_deepeval_metrics(
+            agent_trace = tr.tool_calls_json if isinstance(tr.tool_calls_json, list) else []
+
+            deepeval_scores = await run_all_deepeval_metrics(
                 user_prompt=tr.user_prompt or "",
                 agent_response=tr.agent_response or "",
+                agent_trace=agent_trace,
                 tool_outputs=tool_outputs[:5],
             )
             existing["deepeval_scores"] = deepeval_scores
-        except Exception:
-            existing["deepeval_scores"] = {"deepeval_relevancy": 0.5, "deepeval_faithfulness": 0.5}
+        except Exception as e:
+            existing["deepeval_scores"] = {
+                "deepeval_relevancy": 0.5, "deepeval_faithfulness": 0.5,
+                "tool_correctness": 0.5, "argument_correctness": 0.5,
+                "task_completion": 0.5, "step_efficiency_de": 0.5,
+                "plan_quality": 0.5, "plan_adherence": 0.5,
+            }
+            errors.append(f"deepeval:{tr.id}:{str(e)[:100]}")
 
         tr.eval_scores = existing
         tr.eval_status = "evaluated"
+        flag_modified(tr, "eval_scores")
         evaluated += 1
 
     session.commit()
     total_pending = session.query(Trace).filter(Trace.eval_status.in_(["pending", "quick"])).count()
     session.close()
-    return {"evaluated": evaluated, "remaining": total_pending}
+    return {"evaluated": evaluated, "remaining": total_pending, "errors": errors}
 
 
 # ── Evaluation API ──────────────────────────────────────────────
@@ -694,6 +774,7 @@ async def compare_models(request: EvalCompareRequest):
 
 @app.get("/api/eval/compare/{run_a}/{run_b}")
 def compare_runs(run_a: str, run_b: str):
+    """Compare two eval runs across all 7 CLASSic metrics using results_json."""
     session = get_session()
     a = session.query(EvalRun).filter_by(id=run_a).first()
     b = session.query(EvalRun).filter_by(id=run_b).first()
@@ -701,13 +782,50 @@ def compare_runs(run_a: str, run_b: str):
     if not a or not b:
         raise HTTPException(404, "Run not found")
 
+    rj_a = a.results_json or {}
+    rj_b = b.results_json or {}
+
+    COMPARE_KEYS = [
+        "task_success_rate", "tool_accuracy", "reasoning_quality", "step_efficiency",
+        "faithfulness", "safety_compliance", "routing_accuracy",
+    ]
+
+    DB_FALLBACKS = {
+        "task_success_rate": "task_completion_rate",
+        "tool_accuracy": "avg_tool_call_accuracy",
+        "routing_accuracy": "routing_accuracy",
+    }
+
     comparison = {}
-    for key in ["task_completion_rate", "routing_accuracy", "avg_tool_call_accuracy", "avg_failure_recovery_rate"]:
-        va = getattr(a, key, 0) or 0
-        vb = getattr(b, key, 0) or 0
+    for key in COMPARE_KEYS:
+        va = rj_a.get(key)
+        if va is None:
+            fallback = DB_FALLBACKS.get(key)
+            va = getattr(a, fallback, 0) if fallback else 0
+        va = va or 0
+
+        vb = rj_b.get(key)
+        if vb is None:
+            fallback = DB_FALLBACKS.get(key)
+            vb = getattr(b, fallback, 0) if fallback else 0
+        vb = vb or 0
+
         delta = vb - va
         comparison[key] = {"before": va, "after": vb, "delta": round(delta, 3), "regression": delta < -0.05}
-    return {"run_a": run_a, "run_b": run_b, "comparison": comparison}
+
+    meta_a = {"id": a.id, "model": a.model, "prompt_version": a.prompt_version,
+              "num_tasks": a.num_tasks, "created_at": a.created_at.isoformat() if a.created_at else None}
+    meta_b = {"id": b.id, "model": b.model, "prompt_version": b.prompt_version,
+              "num_tasks": b.num_tasks, "created_at": b.created_at.isoformat() if b.created_at else None}
+
+    regressions = [k for k, v in comparison.items() if v["regression"]]
+    return {
+        "run_a": run_a, "run_b": run_b,
+        "meta_a": meta_a, "meta_b": meta_b,
+        "comparison": comparison,
+        "regressions": regressions,
+        "pass": len(regressions) == 0,
+    }
 
 
 # ── WebSocket ───────────────────────────────────────────────────
