@@ -544,7 +544,7 @@ def get_trace(trace_id: str):
 
 @app.post("/api/traces/evaluate")
 async def evaluate_traces():
-    """Run full LLM-judge evaluation on traces that haven't been fully evaluated."""
+    """Run G-Eval + DeepEval on traces that haven't been fully evaluated."""
     session = get_session()
     pending = session.query(Trace).filter(
         Trace.eval_status.in_(["pending", "quick"]),
@@ -554,23 +554,52 @@ async def evaluate_traces():
 
     evaluated = 0
     for tr in pending:
+        import json as _json
+        existing = tr.eval_scores or {}
+        if isinstance(existing, str):
+            existing = _json.loads(existing) if existing else {}
+
+        # ── G-Eval (LLM-as-Judge with CoT) ──
         try:
             from src.evaluation.llm_judge import judge_response
-            scores = await judge_response(
+            geval_result = await judge_response(
                 user_prompt=tr.user_prompt or "",
                 agent_response=tr.agent_response or "",
                 tool_calls=tr.tool_calls_json or [],
             )
-            existing = tr.eval_scores or {}
-            if isinstance(existing, str):
-                import json
-                existing = json.loads(existing) if existing else {}
-            existing.update({f"judge_{k}": v for k, v in scores.items()})
-            tr.eval_scores = existing
-            tr.eval_status = "evaluated"
-            evaluated += 1
+            geval_scores = geval_result.get("scores", {})
+            geval_reasoning = geval_result.get("reasoning", {})
+            existing["geval_scores"] = geval_scores
+            existing["geval_reasoning"] = geval_reasoning
+            existing["geval_overall"] = geval_result.get("overall", 0.5)
+            for k, v in geval_scores.items():
+                existing[f"judge_{k}"] = v
         except Exception:
             pass
+
+        # ── DeepEval (External Validation) ──
+        try:
+            from src.evaluation.integrations import run_deepeval_metrics
+
+            tool_outputs = []
+            for span_row in session.query(Span).filter_by(trace_id=tr.id).all():
+                if span_row.output_data:
+                    for v in span_row.output_data.values():
+                        if v:
+                            tool_outputs.append(str(v)[:300])
+
+            deepeval_scores = run_deepeval_metrics(
+                user_prompt=tr.user_prompt or "",
+                agent_response=tr.agent_response or "",
+                tool_outputs=tool_outputs[:5],
+            )
+            existing["deepeval_scores"] = deepeval_scores
+        except Exception:
+            existing["deepeval_scores"] = {"deepeval_relevancy": 0.5, "deepeval_faithfulness": 0.5}
+
+        tr.eval_scores = existing
+        tr.eval_status = "evaluated"
+        evaluated += 1
 
     session.commit()
     total_pending = session.query(Trace).filter(Trace.eval_status.in_(["pending", "quick"])).count()

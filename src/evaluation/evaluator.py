@@ -125,18 +125,18 @@ class AgentEvaluator:
 
             task.completed = self._check_success(task.final_response, scenario)
 
-            # ── LLM-as-Judge (G-Eval) ──
+            # ── G-Eval (LLM-as-Judge with CoT + Per-Criterion) ──
             if self.use_llm_judge and task.final_response:
                 try:
                     from src.evaluation.llm_judge import judge_response, judge_trajectory
 
-                    judge_scores = await judge_response(
+                    geval_result = await judge_response(
                         user_prompt=scenario.prompt,
                         agent_response=task.final_response,
                         tool_calls=[{"tool": tc.tool_name, "args": tc.arguments} for tc in task.tool_calls],
                         tool_outputs=task.tool_outputs,
                     )
-                    task.llm_judge_scores = judge_scores
+                    task.llm_judge_scores = geval_result
 
                     trajectory_result = await judge_trajectory(
                         user_prompt=scenario.prompt,

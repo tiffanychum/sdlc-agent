@@ -154,7 +154,7 @@ async def build_orchestrator_from_team(team_id: str = "default"):
             agent_tools.extend(tool_map.get(group, []))
         strategy_hint = _strategy_instruction(ac["decision_strategy"])
         base_prompt = ac["system_prompt"] + (f"\n\n{strategy_hint}" if strategy_hint else "")
-        final_prompt = build_agent_prompt(ac["id"], base_prompt)
+        final_prompt = build_agent_prompt(ac["id"], base_prompt) #base_prompt + skills_section
         llm = get_llm(model=ac["model"] if ac["model"] else None)
         built_agents[ac["role"]] = create_react_agent(
             model=llm, tools=agent_tools, prompt=final_prompt,

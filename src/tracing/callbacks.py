@@ -1,11 +1,11 @@
 """
-LangChain callback handler for automatic LLM call tracing.
+LangChain callback handler for automatic LLM/tool tracing via OpenTelemetry.
 
-Captures token usage, latency, and model info from every LLM invocation
-and feeds it into the TraceCollector.
+Uses the OTel SDK with GenAI semantic conventions for standardized span attributes.
+OpenInference auto-instrumentation handles most LangChain tracing automatically;
+this handler adds custom enrichment (cost estimation, agent context) on top.
 """
 
-from typing import Any, Optional
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
 
@@ -13,7 +13,7 @@ from src.tracing.collector import TraceCollector
 
 
 class TracingCallbackHandler(BaseCallbackHandler):
-    """Captures LLM call metadata for the trace collector."""
+    """Enriches OTel spans with cost estimation and agent context."""
 
     def __init__(self, collector: TraceCollector):
         self.collector = collector
@@ -24,7 +24,11 @@ class TracingCallbackHandler(BaseCallbackHandler):
         span_id = self.collector.start_span(
             name=f"llm_call:{model}",
             span_type="llm_call",
-            input_data={"prompt_length": sum(len(p) for p in prompts)},
+            input_data={
+                "gen_ai.request.model": model,
+                "gen_ai.prompt.length": sum(len(p) for p in prompts),
+                "gen_ai.prompt.count": len(prompts),
+            },
         )
         self._span_map[str(run_id)] = span_id
 
@@ -45,7 +49,11 @@ class TracingCallbackHandler(BaseCallbackHandler):
 
         self.collector.end_span(
             span_id, tokens_in=tokens_in, tokens_out=tokens_out, model=model,
-            output_data={"generations": len(response.generations)},
+            output_data={
+                "gen_ai.usage.input_tokens": tokens_in,
+                "gen_ai.usage.output_tokens": tokens_out,
+                "gen_ai.completion.count": len(response.generations),
+            },
         )
 
     def on_llm_error(self, error: BaseException, *, run_id, **kwargs):
@@ -58,14 +66,18 @@ class TracingCallbackHandler(BaseCallbackHandler):
         span_id = self.collector.start_span(
             name=f"tool:{tool_name}",
             span_type="tool_call",
-            input_data={"input": input_str[:300]},
+            input_data={
+                "gen_ai.tool.name": tool_name,
+                "gen_ai.tool.type": "function",
+                "input.value": input_str[:300],
+            },
         )
         self._span_map[str(run_id)] = span_id
 
     def on_tool_end(self, output: str, *, run_id, **kwargs):
         span_id = self._span_map.pop(str(run_id), None)
         if span_id:
-            self.collector.end_span(span_id, output_data={"output": str(output)[:300]})
+            self.collector.end_span(span_id, output_data={"output.value": str(output)[:300]})
 
     def on_tool_error(self, error: BaseException, *, run_id, **kwargs):
         span_id = self._span_map.pop(str(run_id), None)
