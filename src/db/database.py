@@ -48,6 +48,19 @@ def _migrate(engine):
                     conn.execute(text(f"ALTER TABLE traces ADD COLUMN {col} TEXT DEFAULT {default}"))
             conn.commit()
 
+    if "regression_results" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("regression_results")}
+        with engine.connect() as conn:
+            for col, default in [
+                ("deepeval_scores", "'{}'"),
+                ("eval_reasoning", "'{}'"),
+                ("model_used", "''"),
+                ("prompt_version", "'v1'"),
+            ]:
+                if col not in cols:
+                    conn.execute(text(f"ALTER TABLE regression_results ADD COLUMN {col} TEXT DEFAULT {default}"))
+            conn.commit()
+
 
 def get_session() -> Session:
     engine = get_engine()

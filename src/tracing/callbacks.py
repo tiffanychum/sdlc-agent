@@ -20,7 +20,8 @@ class TracingCallbackHandler(BaseCallbackHandler):
         self._span_map: dict[str, str] = {}
 
     def on_llm_start(self, serialized: dict, prompts: list[str], *, run_id, **kwargs):
-        model = serialized.get("kwargs", {}).get("model", "unknown")
+        kw = serialized.get("kwargs", {})
+        model = kw.get("model_name") or kw.get("model") or kwargs.get("invocation_params", {}).get("model", "unknown")
         span_id = self.collector.start_span(
             name=f"llm_call:{model}",
             span_type="llm_call",
@@ -43,15 +44,38 @@ class TracingCallbackHandler(BaseCallbackHandler):
 
         if response.llm_output:
             usage = response.llm_output.get("token_usage", {})
-            tokens_in = usage.get("prompt_tokens", 0)
-            tokens_out = usage.get("completion_tokens", 0)
-            model = response.llm_output.get("model_name", "")
+            tokens_in = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
+            tokens_out = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
+            model = response.llm_output.get("model_name", "") or response.llm_output.get("model", "")
+
+        if not tokens_in and response.generations:
+            for gen_list in response.generations:
+                for gen in gen_list:
+                    gen_info = getattr(gen, "generation_info", {}) or {}
+                    meta = gen_info if gen_info else {}
+                    if not tokens_in and meta.get("token_usage"):
+                        tokens_in = meta["token_usage"].get("prompt_tokens", 0)
+                        tokens_out = meta["token_usage"].get("completion_tokens", 0)
+                    msg = getattr(gen, "message", None)
+                    if msg:
+                        resp_meta = getattr(msg, "response_metadata", {}) or {}
+                        u = resp_meta.get("token_usage") or resp_meta.get("usage", {})
+                        if u and not tokens_in:
+                            tokens_in = u.get("prompt_tokens", 0) or u.get("input_tokens", 0)
+                            tokens_out = u.get("completion_tokens", 0) or u.get("output_tokens", 0)
+                        if not model and resp_meta.get("model_name"):
+                            model = resp_meta["model_name"]
+                        um = getattr(msg, "usage_metadata", None)
+                        if um and not tokens_in:
+                            tokens_in = getattr(um, "input_tokens", 0) or 0
+                            tokens_out = getattr(um, "output_tokens", 0) or 0
 
         self.collector.end_span(
             span_id, tokens_in=tokens_in, tokens_out=tokens_out, model=model,
             output_data={
                 "gen_ai.usage.input_tokens": tokens_in,
                 "gen_ai.usage.output_tokens": tokens_out,
+                "gen_ai.request.model": model,
                 "gen_ai.completion.count": len(response.generations),
             },
         )

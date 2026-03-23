@@ -38,6 +38,8 @@ from src.db.models import Trace as TraceModel, Span as SpanModel
 COST_PER_1K_TOKENS = {
     "gpt-4o": {"input": 0.0025, "output": 0.01},
     "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
+    "gpt-5-mini": {"input": 0.0003, "output": 0.0012},
+    "gpt-5-mini-2025-08-07": {"input": 0.0003, "output": 0.0012},
     "gpt-5.3-codex": {"input": 0.003, "output": 0.012},
     "claude-sonnet-4-20250514": {"input": 0.003, "output": 0.015},
     "gemini-2.5-flash-lite": {"input": 0.001, "output": 0.004},
@@ -171,6 +173,51 @@ if HAS_OTEL:
 _pending_spans: dict[str, list[dict]] = {}
 
 
+def _flush_pending_spans(trace_id: str) -> list[dict]:
+    """Pop and return all pending OTel spans matching any trace_id.
+
+    The DBSpanProcessor uses OTel-generated trace IDs which differ from
+    our custom 12-char IDs. We flush ALL pending spans and assign them
+    to the current trace so the data isn't lost.
+    """
+    all_spans: list[dict] = []
+    keys_to_remove = list(_pending_spans.keys())
+    for key in keys_to_remove:
+        all_spans.extend(_pending_spans.pop(key, []))
+    return all_spans
+
+
+def _merge_otel_span_data(manual_spans: list[dict], otel_spans: list[dict]):
+    """Enrich manual spans with token/model data from OTel auto-instrumented spans.
+
+    When OpenInference captures LLM calls, it records model name and token counts.
+    We propagate those values to manual spans that are missing them.
+    """
+    total_tokens_in = 0
+    total_tokens_out = 0
+    detected_model = ""
+    for os in otel_spans:
+        total_tokens_in += os.get("tokens_in", 0)
+        total_tokens_out += os.get("tokens_out", 0)
+        if os.get("model") and not detected_model:
+            detected_model = os["model"]
+
+    if not detected_model and not total_tokens_in:
+        return
+
+    for s in manual_spans:
+        if not s.get("model") and detected_model:
+            s["model"] = detected_model
+        if s["span_type"] == "llm_call" and s["tokens_in"] == 0 and total_tokens_in:
+            s["tokens_in"] = total_tokens_in
+            s["tokens_out"] = total_tokens_out
+            s["cost"] = estimate_cost(s.get("model", "") or detected_model, total_tokens_in, total_tokens_out)
+        elif s["span_type"] == "agent_execution" and s["tokens_in"] == 0 and total_tokens_in:
+            s["tokens_in"] = total_tokens_in
+            s["tokens_out"] = total_tokens_out
+            s["cost"] = estimate_cost(s.get("model", "") or detected_model, total_tokens_in, total_tokens_out)
+
+
 # ── TraceCollector (OTel-backed) ─────────────────────────────────
 
 class TraceCollector:
@@ -251,7 +298,15 @@ class TraceCollector:
             self.spans.append(data)
 
     def save(self):
-        """Persist the trace and all spans to the database."""
+        """Persist the trace and all spans to the database.
+
+        Also flushes any spans captured by the OTel DBSpanProcessor
+        (from OpenInference auto-instrumentation) and merges their
+        token/model data into the trace totals.
+        """
+        otel_spans = _flush_pending_spans(self.trace_id)
+        _merge_otel_span_data(self.spans, otel_spans)
+
         elapsed_ms = (time.time() - self.start_time) * 1000
         total_tokens = sum(s["tokens_in"] + s["tokens_out"] for s in self.spans)
         total_cost = sum(s["cost"] for s in self.spans)
@@ -288,6 +343,28 @@ class TraceCollector:
                     error=s["error"],
                 )
                 session.add(span)
+
+            for otel_s in otel_spans:
+                existing_ids = {s["id"] for s in self.spans}
+                if otel_s["id"] not in existing_ids:
+                    span = SpanModel(
+                        id=otel_s["id"],
+                        trace_id=self.trace_id,
+                        parent_span_id=otel_s.get("parent_span_id"),
+                        name=otel_s["name"],
+                        span_type=otel_s["span_type"],
+                        start_time=otel_s.get("start_time"),
+                        end_time=otel_s.get("end_time"),
+                        input_data=otel_s.get("input_data", {}),
+                        output_data=otel_s.get("output_data", {}),
+                        tokens_in=otel_s.get("tokens_in", 0),
+                        tokens_out=otel_s.get("tokens_out", 0),
+                        cost=otel_s.get("cost", 0.0),
+                        model=otel_s.get("model", ""),
+                        status=otel_s.get("status", "completed"),
+                        error=otel_s.get("error"),
+                    )
+                    session.add(span)
 
             session.commit()
         finally:

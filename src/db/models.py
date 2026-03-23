@@ -151,3 +151,85 @@ class EvalRun(Base):
     total_tokens = Column(Integer, default=0)
     results_json = Column(JSON, default=dict)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    regression_results = relationship("RegressionResult", back_populates="eval_run", cascade="all, delete-orphan")
+
+
+# ── Golden Dataset & Regression ──────────────────────────────────
+
+class GoldenTestCase(Base):
+    __tablename__ = "golden_test_cases"
+
+    id = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    prompt = Column(Text, nullable=False)
+    expected_agent = Column(String, default="")
+    expected_tools = Column(JSON, default=list)
+    expected_output_keywords = Column(JSON, default=list)
+    expected_delegation_pattern = Column(JSON, default=list)
+    quality_thresholds = Column(JSON, default=dict)
+    max_llm_calls = Column(Integer, default=15)
+    max_tool_calls = Column(Integer, default=10)
+    max_tokens = Column(Integer, default=8000)
+    max_latency_ms = Column(Integer, default=120000)
+    complexity = Column(String, default="quick")
+    version = Column(String, default="1.0")
+    reference_output = Column(Text, default="")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class RegressionResult(Base):
+    __tablename__ = "regression_results"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    run_id = Column(String, ForeignKey("eval_runs.id"), nullable=False)
+    golden_case_id = Column(String, nullable=False)
+    golden_case_name = Column(String, default="")
+
+    actual_output = Column(Text, default="")
+    actual_agent = Column(String, default="")
+    actual_tools = Column(JSON, default=list)
+    actual_delegation_pattern = Column(JSON, default=list)
+    full_trace = Column(JSON, default=list)
+    span_data = Column(JSON, default=list)
+
+    actual_llm_calls = Column(Integer, default=0)
+    actual_tool_calls = Column(Integer, default=0)
+    actual_tokens_in = Column(Integer, default=0)
+    actual_tokens_out = Column(Integer, default=0)
+    actual_latency_ms = Column(Float, default=0.0)
+    actual_cost = Column(Float, default=0.0)
+
+    semantic_similarity = Column(Float, default=0.0)
+    quality_scores = Column(JSON, default=dict)
+    deepeval_scores = Column(JSON, default=dict)
+    trace_assertions = Column(JSON, default=dict)
+    eval_reasoning = Column(JSON, default=dict)
+
+    cost_regression = Column(Boolean, default=False)
+    latency_regression = Column(Boolean, default=False)
+    quality_regression = Column(Boolean, default=False)
+    trace_regression = Column(Boolean, default=False)
+    overall_pass = Column(Boolean, default=True)
+
+    rca_analysis = Column(JSON, nullable=True)
+    model_used = Column(String, default="")
+    prompt_version = Column(String, default="v1")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    eval_run = relationship("EvalRun", back_populates="regression_results")
+
+
+# ── Prompt Versioning ────────────────────────────────────────────
+
+class PromptVersion(Base):
+    __tablename__ = "prompt_versions"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    version_label = Column(String, nullable=False, unique=True)
+    description = Column(Text, default="")
+    agent_prompts = Column(JSON, default=dict)
+    team_strategy = Column(String, default="")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

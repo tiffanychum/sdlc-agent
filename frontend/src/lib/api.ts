@@ -54,4 +54,31 @@ export const api = {
   otel: {
     spanStats: (days = 30) => fetchJSON(`/api/otel/spans/stats?days=${days}`),
   },
+  golden: {
+    list: () => fetchJSON("/api/golden"),
+    create: (data: any) => fetchJSON("/api/golden", { method: "POST", body: JSON.stringify(data) }),
+    update: (id: string, data: any) => fetchJSON(`/api/golden/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+    delete: (id: string) => fetchJSON(`/api/golden/${id}`, { method: "DELETE" }),
+    sync: () => fetchJSON("/api/golden/sync", { method: "POST" }),
+  },
+  regression: {
+    run: (params: { team_id?: string; case_ids?: string[]; model?: string; prompt_version?: string; baseline_run_id?: string }) =>
+      fetchJSON("/api/regression/run", { method: "POST", body: JSON.stringify(params) }),
+    runs: () => fetchJSON("/api/regression/runs"),
+    results: (runId: string) => fetchJSON(`/api/regression/results/${runId}`),
+    caseDetail: (runId: string, caseId: string) => fetchJSON(`/api/regression/results/${runId}/${caseId}`),
+    diff: (runA: string, runB: string, caseId: string) => fetchJSON(`/api/regression/diff/${runA}/${runB}/${caseId}`),
+    rca: (runId: string, caseId: string, baselineRunId?: string) =>
+      fetchJSON("/api/regression/rca", { method: "POST", body: JSON.stringify({ run_id: runId, case_id: caseId, baseline_run_id: baselineRunId }) }),
+  },
+  models: {
+    list: () => fetchJSON("/api/models"),
+  },
+  promptVersions: {
+    list: () => fetchJSON("/api/prompt-versions"),
+    create: (data: any) => fetchJSON("/api/prompt-versions", { method: "POST", body: JSON.stringify(data) }),
+    update: (id: string, data: any) => fetchJSON(`/api/prompt-versions/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+    delete: (id: string) => fetchJSON(`/api/prompt-versions/${id}`, { method: "DELETE" }),
+    current: () => fetchJSON("/api/prompt-versions/current"),
+  },
 };

@@ -9,6 +9,8 @@ Supports four decision strategies:
   - supervisor: A supervisor agent reviews output and can re-delegate
 """
 
+import operator
+from typing import Annotated
 from typing_extensions import TypedDict
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
@@ -75,10 +77,14 @@ def _strategy_instruction(strategy: str) -> str:
     return STRATEGY_INSTRUCTIONS.get(strategy, STRATEGY_INSTRUCTIONS["react"])
 
 
+def _take_last(a: str, b: str) -> str:
+    return b
+
+
 class OrchestratorState(TypedDict):
-    messages: list
-    selected_agent: str
-    agent_trace: list[dict]
+    messages: Annotated[list, operator.add]
+    selected_agent: Annotated[str, _take_last]
+    agent_trace: Annotated[list[dict], operator.add]
 
 
 def _build_router_prompt(agents_config: list[dict]) -> str:
@@ -106,7 +112,7 @@ def _make_agent_executor(role: str, built_agents: dict):
         return {
             "messages": result["messages"],
             "selected_agent": role,
-            "agent_trace": state.get("agent_trace", []) + [{
+            "agent_trace": [{
                 "step": "execution", "agent": role, "tool_calls": tool_calls,
                 "num_messages": len(result["messages"]),
             }],
@@ -187,8 +193,8 @@ def _build_router_graph(agents_config, built_agents):
         if selected not in valid_roles:
             selected = default_role
         return {
-            **state, "selected_agent": selected,
-            "agent_trace": state.get("agent_trace", []) + [{
+            "selected_agent": selected,
+            "agent_trace": [{
                 "step": "routing", "selected_agent": selected, "reasoning": raw,
             }],
         }
@@ -249,10 +255,10 @@ Respond with ONLY "DONE" or an agent name ({agent_names})."""
         response = await router_llm.ainvoke([SystemMessage(content=supervisor_prompt), *msgs])
         raw = _extract_text(response.content).strip().lower().strip('"\'')
         if raw == "done" or raw not in valid_roles:
-            return {**state, "selected_agent": "__done__",
-                    "agent_trace": state.get("agent_trace", []) + [{"step": "supervisor", "decision": "done"}]}
-        return {**state, "selected_agent": raw,
-                "agent_trace": state.get("agent_trace", []) + [{"step": "supervisor", "decision": raw}]}
+            return {"selected_agent": "__done__",
+                    "agent_trace": [{"step": "supervisor", "decision": "done"}]}
+        return {"selected_agent": raw,
+                "agent_trace": [{"step": "supervisor", "decision": raw}]}
 
     graph = StateGraph(OrchestratorState)
     graph.add_node("supervisor", supervisor_decide)

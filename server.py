@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from src.db.database import init_db, seed_defaults, get_session
 from src.db.models import (
     Team, Agent, AgentToolMapping, Skill, AgentSkillMapping,
-    Trace, Span, EvalRun,
+    Trace, Span, EvalRun, GoldenTestCase, RegressionResult, PromptVersion,
 )
 from src.orchestrator import build_orchestrator_from_team, _extract_text
 from src.tracing.collector import TraceCollector
@@ -34,6 +34,8 @@ orchestrators: dict = {}
 async def lifespan(app: FastAPI):
     init_db()
     seed_defaults()
+    from src.evaluation.golden import sync_golden_to_db
+    sync_golden_to_db()
     orchestrators["default"] = await build_orchestrator_from_team("default")
     yield
 
@@ -95,6 +97,82 @@ class EvalRequest(BaseModel):
 class EvalCompareRequest(BaseModel):
     team_id: str = "default"
     model_configs: list[dict]
+
+
+class GoldenCaseCreate(BaseModel):
+    id: str
+    name: str
+    prompt: str
+    expected_agent: str = ""
+    expected_tools: list[str] = []
+    expected_output_keywords: list[str] = []
+    expected_delegation_pattern: list[str] = []
+    quality_thresholds: dict = {}
+    max_llm_calls: int = 15
+    max_tool_calls: int = 10
+    max_tokens: int = 8000
+    max_latency_ms: int = 120000
+    complexity: str = "quick"
+    version: str = "1.0"
+    reference_output: str = ""
+
+
+class GoldenCaseUpdate(BaseModel):
+    name: Optional[str] = None
+    prompt: Optional[str] = None
+    expected_agent: Optional[str] = None
+    expected_tools: Optional[list[str]] = None
+    expected_output_keywords: Optional[list[str]] = None
+    expected_delegation_pattern: Optional[list[str]] = None
+    quality_thresholds: Optional[dict] = None
+    max_llm_calls: Optional[int] = None
+    max_tool_calls: Optional[int] = None
+    max_tokens: Optional[int] = None
+    max_latency_ms: Optional[int] = None
+    complexity: Optional[str] = None
+    version: Optional[str] = None
+    reference_output: Optional[str] = None
+
+
+class RegressionRunRequest(BaseModel):
+    team_id: str = "default"
+    case_ids: Optional[list[str]] = None
+    model: Optional[str] = None
+    prompt_version: str = "v1"
+    baseline_run_id: Optional[str] = None
+
+
+class RCARequest(BaseModel):
+    run_id: str
+    case_id: str
+    baseline_run_id: Optional[str] = None
+
+
+class PromptVersionCreate(BaseModel):
+    version_label: str
+    description: str = ""
+    agent_prompts: dict = {}
+    team_strategy: str = ""
+
+
+class PromptVersionUpdate(BaseModel):
+    version_label: Optional[str] = None
+    description: Optional[str] = None
+    agent_prompts: Optional[dict] = None
+    team_strategy: Optional[str] = None
+
+
+AVAILABLE_MODELS = [
+    {"id": "gpt-4o-mini", "name": "GPT-4o Mini", "provider": "OpenAI"},
+    {"id": "gpt-4o", "name": "GPT-4o", "provider": "OpenAI"},
+    {"id": "gpt-5-mini", "name": "GPT-5 Mini", "provider": "OpenAI"},
+    {"id": "gpt-5-mini-2025-08-07", "name": "GPT-5 Mini (2025-08-07)", "provider": "OpenAI"},
+    {"id": "gpt-5.3-codex", "name": "GPT-5.3 Codex", "provider": "OpenAI"},
+    {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4", "provider": "Anthropic"},
+    {"id": "gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite", "provider": "Google"},
+    {"id": "llama-3.1-8b-cs", "name": "Llama 3.1 8B", "provider": "Meta"},
+    {"id": "mistral-small-3", "name": "Mistral Small 3", "provider": "Mistral"},
+]
 
 
 # ── Teams API ───────────────────────────────────────────────────
@@ -315,15 +393,35 @@ async def chat(team_id: str, request: ChatRequest):
         orchestrators[team_id] = await build_orchestrator_from_team(team_id)
 
     collector = TraceCollector(team_id=team_id, user_prompt=request.message)
+    from src.tracing.callbacks import TracingCallbackHandler
+    tracing_cb = TracingCallbackHandler(collector)
     routing_span = collector.start_span("routing", "routing", input_data={"prompt": request.message[:200]})
 
-    result = await orchestrators[team_id].ainvoke({
-        "messages": [{"role": "user", "content": request.message}],
-        "selected_agent": "", "agent_trace": [],
-    })
+    result = await orchestrators[team_id].ainvoke(
+        {"messages": [{"role": "user", "content": request.message}],
+         "selected_agent": "", "agent_trace": []},
+        config={"callbacks": [tracing_cb]},
+    )
 
     agent_used = result.get("selected_agent", "unknown")
     collector.end_span(routing_span, output_data={"selected_agent": agent_used})
+
+    # Extract model/token metadata from LangChain response messages
+    llm_model = ""
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    for msg in result.get("messages", []):
+        meta = getattr(msg, "response_metadata", None) or {}
+        usage = meta.get("token_usage") or meta.get("usage", {})
+        if usage:
+            total_prompt_tokens += usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
+            total_completion_tokens += usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
+        if not llm_model and meta.get("model_name"):
+            llm_model = meta["model_name"]
+        um = getattr(msg, "usage_metadata", None)
+        if um:
+            total_prompt_tokens += getattr(um, "input_tokens", 0) or 0
+            total_completion_tokens += getattr(um, "output_tokens", 0) or 0
 
     agent_trace = result.get("agent_trace", [])
     tool_calls = []
@@ -340,7 +438,8 @@ async def chat(team_id: str, request: ChatRequest):
                 span_id = collector.start_span(f"tool:{tc['tool']}", "tool_call",
                                                input_data={"args": str(tc.get("args", {}))[:200], "agent": agent_name})
                 collector.end_span(span_id, output_data={"result": "completed"})
-            collector.end_span(agent_span, output_data={"tool_calls": len(entry.get("tool_calls", []))})
+            collector.end_span(agent_span, output_data={"tool_calls": len(entry.get("tool_calls", []))},
+                               model=llm_model, tokens_in=total_prompt_tokens, tokens_out=total_completion_tokens)
         elif entry.get("step") == "routing":
             pass  # already captured above
         elif entry.get("step") == "supervisor":
@@ -430,6 +529,7 @@ def list_traces(limit: int = 50, offset: int = 0):
         spans = session.query(Span).filter_by(trace_id=t.id).order_by(Span.start_time).all()
         spans_data = [{
             "id": s.id, "name": s.name, "span_type": s.span_type,
+            "model": s.model or "",
             "input_data": s.input_data or {}, "output_data": s.output_data or {},
             "tokens_in": s.tokens_in or 0, "tokens_out": s.tokens_out or 0,
             "cost": round(s.cost or 0, 6), "status": s.status or "completed",
@@ -586,10 +686,16 @@ def otel_span_stats(days: int = 30):
 
     token_flow = []
     for t in sorted(traces, key=lambda x: x.created_at or datetime.min)[-30:]:
+        trace_spans = [s for s in spans if s.trace_id == t.id]
+        t_in = sum(s.tokens_in or 0 for s in trace_spans)
+        t_out = sum(s.tokens_out or 0 for s in trace_spans)
+        if not t_in and t.total_tokens:
+            t_in = t.total_tokens // 2
+            t_out = t.total_tokens - t_in
         token_flow.append({
             "id": t.id[:6],
-            "tokens_in": t.total_tokens // 2 if t.total_tokens else 0,
-            "tokens_out": t.total_tokens - (t.total_tokens // 2) if t.total_tokens else 0,
+            "tokens_in": t_in,
+            "tokens_out": t_out,
             "cost": round(t.total_cost or 0, 6),
             "latency_ms": round(t.total_latency_ms or 0, 1),
             "time": t.created_at.isoformat() if t.created_at else "",
@@ -826,6 +932,459 @@ def compare_runs(run_a: str, run_b: str):
         "regressions": regressions,
         "pass": len(regressions) == 0,
     }
+
+
+# ── Models API ──────────────────────────────────────────────────
+
+@app.get("/api/models")
+def list_available_models():
+    return AVAILABLE_MODELS
+
+
+# ── Prompt Versions API ────────────────────────────────────────
+
+@app.get("/api/prompt-versions")
+def list_prompt_versions():
+    session = get_session()
+    pvs = session.query(PromptVersion).order_by(PromptVersion.created_at.desc()).all()
+    result = [{
+        "id": p.id, "version_label": p.version_label,
+        "description": p.description,
+        "agent_prompts": p.agent_prompts or {},
+        "team_strategy": p.team_strategy,
+        "is_active": p.is_active,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+    } for p in pvs]
+    session.close()
+    return result
+
+
+@app.post("/api/prompt-versions")
+def create_prompt_version(data: PromptVersionCreate):
+    session = get_session()
+    existing = session.query(PromptVersion).filter_by(version_label=data.version_label).first()
+    if existing:
+        session.close()
+        raise HTTPException(409, f"Version '{data.version_label}' already exists")
+    pv = PromptVersion(
+        version_label=data.version_label,
+        description=data.description,
+        agent_prompts=data.agent_prompts,
+        team_strategy=data.team_strategy,
+    )
+    session.add(pv)
+    session.commit()
+    pid = pv.id
+    session.close()
+    return {"id": pid, "status": "created"}
+
+
+@app.put("/api/prompt-versions/{pv_id}")
+def update_prompt_version(pv_id: str, data: PromptVersionUpdate):
+    session = get_session()
+    pv = session.query(PromptVersion).filter_by(id=pv_id).first()
+    if not pv:
+        session.close()
+        raise HTTPException(404, "Prompt version not found")
+    if data.version_label is not None:
+        pv.version_label = data.version_label
+    if data.description is not None:
+        pv.description = data.description
+    if data.agent_prompts is not None:
+        pv.agent_prompts = data.agent_prompts
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(pv, "agent_prompts")
+    if data.team_strategy is not None:
+        pv.team_strategy = data.team_strategy
+    session.commit()
+    session.close()
+    return {"status": "updated"}
+
+
+@app.delete("/api/prompt-versions/{pv_id}")
+def delete_prompt_version(pv_id: str):
+    session = get_session()
+    pv = session.query(PromptVersion).filter_by(id=pv_id).first()
+    if not pv:
+        session.close()
+        raise HTTPException(404, "Prompt version not found")
+    session.delete(pv)
+    session.commit()
+    session.close()
+    return {"status": "deleted"}
+
+
+@app.get("/api/prompt-versions/current")
+def get_current_prompts():
+    """Get the current agent prompts from the default team for editing."""
+    session = get_session()
+    agents = session.query(Agent).filter_by(team_id="default").all()
+    prompts = {a.role: a.system_prompt for a in agents}
+    team = session.query(Team).filter_by(id="default").first()
+    strategy = team.decision_strategy if team else "router_decides"
+    session.close()
+    return {"agent_prompts": prompts, "team_strategy": strategy}
+
+
+# ── Golden Dataset API ──────────────────────────────────────────
+
+@app.get("/api/golden")
+def list_golden_cases():
+    session = get_session()
+    cases = session.query(GoldenTestCase).order_by(GoldenTestCase.id).all()
+    result = [{
+        "id": c.id, "name": c.name, "prompt": c.prompt,
+        "expected_agent": c.expected_agent, "expected_tools": c.expected_tools or [],
+        "expected_output_keywords": c.expected_output_keywords or [],
+        "expected_delegation_pattern": c.expected_delegation_pattern or [],
+        "quality_thresholds": c.quality_thresholds or {},
+        "max_llm_calls": c.max_llm_calls, "max_tool_calls": c.max_tool_calls,
+        "max_tokens": c.max_tokens, "max_latency_ms": c.max_latency_ms,
+        "complexity": c.complexity, "version": c.version,
+        "reference_output": c.reference_output, "is_active": c.is_active,
+    } for c in cases]
+    session.close()
+    return result
+
+
+@app.post("/api/golden")
+def create_golden_case(data: GoldenCaseCreate):
+    session = get_session()
+    existing = session.query(GoldenTestCase).filter_by(id=data.id).first()
+    if existing:
+        session.close()
+        raise HTTPException(409, f"Golden case '{data.id}' already exists")
+    case = GoldenTestCase(
+        id=data.id, name=data.name, prompt=data.prompt,
+        expected_agent=data.expected_agent, expected_tools=data.expected_tools,
+        expected_output_keywords=data.expected_output_keywords,
+        expected_delegation_pattern=data.expected_delegation_pattern,
+        quality_thresholds=data.quality_thresholds,
+        max_llm_calls=data.max_llm_calls, max_tool_calls=data.max_tool_calls,
+        max_tokens=data.max_tokens, max_latency_ms=data.max_latency_ms,
+        complexity=data.complexity, version=data.version,
+        reference_output=data.reference_output,
+    )
+    session.add(case)
+    session.commit()
+    session.close()
+    _sync_db_to_json()
+    return {"id": data.id, "status": "created"}
+
+
+@app.put("/api/golden/{case_id}")
+def update_golden_case(case_id: str, data: GoldenCaseUpdate):
+    session = get_session()
+    case = session.query(GoldenTestCase).filter_by(id=case_id).first()
+    if not case:
+        session.close()
+        raise HTTPException(404, "Golden case not found")
+    for field in [
+        "name", "prompt", "expected_agent", "expected_tools",
+        "expected_output_keywords", "expected_delegation_pattern",
+        "quality_thresholds", "max_llm_calls", "max_tool_calls",
+        "max_tokens", "max_latency_ms", "complexity", "version", "reference_output",
+    ]:
+        val = getattr(data, field, None)
+        if val is not None:
+            setattr(case, field, val)
+    session.commit()
+    session.close()
+    _sync_db_to_json()
+    return {"status": "updated"}
+
+
+@app.delete("/api/golden/{case_id}")
+def delete_golden_case(case_id: str):
+    session = get_session()
+    case = session.query(GoldenTestCase).filter_by(id=case_id).first()
+    if not case:
+        session.close()
+        raise HTTPException(404, "Golden case not found")
+    case.is_active = False
+    session.commit()
+    session.close()
+    _sync_db_to_json()
+    return {"status": "deactivated"}
+
+
+@app.post("/api/golden/sync")
+def sync_golden():
+    from src.evaluation.golden import sync_golden_to_db
+    sync_golden_to_db()
+    return {"status": "synced"}
+
+
+def _sync_db_to_json():
+    """Write active golden cases back to JSON file for version control."""
+    session = get_session()
+    cases = session.query(GoldenTestCase).filter_by(is_active=True).order_by(GoldenTestCase.id).all()
+    data = [{
+        "id": c.id, "name": c.name, "prompt": c.prompt,
+        "expected_agent": c.expected_agent, "expected_tools": c.expected_tools or [],
+        "expected_output_keywords": c.expected_output_keywords or [],
+        "expected_delegation_pattern": c.expected_delegation_pattern or [],
+        "quality_thresholds": c.quality_thresholds or {},
+        "max_llm_calls": c.max_llm_calls, "max_tool_calls": c.max_tool_calls,
+        "max_tokens": c.max_tokens, "max_latency_ms": c.max_latency_ms,
+        "complexity": c.complexity, "version": c.version,
+        "reference_output": c.reference_output,
+    } for c in cases]
+    session.close()
+    from src.evaluation.golden import save_golden_to_json
+    save_golden_to_json(data)
+
+
+# ── Regression Testing API ──────────────────────────────────────
+
+@app.post("/api/regression/run")
+async def run_regression(request: RegressionRunRequest):
+    from src.evaluation.regression import RegressionRunner
+    runner = RegressionRunner(
+        model=request.model,
+        prompt_version=request.prompt_version,
+        team_id=request.team_id,
+    )
+    result = await runner.run(
+        case_ids=request.case_ids,
+        baseline_run_id=request.baseline_run_id,
+    )
+    return result
+
+
+@app.get("/api/regression/runs")
+def list_regression_runs():
+    """List eval runs that have associated regression results."""
+    session = get_session()
+    run_ids = session.query(RegressionResult.run_id).distinct().all()
+    run_ids = [r[0] for r in run_ids]
+    runs = session.query(EvalRun).filter(EvalRun.id.in_(run_ids)).order_by(EvalRun.created_at.desc()).all()
+    result = []
+    for r in runs:
+        case_count = session.query(RegressionResult).filter_by(run_id=r.id).count()
+        passed_count = session.query(RegressionResult).filter_by(run_id=r.id, overall_pass=True).count()
+        rj = r.results_json or {}
+        result.append({
+            "id": r.id, "model": r.model, "prompt_version": r.prompt_version,
+            "num_cases": case_count, "passed": passed_count, "failed": case_count - passed_count,
+            "pass_rate": round(passed_count / max(case_count, 1), 3),
+            "avg_latency_ms": rj.get("avg_latency_ms", r.avg_latency_ms),
+            "total_cost": r.total_cost or 0,
+            "regressions": rj.get("regressions", {}),
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+    session.close()
+    return result
+
+
+@app.get("/api/regression/results/{run_id}")
+def get_regression_results(run_id: str):
+    session = get_session()
+    run = session.query(EvalRun).filter_by(id=run_id).first()
+    if not run:
+        session.close()
+        raise HTTPException(404, "Run not found")
+    rows = session.query(RegressionResult).filter_by(run_id=run_id).all()
+    rj = run.results_json or {}
+    results = [{
+        "id": r.id, "golden_case_id": r.golden_case_id,
+        "golden_case_name": r.golden_case_name,
+        "actual_output": r.actual_output, "actual_agent": r.actual_agent,
+        "actual_tools": r.actual_tools or [],
+        "actual_delegation_pattern": r.actual_delegation_pattern or [],
+        "actual_llm_calls": r.actual_llm_calls, "actual_tool_calls": r.actual_tool_calls,
+        "actual_tokens_in": r.actual_tokens_in, "actual_tokens_out": r.actual_tokens_out,
+        "actual_latency_ms": r.actual_latency_ms, "actual_cost": r.actual_cost,
+        "semantic_similarity": r.semantic_similarity,
+        "quality_scores": r.quality_scores or {},
+        "deepeval_scores": r.deepeval_scores or {},
+        "trace_assertions": r.trace_assertions or {},
+        "eval_reasoning": r.eval_reasoning or {},
+        "cost_regression": r.cost_regression, "latency_regression": r.latency_regression,
+        "quality_regression": r.quality_regression, "trace_regression": r.trace_regression,
+        "overall_pass": r.overall_pass,
+        "model_used": r.model_used, "prompt_version": r.prompt_version,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in rows]
+    session.close()
+    return {
+        "run_id": run_id,
+        "model": run.model,
+        "prompt_version": run.prompt_version,
+        "summary": rj,
+        "results": results,
+    }
+
+
+@app.get("/api/regression/results/{run_id}/{case_id}")
+def get_regression_case_detail(run_id: str, case_id: str):
+    session = get_session()
+    r = session.query(RegressionResult).filter_by(run_id=run_id, golden_case_id=case_id).first()
+    if not r:
+        session.close()
+        raise HTTPException(404, "Case result not found")
+
+    golden = session.query(GoldenTestCase).filter_by(id=case_id).first()
+    golden_data = {}
+    if golden:
+        golden_data = {
+            "id": golden.id, "name": golden.name, "prompt": golden.prompt,
+            "expected_agent": golden.expected_agent, "expected_tools": golden.expected_tools or [],
+            "expected_delegation_pattern": golden.expected_delegation_pattern or [],
+            "quality_thresholds": golden.quality_thresholds or {},
+            "reference_output": golden.reference_output,
+            "max_llm_calls": golden.max_llm_calls, "max_tool_calls": golden.max_tool_calls,
+            "max_tokens": golden.max_tokens, "max_latency_ms": golden.max_latency_ms,
+        }
+
+    result = {
+        "golden_case": golden_data,
+        "result": {
+            "id": r.id, "golden_case_id": r.golden_case_id,
+            "golden_case_name": r.golden_case_name,
+            "actual_output": r.actual_output, "actual_agent": r.actual_agent,
+            "actual_tools": r.actual_tools or [],
+            "actual_delegation_pattern": r.actual_delegation_pattern or [],
+            "full_trace": r.full_trace or [], "span_data": r.span_data or [],
+            "actual_llm_calls": r.actual_llm_calls, "actual_tool_calls": r.actual_tool_calls,
+            "actual_tokens_in": r.actual_tokens_in, "actual_tokens_out": r.actual_tokens_out,
+            "actual_latency_ms": r.actual_latency_ms, "actual_cost": r.actual_cost,
+            "semantic_similarity": r.semantic_similarity,
+            "quality_scores": r.quality_scores or {},
+            "deepeval_scores": r.deepeval_scores or {},
+            "trace_assertions": r.trace_assertions or {},
+            "eval_reasoning": r.eval_reasoning or {},
+            "cost_regression": r.cost_regression, "latency_regression": r.latency_regression,
+            "quality_regression": r.quality_regression, "trace_regression": r.trace_regression,
+            "overall_pass": r.overall_pass,
+            "rca_analysis": r.rca_analysis,
+            "model_used": r.model_used, "prompt_version": r.prompt_version,
+        },
+    }
+    session.close()
+    return result
+
+
+@app.get("/api/regression/diff/{run_a}/{run_b}/{case_id}")
+def regression_trace_diff(run_a: str, run_b: str, case_id: str):
+    """Side-by-side trace comparison for a specific golden test case across two runs."""
+    session = get_session()
+    r_a = session.query(RegressionResult).filter_by(run_id=run_a, golden_case_id=case_id).first()
+    r_b = session.query(RegressionResult).filter_by(run_id=run_b, golden_case_id=case_id).first()
+    session.close()
+    if not r_a or not r_b:
+        raise HTTPException(404, "One or both case results not found")
+
+    from src.evaluation.rca import RootCauseAnalyzer
+    analyzer = RootCauseAnalyzer()
+    trace_diff = analyzer._compute_trace_diff(
+        r_b.full_trace or [],
+        r_a.full_trace or [],
+    )
+    cost_diff = analyzer._compute_cost_diff(
+        {"actual_tokens_in": r_b.actual_tokens_in, "actual_tokens_out": r_b.actual_tokens_out,
+         "actual_cost": r_b.actual_cost, "actual_latency_ms": r_b.actual_latency_ms,
+         "actual_llm_calls": r_b.actual_llm_calls, "actual_tool_calls": r_b.actual_tool_calls},
+        {"actual_tokens_in": r_a.actual_tokens_in, "actual_tokens_out": r_a.actual_tokens_out,
+         "actual_cost": r_a.actual_cost, "actual_latency_ms": r_a.actual_latency_ms,
+         "actual_llm_calls": r_a.actual_llm_calls, "actual_tool_calls": r_a.actual_tool_calls},
+    )
+
+    def _result_dict(r):
+        return {
+            "actual_output": r.actual_output, "actual_agent": r.actual_agent,
+            "actual_tools": r.actual_tools or [], "actual_delegation_pattern": r.actual_delegation_pattern or [],
+            "actual_llm_calls": r.actual_llm_calls, "actual_tool_calls": r.actual_tool_calls,
+            "actual_tokens_in": r.actual_tokens_in, "actual_tokens_out": r.actual_tokens_out,
+            "actual_latency_ms": r.actual_latency_ms, "actual_cost": r.actual_cost,
+            "semantic_similarity": r.semantic_similarity,
+            "quality_scores": r.quality_scores or {},
+            "deepeval_scores": r.deepeval_scores or {},
+            "trace_assertions": r.trace_assertions or {},
+            "eval_reasoning": r.eval_reasoning or {},
+            "overall_pass": r.overall_pass,
+            "model_used": r.model_used,
+        }
+
+    return {
+        "case_id": case_id,
+        "run_a": {"id": run_a, **_result_dict(r_a)},
+        "run_b": {"id": run_b, **_result_dict(r_b)},
+        "trace_diff": trace_diff,
+        "cost_diff": cost_diff,
+    }
+
+
+@app.post("/api/regression/rca")
+async def run_rca(request: RCARequest):
+    session = get_session()
+    result = session.query(RegressionResult).filter_by(
+        run_id=request.run_id, golden_case_id=request.case_id
+    ).first()
+    if not result:
+        session.close()
+        raise HTTPException(404, "Case result not found")
+
+    failing = {
+        "golden_case_id": result.golden_case_id,
+        "golden_case_name": result.golden_case_name,
+        "prompt": "",
+        "actual_output": result.actual_output,
+        "actual_agent": result.actual_agent,
+        "actual_tools": result.actual_tools or [],
+        "actual_tokens_in": result.actual_tokens_in,
+        "actual_tokens_out": result.actual_tokens_out,
+        "actual_cost": result.actual_cost,
+        "actual_latency_ms": result.actual_latency_ms,
+        "actual_llm_calls": result.actual_llm_calls,
+        "actual_tool_calls": result.actual_tool_calls,
+        "quality_scores": result.quality_scores or {},
+        "trace_assertions": result.trace_assertions or {},
+        "full_trace": result.full_trace or [],
+        "model_used": result.model_used,
+    }
+
+    golden = session.query(GoldenTestCase).filter_by(id=request.case_id).first()
+    if golden:
+        failing["prompt"] = golden.prompt
+        failing["expected_agent"] = golden.expected_agent
+        failing["expected_tools"] = golden.expected_tools or []
+
+    baseline = None
+    if request.baseline_run_id:
+        b = session.query(RegressionResult).filter_by(
+            run_id=request.baseline_run_id, golden_case_id=request.case_id
+        ).first()
+        if b:
+            baseline = {
+                "actual_output": b.actual_output, "actual_agent": b.actual_agent,
+                "actual_tools": b.actual_tools or [],
+                "actual_tokens_in": b.actual_tokens_in, "actual_tokens_out": b.actual_tokens_out,
+                "actual_cost": b.actual_cost, "actual_latency_ms": b.actual_latency_ms,
+                "actual_llm_calls": b.actual_llm_calls, "actual_tool_calls": b.actual_tool_calls,
+                "quality_scores": b.quality_scores or {},
+                "trace_assertions": b.trace_assertions or {},
+                "full_trace": b.full_trace or [],
+            }
+
+    session.close()
+
+    from src.evaluation.rca import RootCauseAnalyzer
+    analyzer = RootCauseAnalyzer()
+    rca_result = await analyzer.analyze(failing, baseline)
+
+    session = get_session()
+    r = session.query(RegressionResult).filter_by(
+        run_id=request.run_id, golden_case_id=request.case_id
+    ).first()
+    if r:
+        r.rca_analysis = rca_result
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(r, "rca_analysis")
+        session.commit()
+    session.close()
+
+    return rca_result
 
 
 # ── WebSocket ───────────────────────────────────────────────────

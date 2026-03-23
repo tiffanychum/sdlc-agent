@@ -251,11 +251,13 @@ def run_deepeval_standalone_metrics(
                 actual_output=agent_response[:1000],
                 retrieval_context=retrieval_context,
             )
-            metric = AnswerRelevancyMetric(threshold=0.5)
+            metric = AnswerRelevancyMetric(threshold=0.5, include_reason=True)
             metric.measure(rel_case)
             scores["deepeval_relevancy"] = metric.score or 0.0
-        except Exception:
+            scores["deepeval_relevancy_reason"] = metric.reason or ""
+        except Exception as e:
             scores["deepeval_relevancy"] = 0.5
+            scores["deepeval_relevancy_reason"] = f"Metric failed: {str(e)[:100]}"
 
         # ── Faithfulness ──
         try:
@@ -266,11 +268,13 @@ def run_deepeval_standalone_metrics(
                 actual_output=agent_response[:1000],
                 retrieval_context=retrieval_context,
             )
-            metric = FaithfulnessMetric(threshold=0.5)
+            metric = FaithfulnessMetric(threshold=0.5, include_reason=True)
             metric.measure(faith_case)
             scores["deepeval_faithfulness"] = metric.score or 0.0
-        except Exception:
+            scores["deepeval_faithfulness_reason"] = metric.reason or ""
+        except Exception as e:
             scores["deepeval_faithfulness"] = 0.5
+            scores["deepeval_faithfulness_reason"] = f"Metric failed: {str(e)[:100]}"
 
     except ImportError:
         scores.update({
