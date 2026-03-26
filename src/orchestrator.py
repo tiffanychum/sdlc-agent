@@ -17,10 +17,15 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Base
 from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
 
 from src.llm.client import get_llm
 from src.skills.engine import build_agent_prompt
 from src.tools.registry import get_all_tools
+from src.hitl import (
+    ask_human, DANGEROUS_TOOLS, REVIEWABLE_TOOLS,
+    wrap_dangerous_tool, wrap_reviewable_tool, make_planner_executor,
+)
 
 
 def _extract_text(content) -> str:
@@ -99,6 +104,14 @@ Respond with ONLY the agent name: {agent_names}.
 If unsure, respond with "{agents_config[0]['role']}" as default."""
 
 
+def _get_executor(role: str, built_agents: dict, exec_agents: dict | None = None):
+    """Return the planner HITL executor for planner roles, standard executor otherwise."""
+    if role == "planner":
+        exec_agent = (exec_agents or {}).get(role)
+        return make_planner_executor(role, built_agents, exec_agent=exec_agent)
+    return _make_agent_executor(role, built_agents)
+
+
 def _make_agent_executor(role: str, built_agents: dict):
     """Create an executor closure for a given agent role. Synchronous factory — no async needed."""
     async def execute(state: OrchestratorState) -> OrchestratorState:
@@ -152,34 +165,50 @@ async def build_orchestrator_from_team(team_id: str = "default"):
         session.close()
 
     tool_map = await get_all_tools()
+    checkpointer = MemorySaver()
 
     built_agents = {}
+    exec_agents = {}
     for ac in agents_config:
         agent_tools: list[StructuredTool] = []
         for group in ac["tool_groups"]:
             agent_tools.extend(tool_map.get(group, []))
+
+        hitl_tools: list[StructuredTool] = []
+        for t in agent_tools:
+            if t.name in DANGEROUS_TOOLS:
+                t = wrap_dangerous_tool(t, agent_role=ac["role"])
+            if t.name in REVIEWABLE_TOOLS:
+                t = wrap_reviewable_tool(t, agent_role=ac["role"])
+            hitl_tools.append(t)
+
+        hitl_tools.append(ask_human)
+
         strategy_hint = _strategy_instruction(ac["decision_strategy"])
         base_prompt = ac["system_prompt"] + (f"\n\n{strategy_hint}" if strategy_hint else "")
-        final_prompt = build_agent_prompt(ac["id"], base_prompt) #base_prompt + skills_section
+        final_prompt = build_agent_prompt(ac["id"], base_prompt)
         llm = get_llm(model=ac["model"] if ac["model"] else None)
         built_agents[ac["role"]] = create_react_agent(
-            model=llm, tools=agent_tools, prompt=final_prompt,
+            model=llm, tools=hitl_tools, prompt=final_prompt,
         )
+        if ac["role"] == "planner":
+            exec_agents[ac["role"]] = create_react_agent(
+                model=llm, tools=list(agent_tools), prompt=final_prompt,
+            )
 
-    match strategy:
-        case "router_decides":
-            return _build_router_graph(agents_config, built_agents)
-        case "sequential":
-            return _build_sequential_graph(agents_config, built_agents)
-        case "parallel":
-            return _build_parallel_graph(agents_config, built_agents)
-        case "supervisor":
-            return _build_supervisor_graph(agents_config, built_agents)
-        case _:
-            return _build_router_graph(agents_config, built_agents)
+    builders = {
+        "router_decides": _build_router_graph,
+        "sequential": _build_sequential_graph,
+        "parallel": _build_parallel_graph,
+        "supervisor": _build_supervisor_graph,
+    }
+    builder_fn = builders.get(strategy, _build_router_graph)
+    return builder_fn(agents_config, built_agents, checkpointer=checkpointer,
+                      exec_agents=exec_agents)
 
 
-def _build_router_graph(agents_config, built_agents):
+def _build_router_graph(agents_config, built_agents, checkpointer=None,
+                        exec_agents=None):
     router_llm = get_llm()
     router_prompt = _build_router_prompt(agents_config)
     valid_roles = {a["role"] for a in agents_config}
@@ -204,39 +233,45 @@ def _build_router_graph(agents_config, built_agents):
 
     for ac in agents_config:
         role = ac["role"]
-        graph.add_node(role, _make_agent_executor(role, built_agents))
+        executor = _get_executor(role, built_agents, exec_agents)
+        graph.add_node(role, executor)
         graph.add_edge(role, END)
 
     graph.add_edge(START, "router")
     graph.add_conditional_edges("router", lambda s: s["selected_agent"])
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
-def _build_sequential_graph(agents_config, built_agents):
+def _build_sequential_graph(agents_config, built_agents, checkpointer=None,
+                            exec_agents=None):
     graph = StateGraph(OrchestratorState)
     roles = [ac["role"] for ac in agents_config]
 
     for role in roles:
-        graph.add_node(role, _make_agent_executor(role, built_agents))
+        executor = _get_executor(role, built_agents, exec_agents)
+        graph.add_node(role, executor)
 
     graph.add_edge(START, roles[0])
     for i in range(len(roles) - 1):
         graph.add_edge(roles[i], roles[i + 1])
     graph.add_edge(roles[-1], END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
-def _build_parallel_graph(agents_config, built_agents):
+def _build_parallel_graph(agents_config, built_agents, checkpointer=None,
+                          exec_agents=None):
     graph = StateGraph(OrchestratorState)
     for ac in agents_config:
         role = ac["role"]
-        graph.add_node(role, _make_agent_executor(role, built_agents))
+        executor = _get_executor(role, built_agents, exec_agents)
+        graph.add_node(role, executor)
         graph.add_edge(START, role)
         graph.add_edge(role, END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
-def _build_supervisor_graph(agents_config, built_agents):
+def _build_supervisor_graph(agents_config, built_agents, checkpointer=None,
+                            exec_agents=None):
     router_llm = get_llm()
     valid_roles = {a["role"] for a in agents_config}
 
@@ -265,7 +300,8 @@ Respond with ONLY "DONE" or an agent name ({agent_names})."""
 
     for ac in agents_config:
         role = ac["role"]
-        graph.add_node(role, _make_agent_executor(role, built_agents))
+        executor = _get_executor(role, built_agents, exec_agents)
+        graph.add_node(role, executor)
         graph.add_edge(role, "supervisor")
 
     graph.add_edge(START, "supervisor")
@@ -277,7 +313,7 @@ Respond with ONLY "DONE" or an agent name ({agent_names})."""
         return sel
 
     graph.add_conditional_edges("supervisor", supervisor_router)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 async def build_orchestrator():
@@ -285,3 +321,11 @@ async def build_orchestrator():
     init_db()
     seed_defaults()
     return await build_orchestrator_from_team("default")
+
+
+def get_graph_config(thread_id: str, callbacks: list | None = None) -> dict:
+    """Build the LangGraph config dict with thread_id for checkpointing and optional callbacks."""
+    config: dict = {"configurable": {"thread_id": thread_id}}
+    if callbacks:
+        config["callbacks"] = callbacks
+    return config

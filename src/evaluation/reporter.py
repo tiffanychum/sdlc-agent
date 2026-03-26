@@ -51,28 +51,3 @@ def print_eval_report(run: EvalRunMetric) -> None:
         detail_table.add_row(task.scenario_name, routing_ok, completed, tool_acc, latency)
 
     console.print(detail_table)
-
-
-def print_regression_report(comparison: dict) -> None:
-    """Print a regression comparison between two evaluation runs."""
-    console.print("\n[bold]Regression Analysis[/bold]\n")
-
-    table = Table(title="Performance Comparison")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Before", style="blue")
-    table.add_column("After", style="blue")
-    table.add_column("Delta", style="green")
-    table.add_column("Status", style="bold")
-
-    for metric, data in comparison.items():
-        status = "[red]⚠ REGRESSION[/red]" if data["regression"] else "[green]✓ OK[/green]"
-        delta_str = f"{data['delta']:+.1%}"
-        table.add_row(
-            metric,
-            f"{data['before']:.1%}",
-            f"{data['after']:.1%}",
-            delta_str,
-            status,
-        )
-
-    console.print(table)

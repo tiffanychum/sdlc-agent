@@ -227,7 +227,13 @@ class TraceCollector:
     backward compatibility with server.py and orchestrator.py.
     """
 
-    def __init__(self, team_id: str = None, user_prompt: str = ""):
+    def __init__(self, team_id: str = None, user_prompt: str = "",
+                 on_span_event: callable = None):
+        """
+        Args:
+            on_span_event: Optional callback(event_type, span_dict) called when
+                spans start ("span_start") or end ("span_end") for real-time streaming.
+        """
         init_otel()
         self.trace_id = uuid.uuid4().hex[:12]
         self.team_id = team_id
@@ -237,6 +243,7 @@ class TraceCollector:
         self._tracer = get_tracer()
         self._active_spans: dict = {}
         self._span_data: dict[str, dict] = {}
+        self._on_span_event = on_span_event
 
     def start_span(self, name: str, span_type: str, parent_id: str = None, input_data: dict = None) -> str:
         span_id = uuid.uuid4().hex[:12]
@@ -252,7 +259,7 @@ class TraceCollector:
                 },
             )
             self._active_spans[span_id] = otel_span
-        self._span_data[span_id] = {
+        span_data = {
             "id": span_id,
             "name": name,
             "span_type": span_type,
@@ -267,6 +274,9 @@ class TraceCollector:
             "status": "running",
             "error": None,
         }
+        self._span_data[span_id] = span_data
+        if self._on_span_event:
+            self._on_span_event("span_start", _span_summary(span_data))
         return span_id
 
     def end_span(self, span_id: str, output_data: dict = None, tokens_in: int = 0,
@@ -296,6 +306,8 @@ class TraceCollector:
             data["status"] = "error" if error else "completed"
             data["error"] = error
             self.spans.append(data)
+            if self._on_span_event:
+                self._on_span_event("span_end", _span_summary(data))
 
     def save(self):
         """Persist the trace and all spans to the database.
@@ -391,6 +403,21 @@ class TraceCollector:
                 "error": s["error"],
             } for s in self.spans],
         }
+
+
+def _span_summary(span: dict) -> dict:
+    """Lightweight span dict suitable for SSE streaming (no large data fields)."""
+    return {
+        "id": span.get("id", ""),
+        "name": span.get("name", ""),
+        "span_type": span.get("span_type", ""),
+        "tokens_in": span.get("tokens_in", 0),
+        "tokens_out": span.get("tokens_out", 0),
+        "cost": round(span.get("cost", 0.0), 6),
+        "model": span.get("model", ""),
+        "status": span.get("status", "running"),
+        "error": span.get("error"),
+    }
 
 
 def _truncate(data: dict, max_len: int = 500) -> dict:

@@ -9,9 +9,8 @@ Skills are model-invoked, instruction-only, lightweight, and safe.
 They never add tools — only behavioral guidance injected into the system prompt.
 """
 
-import re
 from src.db.database import get_session
-from src.db.models import Agent, AgentSkillMapping, Skill
+from src.db.models import AgentSkillMapping, Skill
 
 
 def get_agent_skills(agent_id: str) -> list[Skill]:

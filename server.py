@@ -10,12 +10,16 @@ Provides REST APIs for:
 - Multi-LLM evaluation and comparison
 """
 
+import asyncio
+import json
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.db.database import init_db, seed_defaults, get_session
@@ -23,7 +27,7 @@ from src.db.models import (
     Team, Agent, AgentToolMapping, Skill, AgentSkillMapping,
     Trace, Span, EvalRun, GoldenTestCase, RegressionResult, PromptVersion,
 )
-from src.orchestrator import build_orchestrator_from_team, _extract_text
+from src.orchestrator import build_orchestrator_from_team, _extract_text, get_graph_config
 from src.tracing.collector import TraceCollector
 
 
@@ -88,6 +92,14 @@ class SkillUpdate(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+
+class ChatStreamRequest(BaseModel):
+    message: str
+    thread_id: Optional[str] = None
+
+class ChatResumeRequest(BaseModel):
+    thread_id: str
+    hitl_response: dict
 
 class EvalRequest(BaseModel):
     team_id: str = "default"
@@ -397,11 +409,28 @@ async def chat(team_id: str, request: ChatRequest):
     tracing_cb = TracingCallbackHandler(collector)
     routing_span = collector.start_span("routing", "routing", input_data={"prompt": request.message[:200]})
 
-    result = await orchestrators[team_id].ainvoke(
+    from langgraph.types import Command as LGCommand
+
+    legacy_thread = uuid.uuid4().hex[:12]
+    graph = orchestrators[team_id]
+    lg_config = {"configurable": {"thread_id": legacy_thread}, "callbacks": [tracing_cb]}
+
+    result = await graph.ainvoke(
         {"messages": [{"role": "user", "content": request.message}],
          "selected_agent": "", "agent_trace": []},
-        config={"callbacks": [tracing_cb]},
+        config=lg_config,
     )
+
+    for _ in range(10):
+        state = await graph.aget_state(lg_config)
+        if not state.next:
+            break
+        result = await graph.ainvoke(
+            LGCommand(resume={"approved": True, "action": "continue", "answer": "proceed"}),
+            config=lg_config,
+        )
+    else:
+        result = (await graph.aget_state(lg_config)).values
 
     agent_used = result.get("selected_agent", "unknown")
     collector.end_span(routing_span, output_data={"selected_agent": agent_used})
@@ -516,6 +545,277 @@ async def rebuild_team(team_id: str):
     """Rebuild orchestrator after config changes."""
     orchestrators[team_id] = await build_orchestrator_from_team(team_id)
     return {"status": "rebuilt"}
+
+
+# ── SSE Streaming Chat ──────────────────────────────────────────
+
+def _sse_event(event_type: str, data: dict) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+@app.post("/api/teams/{team_id}/chat/stream")
+async def chat_stream(team_id: str, request: ChatStreamRequest):
+    """SSE streaming chat endpoint with HITL support.
+
+    Streams real-time events: agent_start, tool_start, tool_end, trace_span,
+    hitl_request, response, done. Supports LangGraph interrupt/resume via thread_id.
+    """
+    if team_id not in orchestrators:
+        orchestrators[team_id] = await build_orchestrator_from_team(team_id)
+
+    graph = orchestrators[team_id]
+    thread_id = request.thread_id or uuid.uuid4().hex[:12]
+
+    span_queue: asyncio.Queue = asyncio.Queue()
+
+    def on_span_event(event_type: str, span_data: dict):
+        span_queue.put_nowait({"event": event_type, "span": span_data})
+
+    collector = TraceCollector(team_id=team_id, user_prompt=request.message,
+                               on_span_event=on_span_event)
+    from src.tracing.callbacks import TracingCallbackHandler
+    tracing_cb = TracingCallbackHandler(collector)
+    routing_span = collector.start_span("routing", "routing",
+                                        input_data={"prompt": request.message[:200]})
+
+    config = get_graph_config(thread_id, callbacks=[tracing_cb])
+    initial_input = {
+        "messages": [{"role": "user", "content": request.message}],
+        "selected_agent": "", "agent_trace": [],
+    }
+
+    async def event_generator():
+        yield _sse_event("thread_id", {"thread_id": thread_id})
+
+        current_agent = ""
+        try:
+            async for event in graph.astream_events(initial_input, config=config, version="v2"):
+                kind = event.get("event", "")
+                name = event.get("name", "")
+                tags = event.get("tags", [])
+                data = event.get("data", {})
+
+                if kind == "on_chain_start" and "agent" in name.lower():
+                    agent_name = name.replace("agent:", "").replace("Agent", "").strip() or name
+                    current_agent = agent_name
+                    yield _sse_event("agent_start", {"agent": agent_name})
+
+                elif kind == "on_tool_start":
+                    tool_input = data.get("input", {})
+                    if isinstance(tool_input, dict):
+                        safe_input = {k: str(v)[:200] for k, v in tool_input.items()}
+                    else:
+                        safe_input = {"input": str(tool_input)[:200]}
+                    yield _sse_event("tool_start", {
+                        "agent": current_agent, "tool": name,
+                        "args": safe_input,
+                    })
+
+                elif kind == "on_tool_end":
+                    output = data.get("output", "")
+                    yield _sse_event("tool_end", {
+                        "agent": current_agent, "tool": name,
+                        "output_preview": str(output)[:300],
+                    })
+
+                elif kind == "on_chat_model_stream":
+                    chunk = data.get("chunk")
+                    if chunk:
+                        content = getattr(chunk, "content", "")
+                        if content and isinstance(content, str):
+                            yield _sse_event("llm_token", {
+                                "agent": current_agent, "token": content,
+                            })
+
+                elif kind == "on_chain_end" and "agent" in name.lower():
+                    yield _sse_event("agent_end", {"agent": current_agent})
+
+                while not span_queue.empty():
+                    sq = span_queue.get_nowait()
+                    yield _sse_event("trace_span", sq)
+
+        except Exception as e:
+            yield _sse_event("error", {"message": str(e)[:500]})
+            while not span_queue.empty():
+                sq = span_queue.get_nowait()
+                yield _sse_event("trace_span", sq)
+            collector.save()
+            yield _sse_event("done", {"thread_id": thread_id, "partial": True})
+            return
+
+        collector.end_span(routing_span, output_data={"selected_agent": current_agent})
+
+        while not span_queue.empty():
+            sq = span_queue.get_nowait()
+            yield _sse_event("trace_span", sq)
+
+        state = await graph.aget_state(config)
+        if state.next:
+            interrupt_value = {}
+            if state.tasks:
+                for task in state.tasks:
+                    if hasattr(task, "interrupts") and task.interrupts:
+                        interrupt_value = task.interrupts[0].value
+                        break
+            interrupt_value["thread_id"] = thread_id
+            yield _sse_event("hitl_request", interrupt_value)
+        else:
+            full_state = state.values
+            agent_used = full_state.get("selected_agent", "unknown")
+            agent_trace = full_state.get("agent_trace", [])
+            messages = full_state.get("messages", [])
+
+            all_agents = []
+            tool_calls = []
+            for entry in agent_trace:
+                if entry.get("step") == "execution":
+                    an = entry.get("agent", "unknown")
+                    if an not in all_agents:
+                        all_agents.append(an)
+                    for tc in entry.get("tool_calls", []):
+                        tool_calls.append({**tc, "agent": an})
+
+            response_text = ""
+            if messages:
+                last = messages[-1]
+                response_text = _extract_text(
+                    last.content if hasattr(last, "content") else str(last)
+                )
+
+            collector.save()
+
+            yield _sse_event("response", {
+                "content": response_text,
+                "agent_used": " > ".join(all_agents) if all_agents else agent_used,
+                "tool_calls": tool_calls,
+                "agent_trace": agent_trace,
+                "trace": collector.to_dict(),
+            })
+            yield _sse_event("done", {})
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/teams/{team_id}/chat/resume")
+async def chat_resume(team_id: str, request: ChatResumeRequest):
+    """Resume an interrupted chat session after HITL response.
+
+    The graph is resumed from the checkpointed state using the same thread_id.
+    Returns an SSE stream for the remainder of execution.
+    """
+    if team_id not in orchestrators:
+        orchestrators[team_id] = await build_orchestrator_from_team(team_id)
+
+    graph = orchestrators[team_id]
+    thread_id = request.thread_id
+
+    from langgraph.types import Command
+
+    span_queue: asyncio.Queue = asyncio.Queue()
+
+    def on_span_event(event_type: str, span_data: dict):
+        span_queue.put_nowait({"event": event_type, "span": span_data})
+
+    collector = TraceCollector(team_id=team_id, user_prompt="[HITL resume]",
+                               on_span_event=on_span_event)
+    from src.tracing.callbacks import TracingCallbackHandler
+    tracing_cb = TracingCallbackHandler(collector)
+    config = get_graph_config(thread_id, callbacks=[tracing_cb])
+
+    async def event_generator():
+        yield _sse_event("resumed", {"thread_id": thread_id})
+
+        current_agent = ""
+        try:
+            async for event in graph.astream_events(
+                Command(resume=request.hitl_response), config=config, version="v2"
+            ):
+                kind = event.get("event", "")
+                name = event.get("name", "")
+                data = event.get("data", {})
+
+                if kind == "on_chain_start" and "agent" in name.lower():
+                    current_agent = name.replace("agent:", "").strip() or name
+                    yield _sse_event("agent_start", {"agent": current_agent})
+                elif kind == "on_tool_start":
+                    tool_input = data.get("input", {})
+                    safe_input = {k: str(v)[:200] for k, v in tool_input.items()} if isinstance(tool_input, dict) else {"input": str(tool_input)[:200]}
+                    yield _sse_event("tool_start", {"agent": current_agent, "tool": name, "args": safe_input})
+                elif kind == "on_tool_end":
+                    yield _sse_event("tool_end", {"agent": current_agent, "tool": name, "output_preview": str(data.get("output", ""))[:300]})
+                elif kind == "on_chat_model_stream":
+                    chunk = data.get("chunk")
+                    if chunk:
+                        content = getattr(chunk, "content", "")
+                        if content and isinstance(content, str):
+                            yield _sse_event("llm_token", {"agent": current_agent, "token": content})
+                elif kind == "on_chain_end" and "agent" in name.lower():
+                    yield _sse_event("agent_end", {"agent": current_agent})
+
+                while not span_queue.empty():
+                    sq = span_queue.get_nowait()
+                    yield _sse_event("trace_span", sq)
+
+        except Exception as e:
+            yield _sse_event("error", {"message": str(e)[:500]})
+            while not span_queue.empty():
+                sq = span_queue.get_nowait()
+                yield _sse_event("trace_span", sq)
+            collector.save()
+            yield _sse_event("done", {"thread_id": thread_id, "partial": True})
+            return
+
+        while not span_queue.empty():
+            sq = span_queue.get_nowait()
+            yield _sse_event("trace_span", sq)
+
+        state = await graph.aget_state(config)
+        if state.next:
+            interrupt_value = {}
+            if state.tasks:
+                for task in state.tasks:
+                    if hasattr(task, "interrupts") and task.interrupts:
+                        interrupt_value = task.interrupts[0].value
+                        break
+            interrupt_value["thread_id"] = thread_id
+            yield _sse_event("hitl_request", interrupt_value)
+        else:
+            full_state = state.values
+            agent_used = full_state.get("selected_agent", "unknown")
+            agent_trace = full_state.get("agent_trace", [])
+            messages = full_state.get("messages", [])
+
+            all_agents = []
+            tool_calls = []
+            for entry in agent_trace:
+                if entry.get("step") == "execution":
+                    an = entry.get("agent", "unknown")
+                    if an not in all_agents:
+                        all_agents.append(an)
+                    for tc in entry.get("tool_calls", []):
+                        tool_calls.append({**tc, "agent": an})
+
+            response_text = ""
+            if messages:
+                last = messages[-1]
+                response_text = _extract_text(
+                    last.content if hasattr(last, "content") else str(last)
+                )
+
+            collector.save()
+
+            yield _sse_event("response", {
+                "content": response_text,
+                "agent_used": " > ".join(all_agents) if all_agents else agent_used,
+                "tool_calls": tool_calls,
+                "agent_trace": agent_trace,
+                "trace": collector.to_dict(),
+            })
+            yield _sse_event("done", {})
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ── Traces API ──────────────────────────────────────────────────
@@ -1387,7 +1687,7 @@ async def run_rca(request: RCARequest):
     return rca_result
 
 
-# ── WebSocket ───────────────────────────────────────────────────
+# ── WebSocket (fallback with HITL support) ──────────────────────
 
 @app.websocket("/ws/chat/{team_id}")
 async def ws_chat(websocket: WebSocket, team_id: str):
@@ -1395,26 +1695,67 @@ async def ws_chat(websocket: WebSocket, team_id: str):
     if team_id not in orchestrators:
         orchestrators[team_id] = await build_orchestrator_from_team(team_id)
 
+    graph = orchestrators[team_id]
+    thread_id = uuid.uuid4().hex[:12]
+    await websocket.send_json({"type": "thread_id", "thread_id": thread_id})
+
     try:
         while True:
             data = await websocket.receive_json()
-            message = data.get("message", "")
+            msg_type = data.get("type", "message")
+            config = get_graph_config(thread_id)
 
-            result = await orchestrators[team_id].ainvoke({
-                "messages": [{"role": "user", "content": message}],
-                "selected_agent": "", "agent_trace": [],
-            })
+            if msg_type == "resume":
+                from langgraph.types import Command
+                graph_input = Command(resume=data.get("hitl_response", {}))
+            else:
+                message = data.get("message", "")
+                graph_input = {
+                    "messages": [{"role": "user", "content": message}],
+                    "selected_agent": "", "agent_trace": [],
+                }
 
-            agent_used = result.get("selected_agent", "unknown")
-            trace = result.get("agent_trace", [])
-            for entry in trace:
-                if entry.get("step") == "execution":
-                    for tc in entry.get("tool_calls", []):
-                        await websocket.send_json({"type": "tool_call", "tool": tc["tool"], "args": tc.get("args", {})})
+            current_agent = ""
+            async for event in graph.astream_events(graph_input, config=config, version="v2"):
+                kind = event.get("event", "")
+                name = event.get("name", "")
+                ev_data = event.get("data", {})
 
-            last_msg = result["messages"][-1]
-            response = _extract_text(last_msg.content if hasattr(last_msg, "content") else str(last_msg))
-            await websocket.send_json({"type": "response", "content": response, "agent_used": agent_used})
+                if kind == "on_chain_start" and "agent" in name.lower():
+                    current_agent = name.replace("agent:", "").strip() or name
+                    await websocket.send_json({"type": "agent_start", "agent": current_agent})
+                elif kind == "on_tool_start":
+                    await websocket.send_json({"type": "tool_start", "agent": current_agent, "tool": name})
+                elif kind == "on_tool_end":
+                    await websocket.send_json({"type": "tool_end", "agent": current_agent, "tool": name,
+                                               "output_preview": str(ev_data.get("output", ""))[:300]})
+                elif kind == "on_chat_model_stream":
+                    chunk = ev_data.get("chunk")
+                    if chunk:
+                        content = getattr(chunk, "content", "")
+                        if content and isinstance(content, str):
+                            await websocket.send_json({"type": "llm_token", "agent": current_agent, "token": content})
+
+            state = await graph.aget_state(config)
+            if state.next:
+                interrupt_value = {}
+                if state.tasks:
+                    for task in state.tasks:
+                        if hasattr(task, "interrupts") and task.interrupts:
+                            interrupt_value = task.interrupts[0].value
+                            break
+                interrupt_value["thread_id"] = thread_id
+                await websocket.send_json({"type": "hitl_request", **interrupt_value})
+            else:
+                full_state = state.values
+                last = full_state.get("messages", [])[-1] if full_state.get("messages") else None
+                response = _extract_text(last.content if last and hasattr(last, "content") else str(last)) if last else ""
+                await websocket.send_json({
+                    "type": "response", "content": response,
+                    "agent_used": full_state.get("selected_agent", "unknown"),
+                })
+                await websocket.send_json({"type": "done"})
+
     except WebSocketDisconnect:
         pass
 

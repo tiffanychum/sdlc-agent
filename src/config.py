@@ -15,16 +15,8 @@ class LLMConfig:
 
 
 @dataclass
-class GitHubConfig:
-    token: str = field(default_factory=lambda: os.getenv("GITHUB_TOKEN", ""))
-    base_url: str = "https://api.github.com"
-
-
-@dataclass
 class AppConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
-    github: GitHubConfig = field(default_factory=GitHubConfig)
-    max_agent_iterations: int = 10
     eval_output_dir: str = "eval/results"
 
 

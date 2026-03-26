@@ -101,8 +101,6 @@ class TaskMetric:
             return 1.0 if self.completed else 0.5
 
         response_lower = str(self.final_response).lower()
-        if not self.tool_outputs:
-            return 0.5
 
         grounded_words = 0
         total_keywords = 0

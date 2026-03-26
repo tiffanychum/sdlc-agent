@@ -1,6 +1,6 @@
 # SDLC Agent — Multi-Agent Coding Platform
 
-A full-stack multi-agent platform for automating software development workflows. Features a **5-agent team** with per-agent decision strategies, **MCP (Model Context Protocol)** for standardized tool integration, a **three-layer evaluation pipeline** (rule-based + LLM-as-Judge + DeepEval), **golden dataset regression testing** with trace-based assertions and root cause analysis, **prompt versioning with A/B testing**, and a **Next.js dashboard** for configuration, monitoring, and observability.
+A full-stack multi-agent platform for automating software development workflows. Features a **5-agent team** with per-agent decision strategies, **Human-in-the-Loop (HITL)** checkpoints with plan review and action confirmation, **MCP (Model Context Protocol)** for standardized tool integration, a **three-layer evaluation pipeline** (rule-based + LLM-as-Judge + DeepEval), **golden dataset regression testing** with trace-based assertions and root cause analysis, **real-time trace inspection** via SSE streaming, **prompt versioning with A/B testing**, and a **Next.js dashboard** with conversation management, live markdown rendering, and observability.
 
 Built with LangGraph, MCP, FastAPI, SQLite, DeepEval, Langfuse, OpenTelemetry, and Next.js.
 
@@ -21,6 +21,13 @@ Built with LangGraph, MCP, FastAPI, SQLite, DeepEval, Langfuse, OpenTelemetry, a
      │ Coder   │ │ Runner │ │Research│ │ Planner │ │ Reviewer │
      │ (ReAct) │ │(ReAct) │ │(ReAct) │ │(Plan+Ex)│ │(Reflexn) │
      └────┬────┘ └───┬────┘ └───┬────┘ └────┬────┘ └─────┬────┘
+          │          │          │           │            │
+          ▼          ▼          ▼           ▼            ▼
+     ┌──────────────────────────────────────────────────────┐
+     │            HITL Checkpoints (4 types)                │
+     │  Clarification · Plan Review · Action Confirm · Tool │
+     │  Review — interrupt() / Command(resume=) via SSE     │
+     └──────────────────────────────────────────────────────┘
           │          │          │           │            │
           ▼          ▼          ▼           ▼            ▼
      ┌──────────────────────────────────────────────────────┐
@@ -48,14 +55,30 @@ Each agent has a specific role, decision strategy, MCP tool set, and skills:
 
 ### Per-Agent Decision Strategies
 
-Each agent uses the decision strategy best suited to its role:
-
 | Strategy | How It Works | Best For |
 |----------|-------------|----------|
 | **ReAct** | Think → Act → Observe → Repeat | Quick, focused tasks (reading files, running commands) |
 | **Plan-and-Execute** | Create a numbered plan first, then execute step by step | Complex multi-step tasks that need decomposition |
 | **Reflexion** | After each action, reflect on whether it was correct | Quality-critical tasks (code review, verification) |
 | **Chain-of-Thought** | Reason thoroughly before taking any action | Tasks requiring careful analysis |
+
+### Human-in-the-Loop (HITL)
+
+The system supports four HITL checkpoint types, powered by LangGraph's `interrupt()` / `Command(resume=)` with a `MemorySaver` checkpointer:
+
+| Checkpoint | When It Triggers | What the User Sees |
+|------------|-----------------|-------------------|
+| **Clarification Q&A** | Agent calls `ask_human` tool to gather context | Question with optional quick-reply buttons + free-text input |
+| **Plan Review** | Planner generates a plan (two-phase: plan first, then execute) | Editable step list with reorder, add, remove; approve or request changes |
+| **Action Confirmation** | Dangerous tools (`run_command`, `write_file`, `git_commit`, etc.) | Tool name, arguments, risk level; allow or deny |
+| **Tool Output Review** | Reviewable tools (`run_command`, `run_script`) complete | Tool output with option to continue, edit, or stop |
+
+The **Planner** uses a two-phase architecture:
+1. **Phase 1 — Plan**: LLM generates a numbered plan (no tool execution)
+2. **Phase 2 — Review**: HITL interrupt for user review/editing
+3. **Phase 3 — Execute**: Approved plan is executed by an unwrapped agent (no nested HITL interrupts)
+
+During regression testing, all HITL checkpoints are auto-approved to allow unattended execution.
 
 ### MCP vs Skills — Clear Separation
 
@@ -77,7 +100,8 @@ Following the [Claude Code principle](https://docs.anthropic.com/): **"MCP gives
 1. User sends a request (e.g., "Create a plan for refactoring the config module")
 2. A lightweight **Router LLM call** classifies the intent and selects the best agent
 3. The selected agent runs with its assigned tools and strategy
-4. Every step is traced (routing decision, tool calls, response) for evaluation
+4. HITL checkpoints may pause execution for user input
+5. Every step is traced (routing decision, tool calls, HITL pauses, response) for evaluation
 
 ### LLM Configuration
 
@@ -94,11 +118,51 @@ LLM_MODEL=gpt-5-nano
 # Researcher → gpt-4o-mini-search
 ```
 
+## Chat Interface
+
+The chat page features a three-panel layout:
+
+### Conversation Sidebar (left)
+- **Conversation history**: Switch between past chats with full message + trace preservation
+- **Create / delete**: Start new conversations or remove old ones
+- Titles auto-derived from first user message, sorted by last activity
+
+### Chat Panel (center)
+- **Cursor-style thinking box**: Collapsible grey box showing LLM reasoning tokens in real-time
+- **Markdown rendering**: All assistant messages rendered with `react-markdown` (headings, code blocks, tables, lists, links) — styled during streaming, not after
+- **HITL widgets**: Inline interactive widgets for clarification, plan review, action confirmation, and tool output review
+- **Stop button**: Red stop button replaces Send during processing; aborts the SSE stream immediately
+- **Clear**: Clears messages within the current conversation without deleting it
+
+### Trace Inspector (right)
+- **Live trajectory**: Agent and tool execution flow shown as pills — format: `agent/tool_name` with pulsing indicators for active steps
+- **Summary cards**: Elapsed time, token count, cost — persists after query completes
+- **Spans grouped by agent**: Collapsible agent sections with per-agent token/cost totals and individual span details
+- **HITL pause indicator**: Orange banner when waiting for user response
+- All trace data persists after the query finishes (no disappearing on completion)
+
+### Streaming Architecture
+
+```
+Backend (FastAPI)          SSE Stream              Frontend (Next.js)
+─────────────────    ─────────────────────    ──────────────────────
+astream_events() →   thread_id                → setThreadId
+                     agent_start / agent_end  → trajectory pills
+                     tool_start / tool_end    → trajectory + status
+                     llm_token               → thinking box
+                     trace_span              → live span tree
+                     hitl_request            → HITL widget
+                     response                → markdown message
+                     done                    → finalize trace
+```
+
+Two SSE endpoints:
+- `POST /api/teams/{id}/chat/stream` — Initial query
+- `POST /api/teams/{id}/chat/resume` — Resume after HITL pause
+
 ## Evaluation System
 
 ### Three-Layer Evaluation Pipeline
-
-The evaluation system uses three complementary layers for comprehensive coverage:
 
 #### Layer 1: Rule-Based Metrics (7 metrics)
 
@@ -159,8 +223,8 @@ Each case specifies:
 #### Regression Run Pipeline
 
 ```
-Golden Case → Agent Execution → Trace Capture → Multi-Layer Evaluation
-                                                         │
+Golden Case → Agent Execution → HITL Auto-Approve → Trace Capture → Multi-Layer Evaluation
+                                                                            │
                      ┌───────────────────┬───────────────┼───────────────┐
                      ▼                   ▼               ▼               ▼
               Semantic Similarity   G-Eval Quality   DeepEval Agentic   Trace Assertions
@@ -172,6 +236,8 @@ Golden Case → Agent Execution → Trace Capture → Multi-Layer Evaluation
                                     Cost Regression  Latency Regression  Quality Regression
                                     (±20% threshold) (±20% threshold)   (below thresholds)
 ```
+
+During regression runs, all HITL checkpoints are auto-approved with sensible defaults (plans approved as-is, actions allowed, tools continued, clarifications answered with "proceed with best judgment") to enable fully unattended execution.
 
 #### Trace-Based Structural Assertions
 
@@ -219,6 +285,7 @@ Every agent interaction is traced following the **OpenTelemetry trace/span model
 - **Trace**: One complete user request → response cycle
 - **Spans**: Individual operations (routing decision, LLM call, tool invocation)
 - Each span records: input/output data, tokens, cost, latency, status
+- **Real-time streaming**: Spans are emitted via SSE as they start/end, enabling live trace inspection
 - **Cost estimation**: Per-model token pricing applied automatically
 - **OTLP export**: Optional export to any OpenTelemetry-compatible collector
 - **OpenInference**: Auto-instrumentation for LangChain via OpenInference
@@ -247,7 +314,7 @@ The **Regression Testing** tab includes:
 ```
 sdlc-agent/
 ├── main.py                          # CLI: chat, eval, health check
-├── server.py                        # FastAPI: 50+ REST endpoints
+├── server.py                        # FastAPI: 50+ REST + SSE endpoints
 ├── pyproject.toml                   # Project metadata, pytest, ruff config
 ├── requirements.txt                 # Python dependencies
 ├── .env.example                     # Environment template
@@ -255,10 +322,10 @@ sdlc-agent/
 ├── src/
 │   ├── config.py                    # Environment configuration (dataclasses)
 │   ├── orchestrator.py              # LangGraph multi-agent router + 4 strategies
-│   │
-│   ├── agents/
-│   │   ├── prompts.py               # Per-agent system prompts + strategy instructions
-│   │   └── definitions.py           # Agent configs + factory
+│   │                                #   + MemorySaver checkpointer + HITL integration
+│   ├── hitl.py                      # Human-in-the-Loop: 4 checkpoint types,
+│   │                                #   ask_human tool, dangerous/reviewable wrappers,
+│   │                                #   two-phase planner executor
 │   │
 │   ├── llm/
 │   │   └── client.py                # LangChain ChatOpenAI factory (any OpenAI-compatible API)
@@ -285,11 +352,13 @@ sdlc-agent/
 │   │   ├── reporter.py              # Rich console reports
 │   │   ├── golden.py                # Golden dataset: JSON ↔ DB sync
 │   │   ├── golden_dataset.json      # 10 curated test cases (versioned with code)
-│   │   ├── regression.py            # RegressionRunner: execute, evaluate, persist
+│   │   ├── regression.py            # RegressionRunner: execute, HITL auto-approve,
+│   │   │                            #   evaluate, persist
 │   │   └── rca.py                   # RootCauseAnalyzer: trace diff + LLM classification
 │   │
 │   ├── tracing/
 │   │   ├── collector.py             # OTel trace/span recording + OTLP + DB persistence
+│   │   │                            #   + real-time on_span_event callback for SSE
 │   │   └── callbacks.py             # LangChain callback handler → TraceCollector
 │   │
 │   └── db/
@@ -306,14 +375,16 @@ sdlc-agent/
 │   └── agent_memory.json            # MCP memory store
 │
 └── frontend/
-    ├── package.json                 # Next.js 16, React 19, Recharts, Tailwind 4
+    ├── package.json                 # Next.js 16, React 19, Recharts, Tailwind 4,
+    │                                #   react-markdown, remark-gfm
     └── src/
         ├── lib/
-        │   └── api.ts               # Typed fetch client for all backend APIs
+        │   └── api.ts               # Typed fetch + SSE client for all backend APIs
         └── app/
             ├── layout.tsx            # Root layout: sidebar nav (Studio, Chat, Monitoring, Evaluation)
             ├── page.tsx              # Agent Studio: team config, agents, skills, tools
-            ├── chat/page.tsx         # Chat: team chat + real-time trace inspector
+            ├── chat/page.tsx         # Chat: conversation sidebar, HITL widgets,
+            │                         #   Cursor-style thinking box, live trace inspector
             ├── monitoring/page.tsx   # Monitoring: metrics, regression testing, OTel, charts
             ├── evaluation/page.tsx   # Evaluation: run, compare, detail view
             └── traces/page.tsx       # Trace history: list + detail panes
@@ -394,9 +465,9 @@ python main.py test-mcp  # MCP health check
 "Find where decision strategies are defined and list them"
 "Check git status and show me the diff"
 
-# Complex (4+ steps)
-"Create a plan for refactoring the config module"
-"Review recent git changes for issues"
+# Complex (4+ steps, triggers HITL)
+"Create a plan for refactoring the config module"    → Plan Review HITL
+"Review recent git changes for issues"               → Action Confirmation HITL
 "Explore the project, read 3 key files, write a summary"
 ```
 
@@ -427,11 +498,18 @@ python main.py test-mcp  # MCP health check
 | `PUT` | `/api/agents/{id}/skills` | Assign skills to agent |
 | `GET` | `/api/tools` | List all MCP tools (24 total) |
 
-### Chat & Traces
+### Chat (SSE Streaming + HITL)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/api/teams/{id}/chat` | Chat with a team |
+| `POST` | `/api/teams/{id}/chat` | Synchronous chat (auto-resumes HITL) |
+| `POST` | `/api/teams/{id}/chat/stream` | SSE stream: real-time events (tokens, spans, HITL) |
+| `POST` | `/api/teams/{id}/chat/resume` | Resume SSE stream after HITL pause |
+
+### Traces
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | `GET` | `/api/traces` | List traces (paginated) |
 | `GET` | `/api/traces/stats` | Aggregated trace metrics |
 | `GET` | `/api/traces/{id}` | Trace detail with spans |
@@ -457,7 +535,7 @@ python main.py test-mcp  # MCP health check
 | `PUT` | `/api/golden/{id}` | Update golden test case |
 | `DELETE` | `/api/golden/{id}` | Deactivate golden test case |
 | `POST` | `/api/golden/sync` | Sync JSON → DB |
-| `POST` | `/api/regression/run` | Run regression suite |
+| `POST` | `/api/regression/run` | Run regression suite (HITL auto-approved) |
 | `GET` | `/api/regression/runs` | List regression runs |
 | `GET` | `/api/regression/results/{run_id}` | Run results (summary + per-case) |
 | `GET` | `/api/regression/results/{run_id}/{case_id}` | Detailed case result |
@@ -486,6 +564,12 @@ MCP provides a standardized protocol that decouples agents from tools. Adding a 
 ### Why Per-Agent Decision Strategies?
 Different tasks require different reasoning approaches. A code reader benefits from quick ReAct loops, while a project planner needs structured Plan-and-Execute, and a code reviewer benefits from self-reflection (Reflexion). One-size-fits-all strategies leave performance on the table.
 
+### Why Human-in-the-Loop?
+Production agent systems need guardrails. HITL checkpoints give users control over dangerous actions (shell commands, file writes, git operations) and plan approval before execution. The two-phase planner ensures plans are reviewed before any tools are called. During automated testing, HITL is auto-approved to maintain unattended execution.
+
+### Why SSE over WebSocket for Streaming?
+SSE is simpler (HTTP-based, auto-reconnect, one-way), sufficient for server→client streaming, and works through proxies. The granular event types (`agent_start`, `tool_start`, `llm_token`, `trace_span`, `hitl_request`) give the frontend full control over what to render and when. WebSocket is available as a fallback for bidirectional needs.
+
 ### Why Three-Layer Evaluation?
 Rule-based metrics (tool accuracy, step efficiency, safety) are fast and deterministic. LLM-as-Judge (G-Eval) catches nuanced quality issues (coherence, completeness) that rules miss. DeepEval agentic metrics provide specialized agent-level evaluation (tool correctness, plan quality, task completion) with detailed reasoning. Using all three gives comprehensive coverage without over-relying on any single approach.
 
@@ -499,15 +583,16 @@ Prompts are the most frequently changed artifact in an agent system. Treating th
 
 | Component | Technology |
 |-----------|-----------|
-| Agent Orchestration | LangGraph (router_decides, sequential, parallel, supervisor) |
+| Agent Orchestration | LangGraph (router_decides, sequential, parallel, supervisor) + MemorySaver |
+| Human-in-the-Loop | LangGraph interrupt() / Command(resume=), 4 checkpoint types |
 | Tool Protocol | MCP (Model Context Protocol) — 5 servers, 24 tools |
 | LLM Client | LangChain ChatOpenAI (any OpenAI-compatible API) |
-| Backend API | FastAPI + Uvicorn (50+ endpoints) |
+| Backend API | FastAPI + Uvicorn (50+ REST + SSE endpoints) |
 | Database | SQLite + SQLAlchemy (auto-migration) |
 | Evaluation | Custom rule-based + G-Eval + DeepEval (8 agentic metrics) |
-| Regression Testing | Golden dataset + trace assertions + RCA |
-| Observability | OpenTelemetry + OpenInference + Langfuse |
-| Frontend | Next.js 16 + React 19 + Tailwind CSS 4 + Recharts |
+| Regression Testing | Golden dataset + trace assertions + HITL auto-approve + RCA |
+| Observability | OpenTelemetry + OpenInference + Langfuse + real-time SSE spans |
+| Frontend | Next.js 16 + React 19 + Tailwind CSS 4 + Recharts + react-markdown |
 | Testing | pytest (44 tests: 28 MCP E2E + 16 evaluation unit) |
 
 ## License

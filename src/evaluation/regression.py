@@ -77,17 +77,48 @@ class RegressionRunner:
         baseline: dict = None,
     ) -> dict:
         from src.tracing.callbacks import TracingCallbackHandler
+        from src.orchestrator import get_graph_config
+        from langgraph.types import Command as LGCommand
 
         collector = TraceCollector(team_id=self.team_id, user_prompt=case.prompt)
         tracing_cb = TracingCallbackHandler(collector)
+        thread_id = f"regression-{uuid.uuid4().hex[:8]}"
+        config = get_graph_config(thread_id, callbacks=[tracing_cb])
         start = time.time()
 
         try:
             result = await orchestrator.ainvoke(
                 {"messages": [{"role": "user", "content": case.prompt}],
                  "selected_agent": "", "agent_trace": []},
-                config={"callbacks": [tracing_cb]},
+                config=config,
             )
+
+            for _ in range(15):
+                state = await orchestrator.aget_state(config)
+                if not state.next:
+                    break
+                resume_val = {"approved": True, "answer": "auto-approved for regression test"}
+                if state.tasks:
+                    for task in state.tasks:
+                        if hasattr(task, "interrupts") and task.interrupts:
+                            iv = task.interrupts[0].value
+                            if isinstance(iv, dict):
+                                htype = iv.get("type", "")
+                                if htype == "plan_review":
+                                    resume_val = {"type": "plan_review", "approved": True,
+                                                  "edited_plan": iv.get("plan", [])}
+                                elif htype == "action_confirmation":
+                                    resume_val = {"type": "action_confirmation", "approved": True}
+                                elif htype == "tool_review":
+                                    resume_val = {"type": "tool_review", "action": "continue"}
+                                elif htype == "clarification":
+                                    resume_val = {"type": "clarification",
+                                                  "answer": "Proceed with your best judgment."}
+                            break
+                result = await orchestrator.ainvoke(
+                    LGCommand(resume=resume_val), config=config
+                )
+
         except Exception as e:
             return self._error_result(case, str(e), time.time() - start)
 

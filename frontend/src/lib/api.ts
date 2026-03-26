@@ -9,6 +9,61 @@ async function fetchJSON(path: string, options?: RequestInit) {
   return res.json();
 }
 
+// ── SSE Event Types ──────────────────────────────────────────
+
+export interface SSEEvent {
+  type: string;
+  data: Record<string, any>;
+}
+
+export type SSECallback = (event: SSEEvent) => void;
+
+async function consumeSSE(
+  path: string,
+  body: Record<string, any>,
+  onEvent: SSECallback,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok) throw new Error(`SSE error: ${res.status}`);
+  if (!res.body) throw new Error("No response body for SSE");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() || "";
+
+    for (const part of parts) {
+      if (!part.trim()) continue;
+      const lines = part.split("\n");
+      let eventType = "";
+      let dataStr = "";
+      for (const line of lines) {
+        if (line.startsWith("event: ")) eventType = line.slice(7);
+        else if (line.startsWith("data: ")) dataStr = line.slice(6);
+      }
+      if (eventType && dataStr) {
+        try {
+          onEvent({ type: eventType, data: JSON.parse(dataStr) });
+        } catch {
+          onEvent({ type: eventType, data: { raw: dataStr } });
+        }
+      }
+    }
+  }
+}
+
 export const api = {
   teams: {
     list: () => fetchJSON("/api/teams"),
@@ -18,6 +73,10 @@ export const api = {
     delete: (id: string) => fetchJSON(`/api/teams/${id}`, { method: "DELETE" }),
     chat: (id: string, message: string) =>
       fetchJSON(`/api/teams/${id}/chat`, { method: "POST", body: JSON.stringify({ message }) }),
+    chatStream: (id: string, message: string, onEvent: SSECallback, threadId?: string, signal?: AbortSignal) =>
+      consumeSSE(`/api/teams/${id}/chat/stream`, { message, thread_id: threadId }, onEvent, signal),
+    chatResume: (id: string, threadId: string, hitlResponse: Record<string, any>, onEvent: SSECallback, signal?: AbortSignal) =>
+      consumeSSE(`/api/teams/${id}/chat/resume`, { thread_id: threadId, hitl_response: hitlResponse }, onEvent, signal),
     rebuild: (id: string) => fetchJSON(`/api/teams/${id}/rebuild`, { method: "POST" }),
     addAgent: (teamId: string, data: any) =>
       fetchJSON(`/api/teams/${teamId}/agents`, { method: "POST", body: JSON.stringify(data) }),

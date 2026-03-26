@@ -9,7 +9,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Column, String, Text, Float, Integer, Boolean,
-    DateTime, ForeignKey, Enum, JSON, create_engine,
+    DateTime, ForeignKey, JSON,
 )
 from sqlalchemy.orm import declarative_base, relationship
 

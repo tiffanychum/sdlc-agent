@@ -238,8 +238,7 @@ class AgentEvaluator:
         try:
             from src.evaluation.integrations import export_eval_run_to_langfuse
             summary = run.summary()
-            tasks = [{"scenario": t.scenario_name, "completed": t.completed} for t in run.tasks]
-            export_eval_run_to_langfuse(summary, tasks)
+            export_eval_run_to_langfuse(summary)
         except Exception:
             pass
 

@@ -1613,7 +1613,7 @@ export default function MonitoringPage() {
                   <ResponsiveContainer width="50%" height={200}>
                     <PieChart>
                       <Pie data={spanTypeData} dataKey="value" nameKey="name" cx="50%" cy="50%"
-                        outerRadius={80} label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
+                        outerRadius={80} label={({ name, percent }: { name?: string; percent?: number }) => `${name ?? ""} ${((percent ?? 0) * 100).toFixed(0)}%`}
                         labelLine={false} fontSize={9}>
                         {spanTypeData.map((entry, i) => (
                           <Cell key={i} fill={entry.fill} />
@@ -1696,7 +1696,7 @@ export default function MonitoringPage() {
                     <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
                     <XAxis dataKey="id" stroke="var(--text-muted)" fontSize={10} />
                     <YAxis stroke="var(--text-muted)" fontSize={10} />
-                    <Tooltip {...tip} formatter={(value: number) => `$${value.toFixed(4)}`} />
+                    <Tooltip {...tip} formatter={(value) => `$${Number(value ?? 0).toFixed(4)}`} />
                     <Bar dataKey="cost" name="Cost ($)" fill="#059669" radius={[3, 3, 0, 0]} />
                   </BarChart>
                 </ResponsiveContainer>

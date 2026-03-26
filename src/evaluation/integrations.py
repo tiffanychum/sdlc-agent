@@ -80,7 +80,7 @@ def export_trace_to_langfuse(
         pass
 
 
-def export_eval_run_to_langfuse(run_summary: dict, tasks: list[dict]):
+def export_eval_run_to_langfuse(run_summary: dict):
     """Export an entire evaluation run to Langfuse."""
     client = get_langfuse_client()
     if not client:
