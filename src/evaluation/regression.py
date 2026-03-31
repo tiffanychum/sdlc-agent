@@ -15,7 +15,6 @@ from src.db.database import get_session
 from src.db.models import EvalRun, RegressionResult, GoldenTestCase
 from src.evaluation.golden import get_active_cases
 from src.config import config
-from src.llm.client import get_llm
 from src.orchestrator import build_orchestrator_from_team, _extract_text
 from src.tracing.collector import TraceCollector, estimate_cost
 
@@ -48,7 +47,7 @@ class RegressionRunner:
 
         baseline_results = _load_baseline_results(baseline_run_id) if baseline_run_id else {}
 
-        orchestrator = await build_orchestrator_from_team(self.team_id)
+        orchestrator = await build_orchestrator_from_team(self.team_id, model_override=self.model or None)
 
         run_id = uuid.uuid4().hex[:12]
         results: list[dict] = []
@@ -234,7 +233,8 @@ class RegressionRunner:
     async def _compute_semantic_similarity(self, reference: str, actual: str) -> float:
         if not reference or not actual:
             return 0.0
-        llm = get_llm()
+        from src.llm.client import get_judge_llm
+        llm = get_judge_llm()
         prompt = f"""Score the semantic similarity between these two texts on a scale of 0.0 to 1.0.
 Consider meaning equivalence, not exact wording. 0.0 = completely unrelated, 1.0 = identical meaning.
 
@@ -259,7 +259,8 @@ Respond with ONLY a JSON object: {{"score": <float>, "reasoning": "<brief explan
 
     async def _evaluate_quality(self, case: GoldenTestCase, actual_output: str, trace: list) -> tuple[dict, dict]:
         """Run G-Eval style per-criterion evaluation with reasoning."""
-        llm = get_llm()
+        from src.llm.client import get_judge_llm
+        llm = get_judge_llm()
         criteria = {
             "correctness": "Does the output correctly answer the user's question?",
             "completeness": "Does the output cover all aspects of the task?",

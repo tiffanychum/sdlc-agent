@@ -16,7 +16,7 @@ Root cause categories:
 
 import json
 
-from src.llm.client import get_llm
+from src.llm.client import get_rca_llm
 from src.orchestrator import _extract_text
 
 
@@ -131,7 +131,7 @@ class RootCauseAnalyzer:
         }
 
     async def _llm_analyze(self, failing: dict, baseline: dict, trace_diff: list, cost_diff: dict) -> dict:
-        llm = get_llm()
+        llm = get_rca_llm()
 
         divergence_points = [d for d in trace_diff if d.get("diverged")]
         first_div = divergence_points[0] if divergence_points else None

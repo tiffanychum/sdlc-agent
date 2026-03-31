@@ -103,20 +103,29 @@ Following the [Claude Code principle](https://docs.anthropic.com/): **"MCP gives
 4. HITL checkpoints may pause execution for user input
 5. Every step is traced (routing decision, tool calls, HITL pauses, response) for evaluation
 
-### LLM Configuration
+### Multi-Model Architecture
 
-The platform uses any **OpenAI-compatible API** as its LLM backbone. Each agent can use a different model:
+The platform uses any **OpenAI-compatible API** and supports **role-based model selection** — different models for agents, evaluation judges, and root cause analysis:
 
 ```
-# .env — Global default
+# .env — Model configuration
 LLM_BASE_URL=https://api.poe.com/v1
-LLM_MODEL=gpt-5-nano
-
-# Per-agent model selection (via Studio UI)
-# Coder → gemini-2.5-flash-lite
-# Runner → llama-3.1-8b-cs
-# Researcher → gpt-4o-mini-search
+LLM_MODEL=gpt-5                    # Global default / fallback
+LLM_JUDGE_MODEL=deepseek-r1        # G-Eval scoring, semantic similarity, DeepEval trace metrics
+LLM_RCA_MODEL=deepseek-r1          # Root cause analysis on regression failures
+LLM_ROUTER_MODEL=gpt-4o-mini       # Request routing and supervisor decisions (lightweight)
 ```
+
+| Tier | Purpose | Default Model | Why |
+|------|---------|---------------|-----|
+| **Agent (Planner/Coder)** | Complex tool calling, code generation, multi-step plans | `claude-sonnet-4.6` | Best tool-calling accuracy (91.9% tau2-bench), strong code quality |
+| **Agent (Runner/Reviewer)** | Test execution, simple tool use, code review | `gemini-3-flash` | Cost-effective, competitive quality for simpler tasks |
+| **Agent (Researcher)** | Web search, summarization | Global default | Synthesis-focused, configurable per team |
+| **Router / Supervisor** | Intent classification, agent selection | `gpt-4o-mini` | Lightweight, fast, cheap — routing doesn't need frontier reasoning |
+| **LLM-as-a-Judge** | G-Eval quality scoring, semantic similarity, DeepEval trace metrics | `deepseek-r1` | Strong reasoning for consistent evaluation scoring |
+| **RCA** | Root cause analysis on failed regression cases | `deepseek-r1` | Deep reasoning model for multi-step trace debugging |
+
+Per-agent models are stored in the database and configurable via the Studio UI. The `get_llm()`, `get_judge_llm()`, `get_rca_llm()`, and `get_router_llm()` factory functions in `src/llm/client.py` route to the appropriate model.
 
 ## Chat Interface
 
@@ -421,7 +430,12 @@ npm install
 ```bash
 POE_API_KEY=your_api_key           # LLM API key
 LLM_BASE_URL=https://api.poe.com/v1
-LLM_MODEL=gpt-5-nano              # Default model
+LLM_MODEL=gpt-5                   # Default agent model (fallback)
+
+# Role-specific models (optional — falls back to LLM_MODEL if unset)
+LLM_JUDGE_MODEL=deepseek-r1       # Evaluation: G-Eval, semantic similarity, trace metrics
+LLM_RCA_MODEL=deepseek-r1         # Root cause analysis on regression failures
+LLM_ROUTER_MODEL=gpt-4o-mini      # Request routing / supervisor (lightweight)
 
 GITHUB_TOKEN=your_github_token     # Optional: for GitHub MCP server
 

@@ -1,5 +1,5 @@
 "use client";
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, useMemo } from "react";
 import { api } from "@/lib/api";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -92,6 +92,7 @@ export default function MonitoringPage() {
   const [regSubTab, setRegSubTab] = useState<"golden" | "run" | "results" | "compare">("golden");
   const [goldenCases, setGoldenCases] = useState<any[]>([]);
   const [selectedCaseIds, setSelectedCaseIds] = useState<Set<string>>(new Set());
+  const [expandedCaseId, setExpandedCaseId] = useState<string | null>(null);
   const [regModel, setRegModel] = useState("");
   const [regPromptVer, setRegPromptVer] = useState("v1");
   const [regBaselineRunId, setRegBaselineRunId] = useState("");
@@ -117,6 +118,21 @@ export default function MonitoringPage() {
   const [editingPvDesc, setEditingPvDesc] = useState("");
   const [editingPvStrategy, setEditingPvStrategy] = useState("");
   const [pvSaving, setPvSaving] = useState(false);
+
+  const comparableCases = useMemo(() => {
+    const runAData = regRuns.find(r => r.id === regDiffRunA);
+    const runBData = regRuns.find(r => r.id === regDiffRunB);
+    if (!runAData?.case_ids || !runBData?.case_ids) return [];
+    const setB = new Set(runBData.case_ids as string[]);
+    const intersection = (runAData.case_ids as string[]).filter(id => setB.has(id));
+    return goldenCases.filter(c => intersection.includes(c.id));
+  }, [regDiffRunA, regDiffRunB, regRuns, goldenCases]);
+
+  useEffect(() => {
+    if (regDiffCaseId && comparableCases.length > 0 && !comparableCases.some(c => c.id === regDiffCaseId)) {
+      setRegDiffCaseId("");
+    }
+  }, [comparableCases, regDiffCaseId]);
 
   useEffect(() => {
     api.teams.list().then(t => { setTeams(t); if (t.length) setTeamId(t[0].id); });
@@ -533,98 +549,110 @@ export default function MonitoringPage() {
                   <div>
                     <h2 className="text-sm font-medium">Golden Test Cases</h2>
                     <p className="text-[11px] text-[var(--text-muted)]">
-                      Curated test cases with known-good outputs. Versioned alongside code in golden_dataset.json.
+                      Curated test cases with known-good outputs. Click a row to expand full details.
                     </p>
                   </div>
-                  <div className="flex gap-2">
+                  <div className="flex gap-2 items-center">
+                    <span className="text-[10px] text-[var(--text-muted)]">{goldenCases.length} cases ({goldenCases.filter(c => c.is_active).length} active)</span>
                     <button onClick={() => api.golden.sync().then(loadGolden)} className="btn-secondary text-xs">
                       Sync from JSON
                     </button>
                   </div>
                 </div>
-                <div className="space-y-1 max-h-[500px] overflow-y-auto">
-                  <div className="flex items-center gap-2 px-3 py-1.5 bg-[var(--bg)] text-[10px] text-[var(--text-muted)] uppercase tracking-wide font-medium border-b border-[var(--border)]">
-                    <div className="w-6"></div>
+                <div className="space-y-0 max-h-[700px] overflow-y-auto">
+                  <div className="flex items-center gap-2 px-3 py-1.5 bg-[var(--bg)] text-[10px] text-[var(--text-muted)] uppercase tracking-wide font-medium border-b border-[var(--border)] sticky top-0 z-10">
+                    <div className="w-5"></div>
                     <div className="flex-[2]">Name / ID</div>
                     <div className="flex-[3]">Prompt</div>
-                    <div className="w-16 text-center">Agent</div>
+                    <div className="w-20 text-center">Agent(s)</div>
                     <div className="w-20 text-center">Complexity</div>
-                    <div className="w-16 text-center">Version</div>
-                    <div className="w-16 text-center">Active</div>
+                    <div className="w-14 text-center">Ver.</div>
+                    <div className="w-14 text-center">Active</div>
                   </div>
                   {goldenCases.map(c => (
-                    <div key={c.id} className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)] text-xs hover:bg-[var(--bg-hover)] transition-colors">
-                      <div className="w-6">
-                        <input type="checkbox" checked={selectedCaseIds.has(c.id)} onChange={() => toggleCase(c.id)}
-                          className="h-3.5 w-3.5 rounded border-gray-300" />
+                    <div key={c.id}>
+                      <div
+                        onClick={() => setExpandedCaseId(expandedCaseId === c.id ? null : c.id)}
+                        className={`flex items-center gap-2 px-3 py-2 border-b border-[var(--border)] text-xs cursor-pointer transition-colors ${
+                          expandedCaseId === c.id ? "bg-[var(--accent)]/5" : "hover:bg-[var(--bg-hover)]"
+                        }`}>
+                        <div className="w-5 text-[10px] text-[var(--text-muted)]">{expandedCaseId === c.id ? "▼" : "▶"}</div>
+                        <div className="flex-[2]">
+                          <div className="font-medium">{c.name}</div>
+                          <div className="text-[10px] text-[var(--text-muted)] font-mono">{c.id}</div>
+                        </div>
+                        <div className="flex-[3] truncate text-[var(--text-muted)]">{c.prompt}</div>
+                        <div className="w-20 text-center">
+                          <span className="px-1.5 py-0.5 rounded bg-violet-50 text-violet-700 text-[10px] border border-violet-200">{c.expected_agent}</span>
+                        </div>
+                        <div className="w-20 text-center">
+                          <span className={`px-1.5 py-0.5 rounded text-[10px] border ${
+                            c.complexity === "quick" ? "bg-green-50 text-green-700 border-green-200"
+                            : c.complexity === "medium" ? "bg-amber-50 text-amber-700 border-amber-200"
+                            : "bg-red-50 text-red-700 border-red-200"
+                          }`}>{c.complexity}</span>
+                        </div>
+                        <div className="w-14 text-center text-[10px]">{c.version}</div>
+                        <div className="w-14 text-center">
+                          {c.is_active ? (
+                            <span className="w-2 h-2 bg-emerald-500 rounded-full inline-block" />
+                          ) : (
+                            <span className="w-2 h-2 bg-gray-300 rounded-full inline-block" />
+                          )}
+                        </div>
                       </div>
-                      <div className="flex-[2]">
-                        <div className="font-medium">{c.name}</div>
-                        <div className="text-[10px] text-[var(--text-muted)] font-mono">{c.id}</div>
-                      </div>
-                      <div className="flex-[3] truncate text-[var(--text-muted)]">{c.prompt}</div>
-                      <div className="w-16 text-center">
-                        <span className="px-1.5 py-0.5 rounded bg-violet-50 text-violet-700 text-[10px] border border-violet-200">{c.expected_agent}</span>
-                      </div>
-                      <div className="w-20 text-center">
-                        <span className={`px-1.5 py-0.5 rounded text-[10px] border ${
-                          c.complexity === "quick" ? "bg-green-50 text-green-700 border-green-200"
-                          : c.complexity === "medium" ? "bg-amber-50 text-amber-700 border-amber-200"
-                          : "bg-red-50 text-red-700 border-red-200"
-                        }`}>{c.complexity}</span>
-                      </div>
-                      <div className="w-16 text-center text-[10px]">{c.version}</div>
-                      <div className="w-16 text-center">
-                        {c.is_active ? (
-                          <span className="w-2 h-2 bg-emerald-500 rounded-full inline-block" />
-                        ) : (
-                          <span className="w-2 h-2 bg-gray-300 rounded-full inline-block" />
-                        )}
-                      </div>
+                      {expandedCaseId === c.id && (
+                        <div className="px-4 py-3 border-b border-[var(--border)] bg-[var(--bg)]/50">
+                          <div className="grid grid-cols-2 gap-3 text-xs">
+                            <div>
+                              <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1 font-medium">Prompt</div>
+                              <div className="p-2 rounded bg-white/80 border border-[var(--border)] leading-relaxed">{c.prompt}</div>
+                            </div>
+                            <div>
+                              <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1 font-medium">Reference Output</div>
+                              <div className="p-2 rounded bg-emerald-50 border border-emerald-200 leading-relaxed">{c.reference_output || "—"}</div>
+                            </div>
+                            <div>
+                              <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1 font-medium">Expected Behavior</div>
+                              <div className="space-y-1.5 p-2 rounded bg-white/80 border border-[var(--border)]">
+                                <div><span className="text-[var(--text-muted)]">Target Agent:</span> <span className="px-1.5 py-0.5 rounded bg-violet-50 text-violet-700 text-[10px] border border-violet-200">{c.expected_agent}</span></div>
+                                <div><span className="text-[var(--text-muted)]">Expected Tools:</span> {(c.expected_tools || []).map((t: string) => (
+                                  <span key={t} className="inline-block ml-1 px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 text-[10px] border border-blue-200">{t}</span>
+                                ))}</div>
+                                <div><span className="text-[var(--text-muted)]">Delegation Pattern:</span> <span className="font-mono text-[10px]">{(c.expected_delegation_pattern || []).join(" → ")}</span></div>
+                                <div><span className="text-[var(--text-muted)]">Output Keywords:</span> {(c.expected_output_keywords || []).map((k: string) => (
+                                  <span key={k} className="inline-block ml-1 px-1 py-0.5 rounded bg-gray-100 text-gray-600 text-[10px]">{k}</span>
+                                ))}</div>
+                              </div>
+                            </div>
+                            <div>
+                              <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1 font-medium">Budgets & Thresholds</div>
+                              <div className="space-y-1.5 p-2 rounded bg-white/80 border border-[var(--border)]">
+                                <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                                  <div><span className="text-[var(--text-muted)]">Max LLM Calls:</span> <span className="font-semibold">{c.max_llm_calls}</span></div>
+                                  <div><span className="text-[var(--text-muted)]">Max Tool Calls:</span> <span className="font-semibold">{c.max_tool_calls}</span></div>
+                                  <div><span className="text-[var(--text-muted)]">Max Tokens:</span> <span className="font-semibold">{c.max_tokens?.toLocaleString()}</span></div>
+                                  <div><span className="text-[var(--text-muted)]">Max Latency:</span> <span className="font-semibold">{c.max_latency_ms ? `${(c.max_latency_ms / 1000).toFixed(0)}s` : "—"}</span></div>
+                                </div>
+                                <div className="border-t border-[var(--border)] pt-1.5 mt-1">
+                                  <span className="text-[var(--text-muted)]">Quality Thresholds:</span>
+                                  <div className="flex gap-2 mt-1">
+                                    {c.quality_thresholds && Object.entries(c.quality_thresholds).map(([k, v]) => (
+                                      <span key={k} className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 text-[10px] border border-amber-200">
+                                        {k}: {((v as number) * 100).toFixed(0)}%
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
               </div>
-
-              {/* Case Detail Preview */}
-              {selectedCaseIds.size === 1 && (() => {
-                const c = goldenCases.find(g => selectedCaseIds.has(g.id));
-                if (!c) return null;
-                return (
-                  <div className="card">
-                    <h3 className="text-xs font-medium mb-2">Case Detail: {c.name}</h3>
-                    <div className="grid grid-cols-2 gap-3 text-xs">
-                      <div>
-                        <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1">Prompt</div>
-                        <div className="p-2 rounded bg-[var(--bg)] border border-[var(--border)]">{c.prompt}</div>
-                      </div>
-                      <div>
-                        <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1">Reference Output</div>
-                        <div className="p-2 rounded bg-[var(--bg)] border border-[var(--border)]">{c.reference_output || "—"}</div>
-                      </div>
-                      <div>
-                        <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1">Expected</div>
-                        <div className="space-y-1">
-                          <div><span className="text-[var(--text-muted)]">Agent:</span> {c.expected_agent}</div>
-                          <div><span className="text-[var(--text-muted)]">Tools:</span> {(c.expected_tools || []).join(", ")}</div>
-                          <div><span className="text-[var(--text-muted)]">Delegation:</span> {(c.expected_delegation_pattern || []).join(" → ")}</div>
-                          <div><span className="text-[var(--text-muted)]">Keywords:</span> {(c.expected_output_keywords || []).join(", ")}</div>
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1">Budgets & Thresholds</div>
-                        <div className="space-y-1">
-                          <div><span className="text-[var(--text-muted)]">Max LLM Calls:</span> {c.max_llm_calls}</div>
-                          <div><span className="text-[var(--text-muted)]">Max Tool Calls:</span> {c.max_tool_calls}</div>
-                          <div><span className="text-[var(--text-muted)]">Max Tokens:</span> {c.max_tokens}</div>
-                          <div><span className="text-[var(--text-muted)]">Max Latency:</span> {c.max_latency_ms}ms</div>
-                          <div><span className="text-[var(--text-muted)]">Quality:</span> {JSON.stringify(c.quality_thresholds)}</div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })()}
             </div>
           )}
 
@@ -633,7 +661,7 @@ export default function MonitoringPage() {
             <div className="space-y-3">
               <div className="card">
                 <h2 className="text-sm font-medium mb-3">Run Regression Tests</h2>
-                <div className="grid grid-cols-4 gap-3 mb-3">
+                <div className="grid grid-cols-3 gap-3 mb-3">
                   <div>
                     <label className="text-[10px] text-[var(--text-muted)] block mb-0.5">Model</label>
                     <select value={regModel} onChange={e => setRegModel(e.target.value)} className="input text-xs w-full">
@@ -672,23 +700,50 @@ export default function MonitoringPage() {
                       ))}
                     </select>
                   </div>
-                  <div className="flex items-end">
-                    <button onClick={runRegression} disabled={regRunning} className="btn-primary w-full">
-                      {regRunning ? (
-                        <span className="flex items-center justify-center gap-1.5">
-                          <span className="h-3 w-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                          Running...
-                        </span>
-                      ) : `Run ${selectedCaseIds.size > 0 ? selectedCaseIds.size : "All"} Cases`}
-                    </button>
+                </div>
+
+                {/* Test Case Selection */}
+                <div className="mb-3">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-[10px] text-[var(--text-muted)] font-medium uppercase tracking-wide">Select Test Cases</label>
+                    <div className="flex gap-2 items-center">
+                      <span className="text-[10px] text-[var(--text-muted)]">
+                        {selectedCaseIds.size > 0 ? `${selectedCaseIds.size} selected` : "All active cases"}
+                      </span>
+                      <button onClick={selectAllCases} className="text-[10px] text-[var(--accent)] underline">
+                        {selectedCaseIds.size === goldenCases.filter(c => c.is_active).length ? "Deselect All" : "Select All"}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="border border-[var(--border)] rounded max-h-[240px] overflow-y-auto">
+                    {goldenCases.filter(c => c.is_active).map(c => (
+                      <label key={c.id}
+                        className={`flex items-center gap-2 px-3 py-1.5 text-xs border-b border-[var(--border)] last:border-b-0 cursor-pointer transition-colors ${
+                          selectedCaseIds.has(c.id) ? "bg-[var(--accent)]/5" : "hover:bg-[var(--bg-hover)]"
+                        }`}>
+                        <input type="checkbox" checked={selectedCaseIds.has(c.id)} onChange={() => toggleCase(c.id)}
+                          className="h-3.5 w-3.5 rounded border-gray-300 accent-[var(--accent)]" />
+                        <span className="font-mono text-[10px] text-[var(--text-muted)] w-24 shrink-0">{c.id}</span>
+                        <span className="font-medium flex-1">{c.name}</span>
+                        <span className="px-1.5 py-0.5 rounded bg-violet-50 text-violet-700 text-[10px] border border-violet-200">{c.expected_agent}</span>
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] border ${
+                          c.complexity === "quick" ? "bg-green-50 text-green-700 border-green-200"
+                          : c.complexity === "medium" ? "bg-amber-50 text-amber-700 border-amber-200"
+                          : "bg-red-50 text-red-700 border-red-200"
+                        }`}>{c.complexity}</span>
+                      </label>
+                    ))}
                   </div>
                 </div>
-                <div className="text-[10px] text-[var(--text-muted)]">
-                  Selected cases: {selectedCaseIds.size > 0 ? Array.from(selectedCaseIds).join(", ") : "All active cases"}
-                  <button onClick={selectAllCases} className="ml-2 text-[var(--accent)] underline">
-                    {selectedCaseIds.size === goldenCases.filter(c => c.is_active).length ? "Deselect All" : "Select All"}
-                  </button>
-                </div>
+
+                <button onClick={runRegression} disabled={regRunning} className="btn-primary w-full">
+                  {regRunning ? (
+                    <span className="flex items-center justify-center gap-1.5">
+                      <span className="h-3 w-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                      Running...
+                    </span>
+                  ) : `Run ${selectedCaseIds.size > 0 ? selectedCaseIds.size : "All Active"} Cases`}
+                </button>
               </div>
 
               {/* Prompt Version Editor */}
@@ -1195,7 +1250,7 @@ export default function MonitoringPage() {
                 <h2 className="text-sm font-medium mb-3">Trace-Based Comparison</h2>
                 <p className="text-[11px] text-[var(--text-muted)] mb-3">
                   Compare execution traces side-by-side for the same golden test case across two regression runs.
-                  Identifies divergence points (different agents, tools, outputs) and cost/latency deltas.
+                  Only test cases present in both runs are shown for selection.
                 </p>
                 <div className="grid grid-cols-3 gap-3 mb-3">
                   <div>
@@ -1222,12 +1277,23 @@ export default function MonitoringPage() {
                   </div>
                   <div>
                     <label className="text-[10px] text-[var(--text-muted)] block mb-0.5">Test Case</label>
-                    <select value={regDiffCaseId} onChange={e => setRegDiffCaseId(e.target.value)} className="input text-xs w-full">
-                      <option value="">Select case...</option>
-                      {goldenCases.filter(c => c.is_active).map(c => (
+                    <select value={regDiffCaseId} onChange={e => setRegDiffCaseId(e.target.value)}
+                      className="input text-xs w-full"
+                      disabled={!regDiffRunA || !regDiffRunB}>
+                      <option value="">
+                        {!regDiffRunA || !regDiffRunB
+                          ? "Select both runs first..."
+                          : comparableCases.length === 0
+                            ? "No common test cases"
+                            : `Select case (${comparableCases.length} common)...`}
+                      </option>
+                      {comparableCases.map(c => (
                         <option key={c.id} value={c.id}>{c.id} — {c.name}</option>
                       ))}
                     </select>
+                    {regDiffRunA && regDiffRunB && comparableCases.length === 0 && (
+                      <p className="text-[10px] text-red-500 mt-0.5">These runs have no test cases in common.</p>
+                    )}
                   </div>
                 </div>
                 <button onClick={loadTraceDiff}

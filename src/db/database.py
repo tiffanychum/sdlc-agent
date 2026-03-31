@@ -209,11 +209,20 @@ Guidelines:
         },
     ]
 
+    agent_default_models = {
+        "coder": "claude-sonnet-4.6",
+        "planner": "claude-sonnet-4.6",
+        "runner": "gemini-3-flash",
+        "reviewer": "gemini-3-flash",
+        "researcher": "",
+    }
+
     for ad in agents:
         agent = Agent(
             id=ad["id"], team_id="default", name=ad["name"], role=ad["role"],
             description=ad["description"], system_prompt=ad["prompt"],
             decision_strategy=ad["decision_strategy"],
+            model=agent_default_models.get(ad["id"], ""),
         )
         session.add(agent)
         for tg in ad["tools"]:

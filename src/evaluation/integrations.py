@@ -316,14 +316,14 @@ async def run_agentic_trace_metrics(
 
     Returns dict with scores (0-1) and reasoning strings.
     """
-    from src.llm.client import get_llm
+    from src.llm.client import get_judge_llm
     from src.orchestrator import _extract_text
 
     execution_steps = _build_execution_steps_text(agent_trace)
     plan_text = _extract_plan_from_trace(agent_trace)
 
     results: dict[str, float | str] = {}
-    llm = get_llm()
+    llm = get_judge_llm()
 
     async def _eval_task_completion() -> tuple[float, str]:
         prompt = f"""You are evaluating whether an AI agent successfully completed the user's task.

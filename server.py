@@ -175,15 +175,18 @@ class PromptVersionUpdate(BaseModel):
 
 
 AVAILABLE_MODELS = [
-    {"id": "gpt-4o-mini", "name": "GPT-4o Mini", "provider": "OpenAI"},
-    {"id": "gpt-4o", "name": "GPT-4o", "provider": "OpenAI"},
-    {"id": "gpt-5-mini", "name": "GPT-5 Mini", "provider": "OpenAI"},
-    {"id": "gpt-5-mini-2025-08-07", "name": "GPT-5 Mini (2025-08-07)", "provider": "OpenAI"},
-    {"id": "gpt-5.3-codex", "name": "GPT-5.3 Codex", "provider": "OpenAI"},
-    {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4", "provider": "Anthropic"},
-    {"id": "gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite", "provider": "Google"},
-    {"id": "llama-3.1-8b-cs", "name": "Llama 3.1 8B", "provider": "Meta"},
-    {"id": "mistral-small-3", "name": "Mistral Small 3", "provider": "Mistral"},
+    {"id": "gpt-4o-mini", "name": "GPT-4o Mini", "provider": "OpenAI", "tier": "router"},
+    {"id": "gpt-4o", "name": "GPT-4o", "provider": "OpenAI", "tier": "agent"},
+    {"id": "gpt-5-mini", "name": "GPT-5 Mini", "provider": "OpenAI", "tier": "agent"},
+    {"id": "gpt-5-mini-2025-08-07", "name": "GPT-5 Mini (2025-08-07)", "provider": "OpenAI", "tier": "agent"},
+    {"id": "gpt-5.3-codex", "name": "GPT-5.3 Codex", "provider": "OpenAI", "tier": "agent"},
+    {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4", "provider": "Anthropic", "tier": "agent"},
+    {"id": "claude-sonnet-4.6", "name": "Claude Sonnet 4.6", "provider": "Anthropic", "tier": "agent"},
+    {"id": "deepseek-r1", "name": "DeepSeek R1", "provider": "DeepSeek", "tier": "judge/rca"},
+    {"id": "gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite", "provider": "Google", "tier": "agent"},
+    {"id": "gemini-3-flash", "name": "Gemini 3 Flash", "provider": "Google", "tier": "agent"},
+    {"id": "llama-3.1-8b-cs", "name": "Llama 3.1 8B", "provider": "Meta", "tier": "agent"},
+    {"id": "mistral-small-3", "name": "Mistral Small 3", "provider": "Mistral", "tier": "agent"},
 ]
 
 
@@ -1461,8 +1464,10 @@ def list_regression_runs():
     runs = session.query(EvalRun).filter(EvalRun.id.in_(run_ids)).order_by(EvalRun.created_at.desc()).all()
     result = []
     for r in runs:
-        case_count = session.query(RegressionResult).filter_by(run_id=r.id).count()
-        passed_count = session.query(RegressionResult).filter_by(run_id=r.id, overall_pass=True).count()
+        cases = session.query(RegressionResult).filter_by(run_id=r.id).all()
+        case_count = len(cases)
+        passed_count = sum(1 for c in cases if c.overall_pass)
+        case_ids = [c.golden_case_id for c in cases]
         rj = r.results_json or {}
         result.append({
             "id": r.id, "model": r.model, "prompt_version": r.prompt_version,
@@ -1471,6 +1476,7 @@ def list_regression_runs():
             "avg_latency_ms": rj.get("avg_latency_ms", r.avg_latency_ms),
             "total_cost": r.total_cost or 0,
             "regressions": rj.get("regressions", {}),
+            "case_ids": case_ids,
             "created_at": r.created_at.isoformat() if r.created_at else None,
         })
     session.close()

@@ -12,7 +12,7 @@ Token probability weighting is noted but requires logprobs API support.
 import json
 import re
 import asyncio
-from src.llm.client import get_llm
+from src.llm.client import get_judge_llm
 from src.orchestrator import _extract_text
 
 
@@ -96,7 +96,7 @@ Each step should be a specific, actionable check.
 Format: Return ONLY a numbered list of steps, nothing else."""
 
     try:
-        llm = get_llm()
+        llm = get_judge_llm()
         response = await llm.ainvoke([{"role": "user", "content": prompt}])
         steps = _extract_text(response.content)
         _cot_cache[criterion_name] = steps
@@ -155,7 +155,7 @@ Respond in this exact JSON format:
 {{"reasoning": "<your step-by-step reasoning>", "score": <integer 1-5>}}"""
 
     try:
-        llm = get_llm()
+        llm = get_judge_llm()
         response = await llm.ainvoke([{"role": "user", "content": prompt}])
         raw = _extract_text(response.content)
 
@@ -267,7 +267,7 @@ Respond with ONLY a JSON object:
 Each score is 1-5. Number of step_scores must match number of steps ({len(trace_steps)})."""
 
     try:
-        llm = get_llm()
+        llm = get_judge_llm()
         response = await llm.ainvoke([{"role": "user", "content": prompt}])
         raw = _extract_text(response.content)
 

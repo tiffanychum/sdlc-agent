@@ -222,7 +222,7 @@ def wrap_reviewable_tool(original: StructuredTool, agent_role: str = "") -> Stru
 
 # ── Planner HITL Executor ──────────────────────────────────────
 
-def make_planner_executor(role: str, built_agents: dict, exec_agent=None):
+def make_planner_executor(role: str, built_agents: dict, exec_agent=None, agent_model: str | None = None):
     """Create a two-phase executor: plan (LLM-only) -> review -> execute (with tools).
 
     Phase 1: Calls the underlying LLM directly (no tools) to generate a plan.
@@ -240,7 +240,7 @@ def make_planner_executor(role: str, built_agents: dict, exec_agent=None):
         msgs = _ensure_messages(state["messages"])
 
         # ── Phase 1: Generate plan (LLM only, no tool execution) ─────
-        planning_llm = get_llm()
+        planning_llm = get_llm(model=agent_model if agent_model else None)
         plan_prompt = SystemMessage(content=(
             "You are a planning agent. Your job right now is ONLY to create "
             "a numbered step-by-step plan for the user's request. "

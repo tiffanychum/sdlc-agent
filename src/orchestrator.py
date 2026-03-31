@@ -19,7 +19,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 
-from src.llm.client import get_llm
+from src.llm.client import get_llm, get_router_llm
 from src.skills.engine import build_agent_prompt
 from src.tools.registry import get_all_tools
 from src.hitl import (
@@ -104,11 +104,13 @@ Respond with ONLY the agent name: {agent_names}.
 If unsure, respond with "{agents_config[0]['role']}" as default."""
 
 
-def _get_executor(role: str, built_agents: dict, exec_agents: dict | None = None):
+def _get_executor(role: str, built_agents: dict, exec_agents: dict | None = None,
+                   agent_model: str | None = None):
     """Return the planner HITL executor for planner roles, standard executor otherwise."""
     if role == "planner":
         exec_agent = (exec_agents or {}).get(role)
-        return make_planner_executor(role, built_agents, exec_agent=exec_agent)
+        return make_planner_executor(role, built_agents, exec_agent=exec_agent,
+                                     agent_model=agent_model)
     return _make_agent_executor(role, built_agents)
 
 
@@ -133,7 +135,7 @@ def _make_agent_executor(role: str, built_agents: dict):
     return execute
 
 
-async def build_orchestrator_from_team(team_id: str = "default"):
+async def build_orchestrator_from_team(team_id: str = "default", model_override: str | None = None):
     from src.db.database import get_session
     from src.db.models import Team, Agent, AgentToolMapping
 
@@ -166,6 +168,10 @@ async def build_orchestrator_from_team(team_id: str = "default"):
 
     tool_map = await get_all_tools()
     checkpointer = MemorySaver()
+
+    if model_override:
+        for ac in agents_config:
+            ac["model"] = model_override
 
     built_agents = {}
     exec_agents = {}
@@ -209,7 +215,7 @@ async def build_orchestrator_from_team(team_id: str = "default"):
 
 def _build_router_graph(agents_config, built_agents, checkpointer=None,
                         exec_agents=None):
-    router_llm = get_llm()
+    router_llm = get_router_llm()
     router_prompt = _build_router_prompt(agents_config)
     valid_roles = {a["role"] for a in agents_config}
     default_role = agents_config[0]["role"]
@@ -233,7 +239,8 @@ def _build_router_graph(agents_config, built_agents, checkpointer=None,
 
     for ac in agents_config:
         role = ac["role"]
-        executor = _get_executor(role, built_agents, exec_agents)
+        executor = _get_executor(role, built_agents, exec_agents,
+                                  agent_model=ac.get("model") or None)
         graph.add_node(role, executor)
         graph.add_edge(role, END)
 
@@ -246,9 +253,11 @@ def _build_sequential_graph(agents_config, built_agents, checkpointer=None,
                             exec_agents=None):
     graph = StateGraph(OrchestratorState)
     roles = [ac["role"] for ac in agents_config]
+    model_map = {ac["role"]: ac.get("model") or None for ac in agents_config}
 
     for role in roles:
-        executor = _get_executor(role, built_agents, exec_agents)
+        executor = _get_executor(role, built_agents, exec_agents,
+                                  agent_model=model_map.get(role))
         graph.add_node(role, executor)
 
     graph.add_edge(START, roles[0])
@@ -263,7 +272,8 @@ def _build_parallel_graph(agents_config, built_agents, checkpointer=None,
     graph = StateGraph(OrchestratorState)
     for ac in agents_config:
         role = ac["role"]
-        executor = _get_executor(role, built_agents, exec_agents)
+        executor = _get_executor(role, built_agents, exec_agents,
+                                  agent_model=ac.get("model") or None)
         graph.add_node(role, executor)
         graph.add_edge(START, role)
         graph.add_edge(role, END)
@@ -272,7 +282,7 @@ def _build_parallel_graph(agents_config, built_agents, checkpointer=None,
 
 def _build_supervisor_graph(agents_config, built_agents, checkpointer=None,
                             exec_agents=None):
-    router_llm = get_llm()
+    router_llm = get_router_llm()
     valid_roles = {a["role"] for a in agents_config}
 
     agent_descs = "\n".join(f'- "{a["role"]}": {a["description"]}' for a in agents_config)
@@ -300,7 +310,8 @@ Respond with ONLY "DONE" or an agent name ({agent_names})."""
 
     for ac in agents_config:
         role = ac["role"]
-        executor = _get_executor(role, built_agents, exec_agents)
+        executor = _get_executor(role, built_agents, exec_agents,
+                                  agent_model=ac.get("model") or None)
         graph.add_node(role, executor)
         graph.add_edge(role, "supervisor")
 
