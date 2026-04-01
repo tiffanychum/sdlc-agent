@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from src.db.database import init_db, seed_defaults, get_session
+from src.db.database import init_db, seed_defaults, patch_agent_prompts, get_session
 from src.db.models import (
     Team, Agent, AgentToolMapping, Skill, AgentSkillMapping,
     Trace, Span, EvalRun, GoldenTestCase, RegressionResult, PromptVersion,
@@ -38,6 +38,7 @@ orchestrators: dict = {}
 async def lifespan(app: FastAPI):
     init_db()
     seed_defaults()
+    patch_agent_prompts()
     from src.evaluation.golden import sync_golden_to_db
     sync_golden_to_db()
     orchestrators["default"] = await build_orchestrator_from_team("default")

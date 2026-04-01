@@ -100,8 +100,15 @@ def _build_router_prompt(agents_config: list[dict]) -> str:
 Available agents:
 {agent_descs}
 
+Routing rules (apply in order):
+1. If the task has TWO OR MORE distinct steps (e.g., "run X then review Y", "analyze A and B", "create a plan and execute"), route to "planner".
+2. If the task says "review", "assess quality", "find bugs", "suggest improvements" for a file or git diff — with NO execution step — route to "reviewer".
+3. If the task asks to run a SINGLE command or test suite and report the output, route to "runner".
+4. If the task asks to read, write, edit, or navigate code (single action), route to "coder".
+5. If the task requires web search or external documentation, route to "researcher".
+
 Respond with ONLY the agent name: {agent_names}.
-If unsure, respond with "{agents_config[0]['role']}" as default."""
+If unsure, respond with "planner" for complex tasks or "coder" for simple tasks."""
 
 
 def _get_executor(role: str, built_agents: dict, exec_agents: dict | None = None,
@@ -119,17 +126,19 @@ def _make_agent_executor(role: str, built_agents: dict):
     async def execute(state: OrchestratorState) -> OrchestratorState:
         msgs = _ensure_messages(state["messages"])
         result = await built_agents[role].ainvoke({"messages": msgs})
+        # Normalise output messages — some models (Gemini) return raw dicts
+        out_messages = _ensure_messages(result.get("messages", []))
         tool_calls = []
-        for msg in result["messages"]:
+        for msg in out_messages:
             if hasattr(msg, "tool_calls") and msg.tool_calls:
                 for tc in msg.tool_calls:
                     tool_calls.append({"tool": tc["name"], "args": tc["args"]})
         return {
-            "messages": result["messages"],
+            "messages": out_messages,
             "selected_agent": role,
             "agent_trace": [{
                 "step": "execution", "agent": role, "tool_calls": tool_calls,
-                "num_messages": len(result["messages"]),
+                "num_messages": len(out_messages),
             }],
         }
     return execute

@@ -45,13 +45,13 @@ Built with LangGraph, MCP, FastAPI, SQLite, DeepEval, Langfuse, OpenTelemetry, a
 
 Each agent has a specific role, decision strategy, MCP tool set, and skills:
 
-| Agent | Strategy | Tools | Role |
-|-------|----------|-------|------|
-| **Coder** | ReAct | filesystem, git | Reads/writes code, navigates codebases, manages version control |
-| **Runner** | ReAct | shell | Executes commands, runs tests, builds projects |
-| **Researcher** | ReAct | web | Searches documentation, fetches API references, finds solutions |
-| **Planner** | Plan-and-Execute | memory, filesystem | Creates structured task plans, tracks progress, stores context |
-| **Reviewer** | Reflexion | filesystem, shell, git, memory | Reviews code quality, runs tests, reflects on correctness |
+| Agent | Strategy | Tools | Role | Tool Call Limit |
+|-------|----------|-------|------|----------------|
+| **Coder** | ReAct | filesystem, git | Reads/writes code, navigates codebases, manages version control | 8 |
+| **Runner** | ReAct | shell | Single-task executor — runs ONE command or test suite and reports output | 5 |
+| **Researcher** | ReAct | web | Searches documentation, fetches API references, synthesizes findings | 6 |
+| **Planner** | Plan-and-Execute | memory, filesystem | Multi-step coordinator for tasks requiring two or more distinct actions | 15 |
+| **Reviewer** | Reflexion | filesystem, shell, git, memory | Reviews code/git diffs for quality and bugs; runs commands only when explicitly asked | 8 |
 
 ### Per-Agent Decision Strategies
 
@@ -61,6 +61,31 @@ Each agent has a specific role, decision strategy, MCP tool set, and skills:
 | **Plan-and-Execute** | Create a numbered plan first, then execute step by step | Complex multi-step tasks that need decomposition |
 | **Reflexion** | After each action, reflect on whether it was correct | Quality-critical tasks (code review, verification) |
 | **Chain-of-Thought** | Reason thoroughly before taking any action | Tasks requiring careful analysis |
+
+### Agent Prompt Design
+
+All agent system prompts follow a structured six-section format that enforces disciplined tool use:
+
+```
+## Role          — what the agent is responsible for
+## Hard Constraints — non-negotiable per-task tool call limits and anti-patterns
+## Tool Selection Rules — priority-ordered rules for choosing the right tool
+## Execution Loop — strategy-specific reasoning loop (ReAct / Plan-and-Execute / Reflexion)
+## Output        — required output format
+## Error Recovery — what to do when tools fail
+```
+
+**Hard constraints** embedded directly in each prompt prevent runaway tool loops:
+
+| Agent | Max Tool Calls | Key Prohibitions |
+|-------|---------------|-----------------|
+| Coder | 8 | Never read the same file twice; `search_files` before `list_directory` |
+| Runner | 5 | One command per goal; never re-run to verify — read the output |
+| Researcher | 6 | Never repeat a search query; fetch URL only if snippet is insufficient |
+| Planner | 15 | Max 5 plan steps; max 3 `memory_retrieve` calls; never write files unless task says so |
+| Reviewer | 8 | Never call `run_tests` / `run_command` unless task says "run" or "verify" |
+
+Prompts are stored in the database and configurable via the Studio UI. On every startup, `patch_agent_prompts()` in `src/db/database.py` applies the latest prompt version to any existing team in the database — no manual DB reset required when prompts are updated.
 
 ### Human-in-the-Loop (HITL)
 
@@ -98,7 +123,12 @@ Following the [Claude Code principle](https://docs.anthropic.com/): **"MCP gives
 ### Routing: How Requests Reach the Right Agent
 
 1. User sends a request (e.g., "Create a plan for refactoring the config module")
-2. A lightweight **Router LLM call** classifies the intent and selects the best agent
+2. A lightweight **Router LLM call** classifies the intent using priority-ordered routing rules:
+   - Multi-step tasks (two or more distinct actions) → **planner**
+   - "Review / assess / find bugs" without execution → **reviewer**
+   - Single command or test run → **runner**
+   - Read / write / edit code (single action) → **coder**
+   - Web search or external documentation → **researcher**
 3. The selected agent runs with its assigned tools and strategy
 4. HITL checkpoints may pause execution for user input
 5. Every step is traced (routing decision, tool calls, HITL pauses, response) for evaluation
@@ -218,7 +248,9 @@ Specialized agentic evaluation via DeepEval SDK and LLM-as-judge trace analysis.
 
 ### Golden Dataset & Regression Testing
 
-A curated set of 10 test cases with expected outputs, stored in `golden_dataset.json` and synced to the database for UI access.
+A curated set of 10 test cases with expected outputs, stored in `golden_dataset.json` (currently at **version 3.0**) and synced to the database for UI access.
+
+**Version 3.0 changes:** budget constraints were recalibrated to match the new structured prompts — token caps are significantly looser (thinking-model token counts are larger) while LLM call limits are tighter. The reviewer test case no longer expects a `read_file` call since the revised reviewer prompt reads files only when explicitly instructed.
 
 #### Golden Test Case Structure
 
@@ -374,6 +406,7 @@ sdlc-agent/
 │       ├── models.py                # SQLAlchemy: teams, agents, skills, traces, evals,
 │       │                            #   golden cases, regression results, prompt versions
 │       └── database.py              # SQLite connection + auto-migration + seeding
+│                                    #   + patch_agent_prompts() runtime prompt migration
 │
 ├── tests/
 │   ├── test_mcp_communication.py    # 28 E2E tests for MCP layer
@@ -592,6 +625,9 @@ Prompt and model changes can introduce subtle regressions. A curated golden data
 
 ### Why Prompt Versioning?
 Prompts are the most frequently changed artifact in an agent system. Treating them as versioned code enables systematic A/B testing, rollback, and audit trails — the same discipline applied to source code via git.
+
+### Why `patch_agent_prompts()` on Startup?
+Agent prompts evolve frequently. Rather than forcing users to drop and re-seed the database every time a prompt is updated, `patch_agent_prompts()` runs on every startup and applies the latest prompt to any existing agent record. This makes prompt updates zero-friction for anyone with a running deployment — the next server restart picks them up automatically.
 
 ## Tech Stack
 
