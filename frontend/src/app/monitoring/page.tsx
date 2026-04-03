@@ -1,11 +1,51 @@
 "use client";
 import React, { useEffect, useState, useCallback, useMemo } from "react";
 import { api } from "@/lib/api";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   Legend, BarChart, Bar, PieChart, Pie, Cell, AreaChart, Area, RadarChart,
   Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
 } from "recharts";
+
+// ── Markdown renderer (shared across output panels) ──────────────────────────
+const mdComponents = {
+  code({ className, children, ...props }: any) {
+    const isInline = !className;
+    return isInline ? (
+      <code className="px-1 py-0.5 rounded bg-[var(--bg)] text-[var(--accent)] text-[11px] font-mono" {...props}>{children}</code>
+    ) : (
+      <pre className="bg-[var(--bg)] rounded p-2 my-1.5 overflow-x-auto border border-[var(--border)]">
+        <code className="text-[11px] font-mono leading-relaxed" {...props}>{children}</code>
+      </pre>
+    );
+  },
+  p({ children }: any) { return <p className="mb-1.5 last:mb-0 leading-relaxed">{children}</p>; },
+  ul({ children }: any) { return <ul className="list-disc pl-4 mb-1.5 space-y-0.5">{children}</ul>; },
+  ol({ children }: any) { return <ol className="list-decimal pl-4 mb-1.5 space-y-0.5">{children}</ol>; },
+  li({ children }: any) { return <li className="leading-relaxed">{children}</li>; },
+  h1({ children }: any) { return <h1 className="text-sm font-semibold mt-2 mb-1">{children}</h1>; },
+  h2({ children }: any) { return <h2 className="text-[13px] font-semibold mt-2 mb-0.5">{children}</h2>; },
+  h3({ children }: any) { return <h3 className="text-[12px] font-semibold mt-1.5 mb-0.5">{children}</h3>; },
+  strong({ children }: any) { return <strong className="font-semibold">{children}</strong>; },
+  table({ children }: any) {
+    return <div className="overflow-x-auto my-1.5"><table className="text-[11px] border-collapse w-full">{children}</table></div>;
+  },
+  th({ children }: any) { return <th className="border border-[var(--border)] px-2 py-0.5 bg-[var(--bg)] font-medium text-left">{children}</th>; },
+  td({ children }: any) { return <td className="border border-[var(--border)] px-2 py-0.5">{children}</td>; },
+  a({ href, children }: any) {
+    return <a href={href} target="_blank" rel="noopener noreferrer" className="text-[var(--accent)] underline hover:opacity-80">{children}</a>;
+  },
+};
+function Md({ content, className = "" }: { content: string; className?: string }) {
+  if (!content || content === "—") return <span className="text-[var(--text-muted)] italic text-xs">—</span>;
+  return (
+    <div className={`text-xs leading-relaxed ${className}`}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>{content}</ReactMarkdown>
+    </div>
+  );
+}
 
 const REGRESSION_METRICS = [
   { key: "task_success_rate", label: "Task Success", color: "#16a34a" },
@@ -610,7 +650,9 @@ export default function MonitoringPage() {
                             </div>
                             <div>
                               <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1 font-medium">Reference Output</div>
-                              <div className="p-2 rounded bg-emerald-50 border border-emerald-200 leading-relaxed">{c.reference_output || "—"}</div>
+                              <div className="p-2 rounded bg-emerald-50 border border-emerald-200 max-h-40 overflow-y-auto">
+                                <Md content={c.reference_output || "—"} />
+                              </div>
                             </div>
                             <div>
                               <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1 font-medium">Expected Behavior</div>
@@ -1032,18 +1074,35 @@ export default function MonitoringPage() {
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-3">
-                    {/* Expected vs Actual */}
-                    <div>
-                      <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1">Expected Output (Reference)</div>
-                      <div className="p-2 rounded bg-emerald-50 border border-emerald-200 text-xs max-h-32 overflow-y-auto">
-                        {regCaseDetail.golden_case?.reference_output || "—"}
+                  {/* Expected vs Actual — full markdown, synchronized scroll height */}
+                  <div className="rounded-lg border border-[var(--border)] overflow-hidden">
+                    <div className="grid grid-cols-2 divide-x divide-[var(--border)]">
+                      <div className="flex flex-col">
+                        <div className="flex items-center gap-1.5 px-3 py-2 bg-emerald-50 border-b border-[var(--border)]">
+                          <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-emerald-700">Expected Output (Reference)</span>
+                        </div>
+                        <div className="p-3 overflow-y-auto max-h-96 bg-emerald-50/40">
+                          <Md content={regCaseDetail.golden_case?.reference_output || "—"} />
+                        </div>
                       </div>
-                    </div>
-                    <div>
-                      <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1">Actual Output</div>
-                      <div className="p-2 rounded bg-blue-50 border border-blue-200 text-xs max-h-32 overflow-y-auto">
-                        {regCaseDetail.result?.actual_output || "—"}
+                      <div className="flex flex-col">
+                        <div className="flex items-center gap-1.5 px-3 py-2 bg-blue-50 border-b border-[var(--border)]">
+                          <span className="w-2 h-2 rounded-full bg-blue-500 shrink-0" />
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-blue-700">Actual Output</span>
+                          {regCaseDetail.result?.semantic_similarity != null && (
+                            <span className={`ml-auto text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${
+                              regCaseDetail.result.semantic_similarity >= 0.75 ? "bg-emerald-100 text-emerald-700"
+                              : regCaseDetail.result.semantic_similarity >= 0.5 ? "bg-amber-100 text-amber-700"
+                              : "bg-red-100 text-red-700"
+                            }`}>
+                              {(regCaseDetail.result.semantic_similarity * 100).toFixed(1)}% match
+                            </span>
+                          )}
+                        </div>
+                        <div className="p-3 overflow-y-auto max-h-96 bg-blue-50/40">
+                          <Md content={regCaseDetail.result?.actual_output || "—"} />
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -1327,25 +1386,49 @@ export default function MonitoringPage() {
                   )}
 
                   {/* Side-by-side output comparison */}
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="card">
-                      <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1">Baseline Output (Run A)</div>
-                      <div className="p-2 bg-[var(--bg)] rounded text-xs max-h-32 overflow-y-auto">
-                        {regDiff.run_a?.actual_output || "—"}
+                  <div className="rounded-lg border border-[var(--border)] overflow-hidden">
+                    <div className="grid grid-cols-2 divide-x divide-[var(--border)]">
+                      {/* Run A */}
+                      <div className="flex flex-col">
+                        <div className="flex items-center gap-2 px-3 py-2 bg-[var(--bg)] border-b border-[var(--border)]">
+                          <span className="w-2 h-2 rounded-full bg-gray-400 shrink-0" />
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--text-muted)]">Baseline (Run A)</span>
+                          <span className={`ml-auto text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${
+                            (regDiff.run_a?.semantic_similarity || 0) >= 0.75 ? "bg-emerald-100 text-emerald-700"
+                            : (regDiff.run_a?.semantic_similarity || 0) >= 0.5 ? "bg-amber-100 text-amber-700"
+                            : "bg-red-100 text-red-700"
+                          }`}>
+                            {((regDiff.run_a?.semantic_similarity || 0) * 100).toFixed(1)}% match
+                          </span>
+                        </div>
+                        <div className="p-3 overflow-y-auto max-h-96 bg-[var(--bg-secondary)]/30">
+                          <Md content={regDiff.run_a?.actual_output || "—"} />
+                        </div>
+                        <div className="px-3 py-1.5 border-t border-[var(--border)] bg-[var(--bg)] text-[10px] text-[var(--text-muted)] flex flex-wrap gap-x-3">
+                          <span>Agent: <strong>{regDiff.run_a?.actual_agent || "—"}</strong></span>
+                          <span>Tools: <strong>{(regDiff.run_a?.actual_tools || []).join(", ") || "—"}</strong></span>
+                        </div>
                       </div>
-                      <div className="mt-2 text-[10px] text-[var(--text-muted)]">
-                        Agent: {regDiff.run_a?.actual_agent} | Tools: {(regDiff.run_a?.actual_tools || []).join(", ")}
-                        | Similarity: {((regDiff.run_a?.semantic_similarity || 0) * 100).toFixed(1)}%
-                      </div>
-                    </div>
-                    <div className="card">
-                      <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1">Candidate Output (Run B)</div>
-                      <div className="p-2 bg-[var(--bg)] rounded text-xs max-h-32 overflow-y-auto">
-                        {regDiff.run_b?.actual_output || "—"}
-                      </div>
-                      <div className="mt-2 text-[10px] text-[var(--text-muted)]">
-                        Agent: {regDiff.run_b?.actual_agent} | Tools: {(regDiff.run_b?.actual_tools || []).join(", ")}
-                        | Similarity: {((regDiff.run_b?.semantic_similarity || 0) * 100).toFixed(1)}%
+                      {/* Run B */}
+                      <div className="flex flex-col">
+                        <div className="flex items-center gap-2 px-3 py-2 bg-blue-50 border-b border-[var(--border)]">
+                          <span className="w-2 h-2 rounded-full bg-blue-500 shrink-0" />
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-blue-700">Candidate (Run B)</span>
+                          <span className={`ml-auto text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${
+                            (regDiff.run_b?.semantic_similarity || 0) >= 0.75 ? "bg-emerald-100 text-emerald-700"
+                            : (regDiff.run_b?.semantic_similarity || 0) >= 0.5 ? "bg-amber-100 text-amber-700"
+                            : "bg-red-100 text-red-700"
+                          }`}>
+                            {((regDiff.run_b?.semantic_similarity || 0) * 100).toFixed(1)}% match
+                          </span>
+                        </div>
+                        <div className="p-3 overflow-y-auto max-h-96 bg-blue-50/20">
+                          <Md content={regDiff.run_b?.actual_output || "—"} />
+                        </div>
+                        <div className="px-3 py-1.5 border-t border-[var(--border)] bg-[var(--bg)] text-[10px] text-[var(--text-muted)] flex flex-wrap gap-x-3">
+                          <span>Agent: <strong>{regDiff.run_b?.actual_agent || "—"}</strong></span>
+                          <span>Tools: <strong>{(regDiff.run_b?.actual_tools || []).join(", ") || "—"}</strong></span>
+                        </div>
                       </div>
                     </div>
                   </div>

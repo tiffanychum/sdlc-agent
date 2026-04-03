@@ -239,10 +239,10 @@ class RegressionRunner:
 Consider meaning equivalence, not exact wording. 0.0 = completely unrelated, 1.0 = identical meaning.
 
 REFERENCE TEXT:
-{reference[:800]}
+{reference[:3000]}
 
 ACTUAL TEXT:
-{actual[:800]}
+{actual[:3000]}
 
 Respond with ONLY a JSON object: {{"score": <float>, "reasoning": "<brief explanation>"}}"""
         try:
@@ -285,8 +285,8 @@ EXPECTED AGENT: {case.expected_agent}
 EXECUTION TRACE:
 {trace_text[:1200]}
 
-AGENT OUTPUT (first 600 chars):
-{actual_output[:600]}
+AGENT OUTPUT:
+{actual_output[:3000]}
 
 First explain your reasoning step by step, then give a score.
 Respond with ONLY JSON: {{"reasoning": "<step-by-step analysis>", "score": <1-5>}}
@@ -459,7 +459,7 @@ Respond with ONLY JSON: {{"reasoning": "<step-by-step analysis>", "score": <1-5>
                     run_id=run_id,
                     golden_case_id=r["golden_case_id"],
                     golden_case_name=r.get("golden_case_name", ""),
-                    actual_output=r.get("actual_output", "")[:3000],
+                    actual_output=r.get("actual_output", ""),
                     actual_agent=r.get("actual_agent", ""),
                     actual_tools=r.get("actual_tools", []),
                     actual_delegation_pattern=r.get("actual_delegation_pattern", []),
