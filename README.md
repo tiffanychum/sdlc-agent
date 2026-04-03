@@ -1,6 +1,6 @@
 # SDLC Agent — Multi-Agent Coding Platform
 
-A full-stack multi-agent platform for automating software development workflows. Features a **5-agent team** with per-agent decision strategies, **Human-in-the-Loop (HITL)** checkpoints with plan review and action confirmation, **MCP (Model Context Protocol)** for standardized tool integration, a **three-layer evaluation pipeline** (rule-based + LLM-as-Judge + DeepEval), **golden dataset regression testing** with trace-based assertions and root cause analysis, **real-time trace inspection** via SSE streaming, **prompt versioning with A/B testing**, and a **Next.js dashboard** with conversation management, live markdown rendering, and observability.
+A full-stack multi-agent platform for automating software development workflows. Features a **default seven-role team** — Coder, Runner, Researcher, Planner, Reviewer, **Project Manager**, and **Business Analyst** — with per-agent decision strategies, **Human-in-the-Loop (HITL)** checkpoints with plan review and action confirmation, **MCP (Model Context Protocol)** for standardized tool integration, a **three-layer evaluation pipeline** (rule-based + LLM-as-Judge + DeepEval), **golden dataset regression testing** with trace-based assertions and root cause analysis, **real-time trace inspection** via SSE streaming, **prompt versioning with A/B testing**, and a **Next.js dashboard** with conversation management, live markdown rendering, and observability.
 
 Built with LangGraph, MCP, FastAPI, SQLite, DeepEval, Langfuse, OpenTelemetry, and Next.js.
 
@@ -15,14 +15,14 @@ Built with LangGraph, MCP, FastAPI, SQLite, DeepEval, Langfuse, OpenTelemetry, a
                     │                   │  selects best agent
                     └─────────┬─────────┘
                               │
-          ┌───────────┬───────┼───────┬────────────┐
-          ▼           ▼       ▼       ▼            ▼
-     ┌─────────┐ ┌────────┐ ┌────────┐ ┌─────────┐ ┌──────────┐
-     │ Coder   │ │ Runner │ │Research│ │ Planner │ │ Reviewer │
-     │ (ReAct) │ │(ReAct) │ │(ReAct) │ │(Plan+Ex)│ │(Reflexn) │
-     └────┬────┘ └───┬────┘ └───┬────┘ └────┬────┘ └─────┬────┘
-          │          │          │           │            │
-          ▼          ▼          ▼           ▼            ▼
+    ┌───────┬───────┬─────────┼─────────┬─────────┬──────────────┬───────────────┐
+    ▼       ▼       ▼         ▼         ▼         ▼              ▼
+ ┌──────┐┌──────┐┌─────────┐┌───────┐┌────────┐┌─────────────┐┌───────────────┐
+ │Coder ││Runner││Research ││Planner││Reviewer││Project Mgr  ││Business       │
+ │ReAct ││ReAct ││  ReAct  ││Plan+Ex││Reflexn ││Plan+Execute ││Analyst (ReAct)│
+ └──────┘└──────┘└─────────┘└───────┘└────────┘└─────────────┘└───────────────┘
+          │          │          │           │            │              │
+          ▼          ▼          ▼           ▼            ▼              ▼
      ┌──────────────────────────────────────────────────────┐
      │            HITL Checkpoints (4 types)                │
      │  Clarification · Plan Review · Action Confirm · Tool │
@@ -33,25 +33,30 @@ Built with LangGraph, MCP, FastAPI, SQLite, DeepEval, Langfuse, OpenTelemetry, a
      ┌──────────────────────────────────────────────────────┐
      │              MCP Communication Layer                  │
      │  Tool discovery · Schema validation · Error handling  │
-     └──┬─────────┬──────────┬──────────┬──────────┬───────┘
-        ▼         ▼          ▼          ▼          ▼
-   Filesystem   Shell       Git        Web      Memory   Planner   GitHub    Jira
-   (6 tools)  (3 tools)  (6 tools)  (3 tools)  (6 tools) (varies)  (varies)  (varies)
+     └──┬─────────┬──────────┬──────────┬──────────┬───────────────┬──────────┬───────┘
+        ▼         ▼          ▼          ▼          ▼               ▼          ▼
+   Filesystem   Shell       Git        Web      Memory    microsoft_planner   GitHub   Jira
+   (6 tools)  (3 tools)  (6 tools)  (3 tools)  (6 tools)  MS Planner/Graph  (varies) (varies)
+
+   microsoft_planner: Microsoft 365 Planner via Graph (planner_server.py).
+   Registry key: `planner` in src/tools/registry.py — Studio tool group label may show "planner".
 ```
 
 ## How the Agent Team Works
 
-### 5 Specialized Agents
+### Default agent roster (seven roles)
 
-Each agent has a specific role, decision strategy, MCP tool set, and skills:
+Each agent has a specific role, decision strategy, MCP tool set, and skills. The default team is seeded in `src/db/database.py` (extend or trim in Studio).
 
-| Agent | Strategy | Tools | Role | Tool Call Limit |
-|-------|----------|-------|------|----------------|
-| **Coder** | ReAct | filesystem, shell, git, github, jira, memory (typical) | Code, tests, local git, GitHub API, Jira read/fetch, end-to-end SDLC when routed | 14 (prompt budget; tune in DB) |
+| Agent | Strategy | Tools (typical) | Role | Tool call budget (prompt) |
+|-------|----------|-----------------|------|---------------------------|
+| **Coder** | ReAct | filesystem, shell, git, github, jira, memory | Code, tests, local git, GitHub API, Jira read/fetch, end-to-end SDLC when routed | 14 (tune in DB) |
 | **Runner** | ReAct | shell | Single-task executor — runs ONE command or test suite and reports output | 5 |
 | **Researcher** | ReAct | web | Searches documentation, fetches API references, synthesizes findings | 6 |
-| **Planner** | Plan-and-Execute | memory, filesystem | Multi-step coordinator for tasks requiring two or more distinct actions | 15 |
+| **Planner** | Plan-and-Execute | memory, filesystem | Multi-step coordinator when the task spans distinct actions without handing off to Jira-only agents | 15 |
 | **Reviewer** | Reflexion | filesystem, shell, git, memory | Reviews code/git diffs for quality and bugs; runs commands only when explicitly asked | 8 |
+| **Project Manager** | Plan-and-Execute | jira, memory | Jira programs: projects, epics/stories/tasks, assignments; mandatory `ask_human` / approvals before writes | 15 |
+| **Business Analyst** | ReAct | jira, memory | Decomposes requirements into developer tasks in Jira; presents breakdown and gets approval before `jira_create_issue` | 12 |
 
 ### Per-Agent Decision Strategies
 
@@ -79,11 +84,13 @@ All agent system prompts follow a structured six-section format that enforces di
 
 | Agent | Max Tool Calls | Key Prohibitions |
 |-------|---------------|-----------------|
-| Coder | 8 | Never read the same file twice; `search_files` before `list_directory` |
+| Coder | 14 | Never read the same file twice; follow pre-flight / SDLC rules in DB prompt |
 | Runner | 5 | One command per goal; never re-run to verify — read the output |
 | Researcher | 6 | Never repeat a search query; fetch URL only if snippet is insufficient |
 | Planner | 15 | Max 5 plan steps; max 3 `memory_retrieve` calls; never write files unless task says so |
 | Reviewer | 8 | Never call `run_tests` / `run_command` unless task says "run" or "verify" |
+| Project Manager | 15 | No Jira creates/assigns without explicit user approval; confirm project and assignees first |
+| Business Analyst | 12 | No `jira_create_issue` until user approves the full task breakdown |
 
 Prompts are stored in the database and configurable via the Studio UI. On every startup, `patch_agent_prompts()` in `src/db/database.py` applies the latest prompt version to any existing team in the database — no manual DB reset required when prompts are updated.
 
@@ -110,7 +117,7 @@ During regression testing, all HITL checkpoints are auto-approved to allow unatt
 Following the [Claude Code principle](https://docs.anthropic.com/): **"MCP gives power. Skills control power."**
 
 **MCP Tools** (what agents CAN do):
-- MCP tool groups include filesystem, shell, git, web, memory, planner (Microsoft Graph), **github**, **jira** — assign per agent in Studio
+- Tool groups: **filesystem**, **shell**, **git**, **web**, **memory**, **microsoft_planner** (Microsoft 365 Planner / Microsoft Graph — implemented as registry key **`planner`** in `src/tools/registry.py`), **github**, **jira**. Assign per agent in Studio (labels may show `planner` for microsoft_planner).
 - Each tool has a JSON Schema defining its parameters
 - Agents discover tools dynamically at runtime via the MCP protocol
 
@@ -126,7 +133,7 @@ Following the [Claude Code principle](https://docs.anthropic.com/): **"MCP gives
 2. A lightweight **Router LLM call** classifies the intent using priority-ordered routing rules (see `src/orchestrator.py`), including:
    - Jira fetch + implement + push/PR → **coder**
    - GitHub branch/file/PR workflows → **coder**
-   - Jira project/issue *management* (create/assign), no coding → **project_manager** / **business_analyst** when configured
+   - Jira project/issue *management* (create/assign), no coding → **project_manager** or **business_analyst** (both are in the default seeded team)
    - Multi-step tasks spanning domains (without GitHub/Jira coding) → **planner**
    - "Review / assess / find bugs" without execution → **reviewer**
    - Single command or test run → **runner**
@@ -388,7 +395,7 @@ sdlc-agent/
 │   │   ├── git_server.py            # 6 tools: status, diff, log, commit, branch, show
 │   │   ├── web_server.py            # 3 tools: fetch, search, check
 │   │   ├── memory_server.py         # 6 tools: store, retrieve, list, delete, plan, update
-│   │   ├── planner_server.py       # Microsoft Planner / Graph (optional)
+│   │   ├── planner_server.py       # microsoft_planner MCP: MS 365 Planner / Graph (optional)
 │   │   ├── github_server.py         # GitHub REST: repo, branch, file, PR, …
 │   │   └── jira_server.py           # Jira REST: issues, transitions, assign, …
 │   │
@@ -626,7 +633,7 @@ python main.py test-mcp  # MCP health check
 ## Design Decisions
 
 ### Why Multi-Agent over Single Agent?
-Following the principle of **"do the simplest thing that works"** — each agent has a focused tool set (3-12 tools) instead of one agent with 24+ tools. The router adds ~200ms but significantly improves tool selection accuracy. Specialized agents also allow per-agent strategies (Planner uses Plan-Execute while Coder uses ReAct).
+Following the principle of **"do the simplest thing that works"** — each agent has a focused tool set instead of one agent with every MCP tool. The router adds ~200ms but significantly improves tool selection accuracy. Specialized agents also allow per-agent strategies (e.g. Planner and Project Manager use Plan-and-Execute; Coder and Business Analyst often use ReAct).
 
 ### Why MCP over Direct Tool Calls?
 MCP provides a standardized protocol that decouples agents from tools. Adding a new capability (Docker, database, Slack) requires only a new MCP server — the agents and orchestrator don't change. This is the same architecture used by Claude, Cursor, and other production AI tools.
@@ -661,7 +668,7 @@ With `reload=True`, watching the whole repo causes a restart whenever the agent 
 |-----------|-----------|
 | Agent Orchestration | LangGraph (router_decides, sequential, parallel, supervisor) + MemorySaver |
 | Human-in-the-Loop | LangGraph interrupt() / Command(resume=), 4 checkpoint types |
-| Tool Protocol | MCP (Model Context Protocol) — 5 servers, 24 tools |
+| Tool Protocol | MCP — multiple servers (filesystem, shell, git, web, memory, microsoft_planner, github, jira, …) |
 | LLM Client | LangChain ChatOpenAI (any OpenAI-compatible API) |
 | Backend API | FastAPI + Uvicorn (50+ REST + SSE endpoints) |
 | Database | SQLite + SQLAlchemy (auto-migration) |
