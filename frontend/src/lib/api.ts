@@ -73,8 +73,8 @@ export const api = {
     delete: (id: string) => fetchJSON(`/api/teams/${id}`, { method: "DELETE" }),
     chat: (id: string, message: string) =>
       fetchJSON(`/api/teams/${id}/chat`, { method: "POST", body: JSON.stringify({ message }) }),
-    chatStream: (id: string, message: string, onEvent: SSECallback, threadId?: string, signal?: AbortSignal) =>
-      consumeSSE(`/api/teams/${id}/chat/stream`, { message, thread_id: threadId }, onEvent, signal),
+    chatStream: (id: string, message: string, onEvent: SSECallback, threadId?: string, signal?: AbortSignal, model?: string) =>
+      consumeSSE(`/api/teams/${id}/chat/stream`, { message, thread_id: threadId, ...(model ? { model } : {}) }, onEvent, signal),
     chatResume: (id: string, threadId: string, hitlResponse: Record<string, any>, onEvent: SSECallback, signal?: AbortSignal) =>
       consumeSSE(`/api/teams/${id}/chat/resume`, { thread_id: threadId, hitl_response: hitlResponse }, onEvent, signal),
     rebuild: (id: string) => fetchJSON(`/api/teams/${id}/rebuild`, { method: "POST" }),
@@ -132,6 +132,9 @@ export const api = {
   },
   models: {
     list: () => fetchJSON("/api/models"),
+  },
+  config: {
+    llm: () => fetchJSON("/api/config/llm"),
   },
   promptVersions: {
     list: () => fetchJSON("/api/prompt-versions"),

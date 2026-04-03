@@ -35,8 +35,8 @@ Built with LangGraph, MCP, FastAPI, SQLite, DeepEval, Langfuse, OpenTelemetry, a
      │  Tool discovery · Schema validation · Error handling  │
      └──┬─────────┬──────────┬──────────┬──────────┬───────┘
         ▼         ▼          ▼          ▼          ▼
-   Filesystem   Shell       Git        Web      Memory
-   (6 tools)  (3 tools)  (6 tools)  (3 tools)  (6 tools)
+   Filesystem   Shell       Git        Web      Memory   Planner   GitHub    Jira
+   (6 tools)  (3 tools)  (6 tools)  (3 tools)  (6 tools) (varies)  (varies)  (varies)
 ```
 
 ## How the Agent Team Works
@@ -47,7 +47,7 @@ Each agent has a specific role, decision strategy, MCP tool set, and skills:
 
 | Agent | Strategy | Tools | Role | Tool Call Limit |
 |-------|----------|-------|------|----------------|
-| **Coder** | ReAct | filesystem, git | Reads/writes code, navigates codebases, manages version control | 8 |
+| **Coder** | ReAct | filesystem, shell, git, github, jira, memory (typical) | Code, tests, local git, GitHub API, Jira read/fetch, end-to-end SDLC when routed | 14 (prompt budget; tune in DB) |
 | **Runner** | ReAct | shell | Single-task executor — runs ONE command or test suite and reports output | 5 |
 | **Researcher** | ReAct | web | Searches documentation, fetches API references, synthesizes findings | 6 |
 | **Planner** | Plan-and-Execute | memory, filesystem | Multi-step coordinator for tasks requiring two or more distinct actions | 15 |
@@ -110,7 +110,7 @@ During regression testing, all HITL checkpoints are auto-approved to allow unatt
 Following the [Claude Code principle](https://docs.anthropic.com/): **"MCP gives power. Skills control power."**
 
 **MCP Tools** (what agents CAN do):
-- 24 tools across 5 MCP servers (filesystem, shell, git, web, memory)
+- MCP tool groups include filesystem, shell, git, web, memory, planner (Microsoft Graph), **github**, **jira** — assign per agent in Studio
 - Each tool has a JSON Schema defining its parameters
 - Agents discover tools dynamically at runtime via the MCP protocol
 
@@ -123,8 +123,11 @@ Following the [Claude Code principle](https://docs.anthropic.com/): **"MCP gives
 ### Routing: How Requests Reach the Right Agent
 
 1. User sends a request (e.g., "Create a plan for refactoring the config module")
-2. A lightweight **Router LLM call** classifies the intent using priority-ordered routing rules:
-   - Multi-step tasks (two or more distinct actions) → **planner**
+2. A lightweight **Router LLM call** classifies the intent using priority-ordered routing rules (see `src/orchestrator.py`), including:
+   - Jira fetch + implement + push/PR → **coder**
+   - GitHub branch/file/PR workflows → **coder**
+   - Jira project/issue *management* (create/assign), no coding → **project_manager** / **business_analyst** when configured
+   - Multi-step tasks spanning domains (without GitHub/Jira coding) → **planner**
    - "Review / assess / find bugs" without execution → **reviewer**
    - Single command or test run → **runner**
    - Read / write / edit code (single action) → **coder**
@@ -167,8 +170,10 @@ The chat page features a three-panel layout:
 - Titles auto-derived from first user message, sorted by last activity
 
 ### Chat Panel (center)
-- **Cursor-style thinking box**: Collapsible grey box showing LLM reasoning tokens in real-time
+- **Cursor-style thinking box**: While the model streams, a collapsible grey box shows reasoning tokens in real time
+- **Thinking history**: After the turn completes, the same content is stored on the assistant message and can be reopened via **Show thinking** (so it is not lost when streaming ends)
 - **Markdown rendering**: All assistant messages rendered with `react-markdown` (headings, code blocks, tables, lists, links) — styled during streaming, not after
+- **Session model override**: Dropdown next to the team selector; choice is persisted in the browser and sent as optional `model` on `POST /api/teams/{id}/chat/stream` (overrides per-agent DB model for that request path when the backend applies it)
 - **HITL widgets**: Inline interactive widgets for clarification, plan review, action confirmation, and tool output review
 - **Stop button**: Red stop button replaces Send during processing; aborts the SSE stream immediately
 - **Clear**: Clears messages within the current conversation without deleting it
@@ -178,7 +183,8 @@ The chat page features a three-panel layout:
 - **Summary cards**: Elapsed time, token count, cost — persists after query completes
 - **Spans grouped by agent**: Collapsible agent sections with per-agent token/cost totals and individual span details
 - **HITL pause indicator**: Orange banner when waiting for user response
-- All trace data persists after the query finishes (no disappearing on completion)
+- **After refresh**: The last trace summary is restored from `localStorage` so the panel is not empty on reload
+- Live trace data remains visible after the query finishes (no disappearing on completion)
 
 ### Streaming Architecture
 
@@ -196,7 +202,7 @@ astream_events() →   thread_id                → setThreadId
 ```
 
 Two SSE endpoints:
-- `POST /api/teams/{id}/chat/stream` — Initial query
+- `POST /api/teams/{id}/chat/stream` — Initial query; JSON body may include `message`, `thread_id`, and optional `model`
 - `POST /api/teams/{id}/chat/resume` — Resume after HITL pause
 
 ## Evaluation System
@@ -248,9 +254,11 @@ Specialized agentic evaluation via DeepEval SDK and LLM-as-judge trace analysis.
 
 ### Golden Dataset & Regression Testing
 
-A curated set of 10 test cases with expected outputs, stored in `golden_dataset.json` (currently at **version 3.0**) and synced to the database for UI access.
+A curated set of **golden test cases** (including integration scenarios such as GitHub branch/file/PR, Jira issue workflows, and end-to-end Jira → code → pytest → PR) stored in `src/evaluation/golden_dataset.json` and synced to the database for UI access.
 
-**Version 3.0 changes:** budget constraints were recalibrated to match the new structured prompts — token caps are significantly looser (thinking-model token counts are larger) while LLM call limits are tighter. The reviewer test case no longer expects a `read_file` call since the revised reviewer prompt reads files only when explicitly instructed.
+**Standalone runners** for heavy integration cases: `tests/golden_tests/run_golden_019.py` (Jira), `run_golden_020.py` (GitHub), `run_golden_021.py` (full SDLC). They resolve the repo root automatically; run: `python tests/golden_tests/run_golden_021.py` from the project root.
+
+**Version 3.0 context:** budget constraints were recalibrated to match structured prompts — token caps looser for thinking models, LLM call limits tighter where appropriate. Reviewer cases align with “read only when asked” behavior.
 
 #### Golden Test Case Structure
 
@@ -375,11 +383,14 @@ sdlc-agent/
 │   │   └── registry.py              # MCP → LangChain bridge (JSON Schema → Pydantic)
 │   │
 │   ├── mcp_servers/
-│   │   ├── filesystem_server.py     # 6 tools: read, write, edit, search, find, list
+│   │   ├── filesystem_server.py     # 6 tools; workspace sandbox + optional absolute paths
 │   │   ├── shell_server.py          # 3 tools: command, script, tests
 │   │   ├── git_server.py            # 6 tools: status, diff, log, commit, branch, show
 │   │   ├── web_server.py            # 3 tools: fetch, search, check
-│   │   └── memory_server.py         # 6 tools: store, retrieve, list, delete, plan, update
+│   │   ├── memory_server.py         # 6 tools: store, retrieve, list, delete, plan, update
+│   │   ├── planner_server.py       # Microsoft Planner / Graph (optional)
+│   │   ├── github_server.py         # GitHub REST: repo, branch, file, PR, …
+│   │   └── jira_server.py           # Jira REST: issues, transitions, assign, …
 │   │
 │   ├── skills/
 │   │   └── engine.py                # Skill injection + trigger matching
@@ -392,7 +403,7 @@ sdlc-agent/
 │   │   ├── integrations.py          # DeepEval (8 agentic metrics) + Langfuse wrappers
 │   │   ├── reporter.py              # Rich console reports
 │   │   ├── golden.py                # Golden dataset: JSON ↔ DB sync
-│   │   ├── golden_dataset.json      # 10 curated test cases (versioned with code)
+│   │   ├── golden_dataset.json      # Curated regression cases (synced to DB)
 │   │   ├── regression.py            # RegressionRunner: execute, HITL auto-approve,
 │   │   │                            #   evaluate, persist
 │   │   └── rca.py                   # RootCauseAnalyzer: trace diff + LLM classification
@@ -409,8 +420,10 @@ sdlc-agent/
 │                                    #   + patch_agent_prompts() runtime prompt migration
 │
 ├── tests/
-│   ├── test_mcp_communication.py    # 28 E2E tests for MCP layer
-│   └── test_evaluation.py           # 16 unit tests for eval pipeline
+│   ├── golden_tests/                # Standalone golden integration runners (019–021, …)
+│   ├── test_filesystem_absolute_path.py  # Absolute-path filesystem MCP (env-gated)
+│   ├── test_mcp_communication.py    # E2E tests for MCP layer
+│   └── test_evaluation.py           # Unit tests for eval pipeline
 │
 ├── data/                            # Runtime data (gitignored)
 │   ├── sdlc_agent.db               # SQLite database
@@ -470,7 +483,14 @@ LLM_JUDGE_MODEL=deepseek-r1       # Evaluation: G-Eval, semantic similarity, tra
 LLM_RCA_MODEL=deepseek-r1         # Root cause analysis on regression failures
 LLM_ROUTER_MODEL=gpt-4o-mini      # Request routing / supervisor (lightweight)
 
-GITHUB_TOKEN=your_github_token     # Optional: for GitHub MCP server
+# Filesystem MCP
+# AGENT_WORKSPACE=/path/to/project   # Optional: workspace root for relative paths (defaults to cwd)
+# AGENT_ALLOW_ABSOLUTE_PATHS=1       # Optional: allow read/write outside workspace (use with care)
+
+GITHUB_TOKEN=your_github_token     # GitHub MCP (repo, branch, file, PR)
+JIRA_BASE_URL=https://your.atlassian.net
+JIRA_EMAIL=you@example.com
+JIRA_API_TOKEN=your_jira_token     # Jira MCP
 
 # Optional: OpenTelemetry export
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
@@ -489,6 +509,8 @@ LANGFUSE_BASE_URL=https://cloud.langfuse.com
 source venv/bin/activate
 python server.py
 # API at http://localhost:8000/docs
+# Dev reload watches only ./src (see server.py) so agent-written files under tests/ etc.
+# do not restart the server and break in-flight HITL checkpoints.
 
 # Terminal 2 — Frontend
 cd frontend
@@ -543,7 +565,7 @@ python main.py test-mcp  # MCP health check
 | `PUT` | `/api/skills/{id}` | Update skill |
 | `DELETE` | `/api/skills/{id}` | Delete skill |
 | `PUT` | `/api/agents/{id}/skills` | Assign skills to agent |
-| `GET` | `/api/tools` | List all MCP tools (24 total) |
+| `GET` | `/api/tools` | List all MCP tools (by group) |
 
 ### Chat (SSE Streaming + HITL)
 
@@ -593,7 +615,8 @@ python main.py test-mcp  # MCP health check
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/api/models` | List available LLM models |
+| `GET` | `/api/models` | List available LLM models (id, name, provider, tier; Studio + Chat dropdowns) |
+| `GET` | `/api/config/llm` | Resolved defaults: `default_model`, `default_model_name`, `judge_model`, `router_model` |
 | `GET` | `/api/prompt-versions` | List prompt versions |
 | `POST` | `/api/prompt-versions` | Create prompt version |
 | `PUT` | `/api/prompt-versions/{id}` | Update prompt version |
@@ -629,6 +652,9 @@ Prompts are the most frequently changed artifact in an agent system. Treating th
 ### Why `patch_agent_prompts()` on Startup?
 Agent prompts evolve frequently. Rather than forcing users to drop and re-seed the database every time a prompt is updated, `patch_agent_prompts()` runs on every startup and applies the latest prompt to any existing agent record. This makes prompt updates zero-friction for anyone with a running deployment — the next server restart picks them up automatically.
 
+### Why restrict Uvicorn reload to `src/`?
+With `reload=True`, watching the whole repo causes a restart whenever the agent writes a file (e.g. under `tests/`). That resets the in-memory LangGraph checkpointer and the next `chat/resume` fails. Limiting reload to `src/` keeps developer ergonomics while preserving HITL sessions during agent-driven file writes.
+
 ## Tech Stack
 
 | Component | Technology |
@@ -643,7 +669,7 @@ Agent prompts evolve frequently. Rather than forcing users to drop and re-seed t
 | Regression Testing | Golden dataset + trace assertions + HITL auto-approve + RCA |
 | Observability | OpenTelemetry + OpenInference + Langfuse + real-time SSE spans |
 | Frontend | Next.js 16 + React 19 + Tailwind CSS 4 + Recharts + react-markdown |
-| Testing | pytest (44 tests: 28 MCP E2E + 16 evaluation unit) |
+| Testing | pytest (MCP E2E, evaluation unit, filesystem absolute-path tests, golden runners) |
 
 ## License
 

@@ -17,6 +17,7 @@ interface Message {
   toolCalls?: ToolCall[];
   trace?: TraceInfo;
   hitl?: HITLData;
+  thinkingContent?: string;
 }
 
 interface HITLData {
@@ -58,6 +59,8 @@ interface Conversation {
 // ── Constants & helpers ──────────────────────────────────────────
 
 const CONVOS_KEY = "sdlc_conversations";
+const LAST_TRACE_KEY = "sdlc_last_trace";
+const CHAT_MODEL_KEY = "sdlc_chat_model";
 const TYPE_DOT: Record<string, string> = {
   routing: "bg-blue-500", llm_call: "bg-purple-500", tool_call: "bg-green-500",
   agent_execution: "bg-cyan-500", hitl: "bg-orange-500", supervisor: "bg-yellow-500",
@@ -127,6 +130,9 @@ export default function ChatPage() {
   const [teams, setTeams] = useState<any[]>([]);
   const [teamId, setTeamId] = useState("default");
   const [hydrated, setHydrated] = useState(false);
+  const [availableModels, setAvailableModels] = useState<any[]>([]);
+  const [defaultModelName, setDefaultModelName] = useState("from .env");
+  const [chatModel, setChatModel] = useState("");
 
   // Conversation list
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -164,7 +170,14 @@ export default function ChatPage() {
   const userNearBottom = useRef(true);
 
   // ── Hydration ──────────────────────────────────────────────
-  useEffect(() => { api.teams.list().then(setTeams); }, []);
+  useEffect(() => {
+    api.teams.list().then(setTeams);
+    Promise.all([api.models.list(), api.config.llm()]).then(([models, llmCfg]) => {
+      setAvailableModels(models);
+      setDefaultModelName(llmCfg.default_model_name || llmCfg.default_model || "from .env");
+    });
+  }, []);
+
   useEffect(() => {
     const convos = loadConversations();
     setConversations(convos);
@@ -175,8 +188,30 @@ export default function ChatPage() {
       setThreadId(latest.threadId);
       setTeamId(latest.teamId);
     }
+    // Restore last trace and model preference from localStorage
+    try {
+      const saved = localStorage.getItem(LAST_TRACE_KEY);
+      if (saved) setActiveTrace(JSON.parse(saved));
+    } catch { /* ignore */ }
+    try {
+      const savedModel = localStorage.getItem(CHAT_MODEL_KEY);
+      if (savedModel !== null) setChatModel(savedModel);
+    } catch { /* ignore */ }
     setHydrated(true);
   }, []);
+
+  // Persist last trace and model preference
+  useEffect(() => {
+    if (!hydrated) return;
+    try {
+      if (activeTrace) localStorage.setItem(LAST_TRACE_KEY, JSON.stringify(activeTrace));
+    } catch { /* quota */ }
+  }, [activeTrace, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    try { localStorage.setItem(CHAT_MODEL_KEY, chatModel); } catch { /* quota */ }
+  }, [chatModel, hydrated]);
 
   // Persist conversations when messages change
   useEffect(() => {
@@ -274,7 +309,8 @@ export default function ChatPage() {
         break;
       }
 
-      case "hitl_request":
+      case "hitl_request": {
+        const capturedThinkingHITL = thinkingText;
         setInputLocked(false);
         setStatusText("Waiting for your input...");
         setPendingHITL(data as HITLData);
@@ -282,17 +318,28 @@ export default function ChatPage() {
           agent: data.agent || "", action: `hitl:${data.type}`,
           status: "active", timestamp: Date.now(),
         }]);
-        setMessages(prev => [...prev, {
-          role: "hitl" as const, content: data.message || "Agent needs your input",
-          hitl: data as HITLData,
-        }]);
+        setMessages(prev => [
+          ...prev,
+          ...(capturedThinkingHITL ? [{
+            role: "assistant" as const,
+            content: "",
+            thinkingContent: capturedThinkingHITL,
+          }] : []),
+          {
+            role: "hitl" as const, content: data.message || "Agent needs your input",
+            hitl: data as HITLData,
+          },
+        ]);
         setThinkingText("");
         break;
+      }
 
       case "response": {
+        const capturedThinking = thinkingText;
         setMessages(prev => [...prev, {
           role: "assistant", content: data.content, agent: data.agent_used,
           toolCalls: data.tool_calls, trace: data.trace,
+          thinkingContent: capturedThinking || undefined,
         }]);
         setActiveTrace(data.trace || null);
         setThinkingText("");
@@ -378,7 +425,7 @@ export default function ChatPage() {
 
     abortRef.current = new AbortController();
     try {
-      await api.teams.chatStream(teamId, msg, handleSSEEvent, threadId || undefined, abortRef.current.signal);
+      await api.teams.chatStream(teamId, msg, handleSSEEvent, threadId || undefined, abortRef.current.signal, chatModel || undefined);
     } catch (e: any) {
       if (e.name !== "AbortError")
         setMessages(prev => [...prev, { role: "assistant", content: `Error: ${e.message}` }]);
@@ -470,6 +517,29 @@ export default function ChatPage() {
               <button onClick={clearCurrentChat} className="btn-ghost !text-[11px]"
                 title="Clear messages in this chat">Clear</button>
             )}
+            {/* Global model override — applies to all agents for this session */}
+            <select
+              value={chatModel}
+              onChange={e => setChatModel(e.target.value)}
+              className="input !w-auto !text-[12px]"
+              title="Override model for all agents in this chat"
+            >
+              <option value="">Default ({defaultModelName})</option>
+              {(() => {
+                const byProvider: Record<string, any[]> = {};
+                for (const m of availableModels) {
+                  const g = m.provider || "Other";
+                  (byProvider[g] = byProvider[g] || []).push(m);
+                }
+                return Object.entries(byProvider).map(([provider, models]) => (
+                  <optgroup key={provider} label={provider}>
+                    {models.map((m: any) => (
+                      <option key={m.id} value={m.id}>{m.name}</option>
+                    ))}
+                  </optgroup>
+                ));
+              })()}
+            </select>
             <select value={teamId} onChange={e => setTeamId(e.target.value)} className="input !w-auto !text-[12px]">
               {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
             </select>
@@ -496,9 +566,10 @@ export default function ChatPage() {
                     m.role === "user" ? "bg-[var(--accent)] text-white" : "card !p-3"
                   }`}>
                     {m.agent && <div className="text-[11px] text-[var(--accent)] font-medium mb-1">{m.agent}</div>}
+                    {m.thinkingContent && <ThinkingHistory content={m.thinkingContent} />}
                     {m.role === "user"
                       ? <div className="text-[13px] whitespace-pre-wrap leading-relaxed">{m.content}</div>
-                      : <Md content={m.content} />
+                      : m.content ? <Md content={m.content} /> : null
                     }
                     {m.toolCalls && m.toolCalls.length > 0 && (
                       <div className="mt-2 pt-1.5 border-t border-[var(--border)] space-y-0.5">
@@ -663,6 +734,32 @@ export default function ChatPage() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+
+// ── Thinking History ─────────────────────────────────────────────
+
+function ThinkingHistory({ content }: { content: string }) {
+  const [collapsed, setCollapsed] = useState(true);
+  return (
+    <div className="mb-2">
+      <button
+        onClick={() => setCollapsed(c => !c)}
+        className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] transition-colors mb-1"
+      >
+        <span className={`transition-transform text-[9px] ${collapsed ? "" : "rotate-90"}`}>&#9654;</span>
+        <span className="h-1.5 w-1.5 rounded-full bg-[var(--text-muted)]" />
+        {collapsed ? "Show thinking" : "Hide thinking"}
+      </button>
+      {!collapsed && (
+        <div className="bg-[#f4f4f5] dark:bg-[#27272a] rounded-xl px-4 py-3 border border-[#e4e4e7] dark:border-[#3f3f46] mb-2">
+          <div className="text-[12px] text-[#71717a] dark:text-[#a1a1aa] leading-relaxed whitespace-pre-wrap font-mono max-h-[240px] overflow-y-auto">
+            {content}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -11,3 +11,7 @@ data/
 frontend/.next/
 frontend/node_modules/
 venv
+
+# Local / accidental artifacts
+checkpoints.db
+Users/

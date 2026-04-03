@@ -20,6 +20,11 @@ MAX_FILE_SIZE = 100_000  # 100KB read limit
 MAX_RESULTS = 50
 
 
+def _allow_absolute_paths() -> bool:
+    """When true, read_file/write_file/edit_file/list/search accept absolute paths anywhere on disk."""
+    return os.getenv("AGENT_ALLOW_ABSOLUTE_PATHS", "").lower() in ("1", "true", "yes")
+
+
 @dataclass
 class FilesystemState:
     tool_calls: list[dict] = field(default_factory=list)
@@ -35,12 +40,27 @@ server = Server("filesystem-mcp-server")
 state = FilesystemState()
 
 
-def _safe_path(relative_path: str) -> Path:
-    """Resolve a path within the workspace, preventing directory traversal."""
-    resolved = Path(WORKSPACE_ROOT, relative_path).resolve()
+def _safe_path(path_arg: str) -> Path:
+    """Resolve a path: relative paths stay under WORKSPACE_ROOT; absolute paths allowed if env enables it."""
+    raw = (path_arg or "").strip()
+    if not raw:
+        return Path(WORKSPACE_ROOT).resolve()
+
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        if not _allow_absolute_paths():
+            raise ValueError(
+                "Absolute paths are disabled. Set environment variable AGENT_ALLOW_ABSOLUTE_PATHS=1 "
+                "to allow read/write outside the workspace, or use a path relative to the workspace root."
+            )
+        return candidate.resolve()
+
+    resolved = Path(WORKSPACE_ROOT, raw).resolve()
     workspace = Path(WORKSPACE_ROOT).resolve()
-    if not str(resolved).startswith(str(workspace)):
-        raise ValueError(f"Path escapes workspace: {relative_path}")
+    try:
+        resolved.relative_to(workspace)
+    except ValueError:
+        raise ValueError(f"Path escapes workspace: {path_arg}") from None
     return resolved
 
 
@@ -53,7 +73,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Relative path to the file from workspace root"},
+                    "path": {"type": "string", "description": "Path to the file: relative to workspace root, or absolute if AGENT_ALLOW_ABSOLUTE_PATHS=1"},
                     "start_line": {"type": "integer", "description": "Optional: start reading from this line (1-indexed)"},
                     "end_line": {"type": "integer", "description": "Optional: stop reading at this line"},
                 },
@@ -66,7 +86,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Relative path to the file"},
+                    "path": {"type": "string", "description": "File path (workspace-relative or absolute if AGENT_ALLOW_ABSOLUTE_PATHS=1)"},
                     "content": {"type": "string", "description": "Content to write"},
                 },
                 "required": ["path", "content"],
@@ -78,7 +98,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Relative path to the file"},
+                    "path": {"type": "string", "description": "File path (workspace-relative or absolute if AGENT_ALLOW_ABSOLUTE_PATHS=1)"},
                     "old_text": {"type": "string", "description": "Exact text to find and replace"},
                     "new_text": {"type": "string", "description": "Replacement text"},
                 },
@@ -91,7 +111,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Relative path to directory (empty string for root)", "default": ""},
+                    "path": {"type": "string", "description": "Directory path (workspace-relative, empty = workspace root; or absolute if enabled)", "default": ""},
                     "recursive": {"type": "boolean", "description": "List recursively", "default": False},
                 },
             },
@@ -103,7 +123,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "Text or regex pattern to search for"},
-                    "path": {"type": "string", "description": "Directory to search in (relative path)", "default": ""},
+                    "path": {"type": "string", "description": "Directory to search in (relative or absolute if enabled)", "default": ""},
                     "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.py')", "default": "*"},
                 },
                 "required": ["pattern"],
@@ -116,7 +136,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "Glob pattern (e.g., '*.py', 'test_*.ts')"},
-                    "path": {"type": "string", "description": "Directory to search in", "default": ""},
+                    "path": {"type": "string", "description": "Directory to search in (relative or absolute if enabled)", "default": ""},
                 },
                 "required": ["pattern"],
             },
@@ -201,19 +221,20 @@ def _list_directory(args: dict) -> str:
     if not dirpath.is_dir():
         raise NotADirectoryError(f"Not a directory: {args.get('path', '')}")
 
+    anchor = dirpath.resolve()
     entries = []
     if args.get("recursive"):
         for p in sorted(dirpath.rglob("*")):
-            if any(part.startswith(".") for part in p.relative_to(dirpath).parts):
+            if any(part.startswith(".") for part in p.relative_to(anchor).parts):
                 continue
-            rel = p.relative_to(Path(WORKSPACE_ROOT))
+            rel = p.relative_to(anchor)
             kind = "dir" if p.is_dir() else f"{p.stat().st_size:,}B"
             entries.append(f"  {rel}  ({kind})")
     else:
         for p in sorted(dirpath.iterdir()):
             if p.name.startswith("."):
                 continue
-            rel = p.relative_to(Path(WORKSPACE_ROOT))
+            rel = p.relative_to(anchor)
             kind = "dir/" if p.is_dir() else f"{p.stat().st_size:,}B"
             entries.append(f"  {rel}  ({kind})")
 
@@ -225,6 +246,7 @@ def _list_directory(args: dict) -> str:
 def _search_files(args: dict) -> str:
     import re
     search_dir = _safe_path(args.get("path", ""))
+    search_anchor = search_dir.resolve()
     pattern = args["pattern"]
     file_glob = args.get("file_pattern", "*")
 
@@ -232,13 +254,13 @@ def _search_files(args: dict) -> str:
     for filepath in search_dir.rglob(file_glob):
         if not filepath.is_file() or filepath.stat().st_size > MAX_FILE_SIZE:
             continue
-        if any(part.startswith(".") for part in filepath.relative_to(search_dir).parts):
+        if any(part.startswith(".") for part in filepath.relative_to(search_anchor).parts):
             continue
         try:
             content = filepath.read_text(encoding="utf-8")
             for i, line in enumerate(content.splitlines(), 1):
                 if re.search(pattern, line):
-                    rel = filepath.relative_to(Path(WORKSPACE_ROOT))
+                    rel = filepath.relative_to(search_anchor)
                     matches.append(f"  {rel}:{i}: {line.strip()}")
                     if len(matches) >= MAX_RESULTS:
                         return f"Found {len(matches)}+ matches:\n" + "\n".join(matches)
@@ -252,13 +274,14 @@ def _search_files(args: dict) -> str:
 
 def _find_files(args: dict) -> str:
     search_dir = _safe_path(args.get("path", ""))
+    search_anchor = search_dir.resolve()
     pattern = args["pattern"]
 
     results = []
     for filepath in sorted(search_dir.rglob(pattern)):
-        if any(part.startswith(".") for part in filepath.relative_to(search_dir).parts):
+        if any(part.startswith(".") for part in filepath.relative_to(search_anchor).parts):
             continue
-        rel = filepath.relative_to(Path(WORKSPACE_ROOT))
+        rel = filepath.relative_to(search_anchor)
         kind = "dir/" if filepath.is_dir() else f"{filepath.stat().st_size:,}B"
         results.append(f"  {rel}  ({kind})")
         if len(results) >= MAX_RESULTS:

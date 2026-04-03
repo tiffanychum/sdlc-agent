@@ -75,6 +75,25 @@ DANGEROUS_TOOLS = {
     "edit_file",
     "git_commit",
     "git_branch",
+    # GitHub remote operations — all require explicit user confirmation
+    "github_create_repo",
+    "github_remote_add",
+    "github_push",
+    "github_create_pr",
+    # Planner write operations — always confirm before modifying Planner
+    "planner_create_plan",
+    "planner_create_bucket",
+    "planner_create_task",
+    "planner_assign_task",
+    "planner_update_task",
+    # Jira write operations — always confirm before creating/modifying tickets
+    "jira_create_issue",
+    "jira_update_issue",
+    "jira_assign_issue",
+    "jira_transition_issue",
+    # New GitHub write operations
+    "github_create_branch",
+    "github_create_file",
 }
 
 REVIEWABLE_TOOLS = {
@@ -372,5 +391,24 @@ def _risk_reason(tool_name: str) -> str:
         "edit_file": "Modifies an existing file.",
         "git_commit": "Stages files and creates a git commit.",
         "git_branch": "Creates or switches git branches.",
+        # GitHub
+        "github_create_repo": "Creates a new GitHub repository (cannot be undone without deletion).",
+        "github_remote_add": "Adds a remote URL to the local git repository config.",
+        "github_push": "Pushes local commits to GitHub — makes code publicly/privately visible.",
+        "github_create_pr": "Opens a Pull Request on GitHub that others can see and review.",
+        # Planner
+        "planner_create_plan": "Creates a new Microsoft Planner plan in an M365 group.",
+        "planner_create_bucket": "Creates a new bucket (Epic) in a Planner plan.",
+        "planner_create_task": "Creates a new task in Microsoft Planner and optionally assigns it.",
+        "planner_assign_task": "Assigns a Planner task to a developer — sends them a notification.",
+        "planner_update_task": "Modifies an existing Planner task (title, progress, due date).",
+        # Jira
+        "jira_create_issue": "Creates a real Jira ticket (Epic/Story/Task) — visible to all project members.",
+        "jira_update_issue": "Modifies an existing Jira ticket's summary, description, or priority.",
+        "jira_assign_issue": "Assigns a Jira ticket to a developer — sends them a Jira notification.",
+        "jira_transition_issue": "Changes the status of a Jira ticket (e.g. To Do → In Progress).",
+        # New GitHub tools
+        "github_create_branch": "Creates a new branch in a remote GitHub repository — affects shared codebase.",
+        "github_create_file": "Commits a new or updated file directly to a GitHub branch — permanent remote commit.",
     }
     return reasons.get(tool_name, "This action modifies system state.")

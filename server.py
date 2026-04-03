@@ -176,18 +176,27 @@ class PromptVersionUpdate(BaseModel):
 
 
 AVAILABLE_MODELS = [
-    {"id": "gpt-4o-mini", "name": "GPT-4o Mini", "provider": "OpenAI", "tier": "router"},
-    {"id": "gpt-4o", "name": "GPT-4o", "provider": "OpenAI", "tier": "agent"},
-    {"id": "gpt-5-mini", "name": "GPT-5 Mini", "provider": "OpenAI", "tier": "agent"},
-    {"id": "gpt-5-mini-2025-08-07", "name": "GPT-5 Mini (2025-08-07)", "provider": "OpenAI", "tier": "agent"},
-    {"id": "gpt-5.3-codex", "name": "GPT-5.3 Codex", "provider": "OpenAI", "tier": "agent"},
-    {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4", "provider": "Anthropic", "tier": "agent"},
-    {"id": "claude-sonnet-4.6", "name": "Claude Sonnet 4.6", "provider": "Anthropic", "tier": "agent"},
-    {"id": "deepseek-r1", "name": "DeepSeek R1", "provider": "DeepSeek", "tier": "judge/rca"},
-    {"id": "gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite", "provider": "Google", "tier": "agent"},
-    {"id": "gemini-3-flash", "name": "Gemini 3 Flash", "provider": "Google", "tier": "agent"},
-    {"id": "llama-3.1-8b-cs", "name": "Llama 3.1 8B", "provider": "Meta", "tier": "agent"},
-    {"id": "mistral-small-3", "name": "Mistral Small 3", "provider": "Mistral", "tier": "agent"},
+    # ── OpenAI ──────────────────────────────────────────────────
+    {"id": "gpt-4o-mini",              "name": "GPT-4o Mini",                "provider": "OpenAI",     "tier": "router", "thinking": False},
+    {"id": "gpt-4o",                   "name": "GPT-4o",                     "provider": "OpenAI",     "tier": "agent",  "thinking": False},
+    {"id": "gpt-5",                    "name": "GPT-5",                      "provider": "OpenAI",     "tier": "agent",  "thinking": False},
+    {"id": "gpt-5-mini",               "name": "GPT-5 Mini",                 "provider": "OpenAI",     "tier": "agent",  "thinking": False},
+    {"id": "gpt-5-mini-2025-08-07",    "name": "GPT-5 Mini (2025-08-07)",    "provider": "OpenAI",     "tier": "agent",  "thinking": False},
+    {"id": "gpt-5.3-codex",            "name": "GPT-5.3 Codex",              "provider": "OpenAI",     "tier": "agent",  "thinking": False},
+    # ── Anthropic ───────────────────────────────────────────────
+    {"id": "claude-haiku-3",           "name": "Claude Haiku 3",             "provider": "Anthropic",  "tier": "agent",  "thinking": False},
+    {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4",            "provider": "Anthropic",  "tier": "agent",  "thinking": False},
+    {"id": "claude-sonnet-4.6",        "name": "Claude Sonnet 4.6 (thinks)", "provider": "Anthropic",  "tier": "agent",  "thinking": True},
+    {"id": "claude-opus-4.5",          "name": "Claude Opus 4.5 (thinks)",   "provider": "Anthropic",  "tier": "agent",  "thinking": True},
+    {"id": "claude-opus-4.6",          "name": "Claude Opus 4.6 (thinks)",   "provider": "Anthropic",  "tier": "agent",  "thinking": True},
+    # ── Google — ⚠️ may trigger safety blocks ──────────────────
+    {"id": "gemini-2.5-flash-lite",    "name": "Gemini 2.5 Flash Lite ⚠️",  "provider": "Google",     "tier": "agent",  "thinking": False, "unstable": True},
+    {"id": "gemini-3-flash",           "name": "Gemini 3 Flash ⚠️",         "provider": "Google",     "tier": "agent",  "thinking": False, "unstable": True},
+    # ── Other providers ─────────────────────────────────────────
+    {"id": "deepseek-r1",              "name": "DeepSeek R1",                "provider": "DeepSeek",   "tier": "judge",  "thinking": False},
+    {"id": "llama-3.1-8b-cs",          "name": "Llama 3.1 8B",               "provider": "Meta",       "tier": "agent",  "thinking": False},
+    {"id": "mistral-small-3",          "name": "Mistral Small 3",            "provider": "Mistral",    "tier": "agent",  "thinking": False},
+    {"id": "grok-4.1-fast-reasoning",  "name": "Grok 4.1 Fast",              "provider": "xAI",        "tier": "agent",  "thinking": False},
 ]
 
 
@@ -1245,6 +1254,21 @@ def list_available_models():
     return AVAILABLE_MODELS
 
 
+@app.get("/api/config/llm")
+def get_llm_config():
+    """Return current LLM defaults so the UI can display the active default model."""
+    from src.config import config as app_config
+    default_model = app_config.llm.model
+    # Find a human-readable name from AVAILABLE_MODELS, fall back to the raw id
+    name = next((m["name"] for m in AVAILABLE_MODELS if m["id"] == default_model), default_model)
+    return {
+        "default_model": default_model,
+        "default_model_name": name,
+        "judge_model": app_config.llm.judge_model,
+        "router_model": app_config.llm.router_model,
+    }
+
+
 # ── Prompt Versions API ────────────────────────────────────────
 
 @app.get("/api/prompt-versions")
@@ -1769,4 +1793,18 @@ async def ws_chat(websocket: WebSocket, team_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    # Only watch actual source code dirs — exclude workspace dirs where agents write files.
+    # This prevents the server from reloading (and losing checkpoints) when the coder
+    # agent writes files to tests/, src/agents/, etc.
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        reload_dirs=["src"],
+        reload_excludes=[
+            "tests/*", "*.pyc", "__pycache__/*",
+            "*.db", "*.sqlite", "*.log",
+            "frontend/*", "node_modules/*",
+        ],
+    )

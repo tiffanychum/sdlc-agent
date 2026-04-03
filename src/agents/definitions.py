@@ -1,0 +1,2 @@
+class AgentConfig:
+    pass

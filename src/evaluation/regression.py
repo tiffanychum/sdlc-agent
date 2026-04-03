@@ -111,8 +111,21 @@ class RegressionRunner:
                                 elif htype == "tool_review":
                                     resume_val = {"type": "tool_review", "action": "continue"}
                                 elif htype == "clarification":
-                                    resume_val = {"type": "clarification",
-                                                  "answer": "Proceed with your best judgment."}
+                                    question_text = iv.get("question", "").lower()
+                                    # Give a clear "yes" for approval/confirmation gates so
+                                    # plan_execute agents don't stall waiting for explicit approval.
+                                    _approval_keywords = (
+                                        "proceed", "confirm", "approve", "abort",
+                                        "shall i", "should i", "go ahead", "create these",
+                                        "is this correct", "is that correct", "correct repo",
+                                        "correct?", "correct.", "is this", "is that",
+                                        "will i", "i will",
+                                    )
+                                    if any(kw in question_text for kw in _approval_keywords):
+                                        _answer = "Yes, proceed exactly as planned."
+                                    else:
+                                        _answer = "Yes, proceed exactly as planned."
+                                    resume_val = {"type": "clarification", "answer": _answer}
                             break
                 result = await orchestrator.ainvoke(
                     LGCommand(resume=resume_val), config=config

@@ -101,11 +101,15 @@ Available agents:
 {agent_descs}
 
 Routing rules (apply in order):
-1. If the task has TWO OR MORE distinct steps (e.g., "run X then review Y", "analyze A and B", "create a plan and execute"), route to "planner".
-2. If the task says "review", "assess quality", "find bugs", "suggest improvements" for a file or git diff — with NO execution step — route to "reviewer".
-3. If the task asks to run a SINGLE command or test suite and report the output, route to "runner".
-4. If the task asks to read, write, edit, or navigate code (single action), route to "coder".
-5. If the task requires web search or external documentation, route to "researcher".
+1. If the task says "fetch/get/read a Jira task and then implement/code/write/push/PR" — this is a developer SDLC workflow → route to "coder". Coder can read Jira AND write code AND push to GitHub.
+2. If the task involves CREATING or MANAGING Jira (creating epics, stories, new projects, assigning tickets, updating issue status) with NO coding step → route to "project_manager".
+3. If the task involves decomposing requirements into developer tasks in Jira, writing acceptance criteria — with NO coding step → route to "business_analyst".
+4. If the task involves GitHub repos in ANY way — creating a branch, creating a file, pushing code, creating a PR, reading repo info — route to "coder". ALL GitHub operations (including multi-step branch+file+PR) belong to coder.
+5. If the task has TWO OR MORE distinct steps spanning DIFFERENT domains (e.g., "search the web AND then edit local files", "review code AND run tests") with NO GitHub/Jira reading involved → route to "planner".
+5. If the task says "review", "assess quality", "find bugs", "suggest improvements" for a file or git diff — with NO execution step → route to "reviewer".
+6. If the task asks to run a SINGLE command or test suite and report the output → route to "runner".
+7. If the task asks to read, write, edit, or navigate code (single action) → route to "coder".
+8. If the task requires web search or external documentation → route to "researcher".
 
 Respond with ONLY the agent name: {agent_names}.
 If unsure, respond with "planner" for complex tasks or "coder" for simple tasks."""

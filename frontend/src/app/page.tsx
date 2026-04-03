@@ -2,16 +2,6 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 
-const LLM_MODELS = [
-  { value: "", label: "Default (from .env)" },
-  { value: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite" },
-  { value: "llama-3.1-8b-cs", label: "Llama 3.1 8B" },
-  { value: "mistral-small-3", label: "Mistral Small 3" },
-  { value: "grok-4.1-fast-reasoning", label: "Grok 4.1 Fast" },
-  { value: "claude-haiku-3", label: "Claude Haiku 3" },
-  { value: "gpt-4o-mini-search", label: "GPT-4o Mini (Search)" },
-];
-
 const TEAM_STRATEGIES = [
   { v: "router_decides", l: "Router", d: "LLM picks the best agent" },
   { v: "sequential", l: "Sequential", d: "Agents run in order" },
@@ -38,13 +28,30 @@ export default function StudioPage() {
   const [showSkill, setShowSkill] = useState(false);
   const [agent, setAgent] = useState({ name: "", role: "", description: "", system_prompt: "", tool_groups: [] as string[], model: "" });
   const [skill, setSkill] = useState({ name: "", description: "", instructions: "", trigger_pattern: "" });
+  const [availableModels, setAvailableModels] = useState<any[]>([]);
+  const [defaultModelName, setDefaultModelName] = useState("from .env");
 
   useEffect(() => { load(); }, []);
 
   async function load() {
-    const [t, s, tl] = await Promise.all([api.teams.list(), api.skills.list(), api.tools.list()]);
+    const [t, s, tl, models, llmCfg] = await Promise.all([
+      api.teams.list(), api.skills.list(), api.tools.list(),
+      api.models.list(), api.config.llm(),
+    ]);
     setTeams(t); setSkills(s); setTools(tl);
+    setAvailableModels(models);
+    setDefaultModelName(llmCfg.default_model_name || llmCfg.default_model || "from .env");
     if (t.length > 0 && !team) setTeam(await api.teams.get(t[0].id));
+  }
+
+  /** Build <option> list: "Default" first, then all server models grouped by provider */
+  function modelOptions() {
+    const byProvider: Record<string, any[]> = {};
+    for (const m of availableModels) {
+      const g = m.provider || "Other";
+      (byProvider[g] = byProvider[g] || []).push(m);
+    }
+    return { byProvider };
   }
 
   async function selectTeam(id: string) { setTeam(await api.teams.get(id)); }
@@ -211,7 +218,14 @@ export default function StudioPage() {
                       <span className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide">Model:</span>
                       <select value={a.model || ""} onChange={e => updateAgentModel(a.id, e.target.value)}
                         className="input !w-auto !py-1 !text-xs">
-                        {LLM_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                        <option value="">Default ({defaultModelName})</option>
+                        {Object.entries(modelOptions().byProvider).map(([provider, models]) => (
+                          <optgroup key={provider} label={provider}>
+                            {models.map((m: any) => (
+                              <option key={m.id} value={m.id}>{m.name}</option>
+                            ))}
+                          </optgroup>
+                        ))}
                       </select>
                     </div>
                     <div className="flex items-center gap-1.5">
@@ -257,7 +271,14 @@ export default function StudioPage() {
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-[var(--text-muted)]">Model:</span>
                   <select value={agent.model} onChange={e => setAgent({ ...agent, model: e.target.value })} className="input !w-auto">
-                    {LLM_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                    <option value="">Default ({defaultModelName})</option>
+                    {Object.entries(modelOptions().byProvider).map(([provider, models]) => (
+                      <optgroup key={provider} label={provider}>
+                        {models.map((m: any) => (
+                          <option key={m.id} value={m.id}>{m.name}</option>
+                        ))}
+                      </optgroup>
+                    ))}
                   </select>
                 </div>
                 <textarea value={agent.system_prompt} onChange={e => setAgent({ ...agent, system_prompt: e.target.value })} placeholder="System prompt" rows={3} className="input" />

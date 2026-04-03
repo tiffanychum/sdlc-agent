@@ -25,6 +25,15 @@ from src.mcp_servers.web_server import (
 from src.mcp_servers.memory_server import (
     call_tool as mem_call, list_tools as mem_list,
 )
+from src.mcp_servers.planner_server import (
+    call_tool as planner_call, list_tools as planner_list,
+)
+from src.mcp_servers.github_server import (
+    call_tool as github_call, list_tools as github_list,
+)
+from src.mcp_servers.jira_server import (
+    call_tool as jira_call, list_tools as jira_list,
+)
 
 
 JSON_TYPE_MAP = {
@@ -102,6 +111,21 @@ async def get_memory_tools() -> list[StructuredTool]:
     return [_make_tool(t.name, t.description, t.inputSchema, mem_call) for t in mcp_tools]
 
 
+async def get_planner_tools() -> list[StructuredTool]:
+    mcp_tools = await planner_list()
+    return [_make_tool(t.name, t.description, t.inputSchema, planner_call) for t in mcp_tools]
+
+
+async def get_github_tools() -> list[StructuredTool]:
+    mcp_tools = await github_list()
+    return [_make_tool(t.name, t.description, t.inputSchema, github_call) for t in mcp_tools]
+
+
+async def get_jira_tools() -> list[StructuredTool]:
+    mcp_tools = await jira_list()
+    return [_make_tool(t.name, t.description, t.inputSchema, jira_call) for t in mcp_tools]
+
+
 async def get_all_tools() -> dict[str, list[StructuredTool]]:
     """Returns all tools grouped by MCP server origin."""
     return {
@@ -110,4 +134,7 @@ async def get_all_tools() -> dict[str, list[StructuredTool]]:
         "git": await get_git_tools(),
         "web": await get_web_tools(),
         "memory": await get_memory_tools(),
+        "planner": await get_planner_tools(),
+        "github": await get_github_tools(),
+        "jira": await get_jira_tools(),
     }
