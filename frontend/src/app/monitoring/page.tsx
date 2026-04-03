@@ -133,7 +133,8 @@ export default function MonitoringPage() {
   const [goldenCases, setGoldenCases] = useState<any[]>([]);
   const [selectedCaseIds, setSelectedCaseIds] = useState<Set<string>>(new Set());
   const [expandedCaseId, setExpandedCaseId] = useState<string | null>(null);
-  const [regModel, setRegModel] = useState("");
+  const [regModels, setRegModels] = useState<Set<string>>(new Set()); // multi-model selection
+  const [copiedRunId, setCopiedRunId] = useState<string | null>(null);
   const [regPromptVer, setRegPromptVer] = useState("v1");
   const [regBaselineRunId, setRegBaselineRunId] = useState("");
   const [regRunning, setRegRunning] = useState(false);
@@ -267,18 +268,41 @@ export default function MonitoringPage() {
     }
   }
 
+  function copyRunId(id: string) {
+    navigator.clipboard.writeText(id).catch(() => {});
+    setCopiedRunId(id);
+    setTimeout(() => setCopiedRunId(null), 1500);
+  }
+
   async function runRegression() {
     setRegRunning(true);
     setRegRunResult(null);
+    const models = regModels.size > 0 ? Array.from(regModels) : [undefined];
     try {
-      const result = await api.regression.run({
-        team_id: teamId,
-        case_ids: selectedCaseIds.size > 0 ? Array.from(selectedCaseIds) : undefined,
-        model: regModel || undefined,
-        prompt_version: regPromptVer,
-        baseline_run_id: regBaselineRunId || undefined,
-      });
-      setRegRunResult(result);
+      if (models.length > 1) {
+        // Run each model sequentially, collect all results
+        const runs: any[] = [];
+        for (const model of models) {
+          const result = await api.regression.run({
+            team_id: teamId,
+            case_ids: selectedCaseIds.size > 0 ? Array.from(selectedCaseIds) : undefined,
+            model: model || undefined,
+            prompt_version: regPromptVer,
+            baseline_run_id: regBaselineRunId || undefined,
+          });
+          runs.push(result);
+        }
+        setRegRunResult({ multi_run: true, runs });
+      } else {
+        const result = await api.regression.run({
+          team_id: teamId,
+          case_ids: selectedCaseIds.size > 0 ? Array.from(selectedCaseIds) : undefined,
+          model: models[0] || undefined,
+          prompt_version: regPromptVer,
+          baseline_run_id: regBaselineRunId || undefined,
+        });
+        setRegRunResult(result);
+      }
       setRegSubTab("results");
       await loadRegRuns();
     } catch (e: any) {
@@ -705,15 +729,38 @@ export default function MonitoringPage() {
                 <h2 className="text-sm font-medium mb-3">Run Regression Tests</h2>
                 <div className="grid grid-cols-3 gap-3 mb-3">
                   <div>
-                    <label className="text-[10px] text-[var(--text-muted)] block mb-0.5">Model</label>
-                    <select value={regModel} onChange={e => setRegModel(e.target.value)} className="input text-xs w-full">
-                      <option value="">Default (from config)</option>
+                    <div className="flex items-center justify-between mb-0.5">
+                      <label className="text-[10px] text-[var(--text-muted)]">Models <span className="text-[var(--accent)]">(select 1+ to compare)</span></label>
+                      {regModels.size > 0 && (
+                        <button onClick={() => setRegModels(new Set())} className="text-[10px] text-[var(--text-muted)] underline">Clear</button>
+                      )}
+                    </div>
+                    <div className="border border-[var(--border)] rounded max-h-[120px] overflow-y-auto bg-[var(--bg)]">
+                      <label className={`flex items-center gap-2 px-2 py-1 text-[11px] border-b border-[var(--border)] cursor-pointer hover:bg-[var(--bg-hover)] ${regModels.size === 0 ? "bg-[var(--accent)]/5 font-medium" : ""}`}>
+                        <input type="checkbox" checked={regModels.size === 0}
+                          onChange={() => setRegModels(new Set())}
+                          className="h-3 w-3 rounded border-gray-300 accent-[var(--accent)]" />
+                        <span>Default (from config)</span>
+                      </label>
                       {availableModels.map(m => (
-                        <option key={m.id} value={m.id}>
-                          {m.name} ({m.provider})
-                        </option>
+                        <label key={m.id} className={`flex items-center gap-2 px-2 py-1 text-[11px] border-b border-[var(--border)] last:border-b-0 cursor-pointer hover:bg-[var(--bg-hover)] ${regModels.has(m.id) ? "bg-[var(--accent)]/5 font-medium" : ""}`}>
+                          <input type="checkbox" checked={regModels.has(m.id)}
+                            onChange={() => {
+                              const next = new Set(regModels);
+                              if (next.has(m.id)) next.delete(m.id); else next.add(m.id);
+                              setRegModels(next);
+                            }}
+                            className="h-3 w-3 rounded border-gray-300 accent-[var(--accent)]" />
+                          <span className="flex-1 truncate">{m.name}</span>
+                          <span className="text-[10px] text-[var(--text-muted)] shrink-0">{m.provider}</span>
+                        </label>
                       ))}
-                    </select>
+                    </div>
+                    {regModels.size > 1 && (
+                      <div className="mt-1 text-[10px] text-[var(--accent)] font-medium">
+                        {regModels.size} models — will run sequentially
+                      </div>
+                    )}
                   </div>
                   <div>
                     <label className="text-[10px] text-[var(--text-muted)] block mb-0.5">Prompt Version</label>
@@ -782,9 +829,11 @@ export default function MonitoringPage() {
                   {regRunning ? (
                     <span className="flex items-center justify-center gap-1.5">
                       <span className="h-3 w-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                      Running...
+                      Running{regModels.size > 1 ? ` (${regModels.size} models)` : ""}...
                     </span>
-                  ) : `Run ${selectedCaseIds.size > 0 ? selectedCaseIds.size : "All Active"} Cases`}
+                  ) : (
+                    `Run ${selectedCaseIds.size > 0 ? selectedCaseIds.size : "All Active"} Cases${regModels.size > 1 ? ` × ${regModels.size} Models` : ""}`
+                  )}
                 </button>
               </div>
 
@@ -891,7 +940,7 @@ export default function MonitoringPage() {
               )}
 
               {/* Quick inline result from the last run */}
-              {regRunResult && !regRunResult.error && (
+              {regRunResult && !regRunResult.error && !regRunResult.multi_run && (
                 <div className={`card !p-3 border-l-4 ${
                   regRunResult.summary?.failed > 0 ? "border-l-red-500 bg-red-50/30" : "border-l-emerald-500 bg-emerald-50/30"
                 }`}>
@@ -901,9 +950,17 @@ export default function MonitoringPage() {
                         {regRunResult.summary?.passed}/{regRunResult.summary?.total_cases} passed
                         {regRunResult.summary?.failed > 0 && ` — ${regRunResult.summary.failed} failed`}
                       </div>
-                      <div className="text-[11px] text-[var(--text-muted)]">
-                        Run: {regRunResult.run_id} | Model: {regRunResult.model} | Prompt: {regRunResult.prompt_version}
-                        | Latency: {regRunResult.summary?.avg_latency_ms?.toFixed(0)}ms | Cost: ${regRunResult.summary?.total_cost?.toFixed(4)}
+                      <div className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)] mt-0.5 flex-wrap">
+                        <span className="font-mono">{regRunResult.run_id}</span>
+                        <button onClick={() => copyRunId(regRunResult.run_id)}
+                          className="px-1 py-0.5 rounded border border-[var(--border)] hover:bg-[var(--bg-hover)] transition-colors"
+                          title="Copy run ID">
+                          {copiedRunId === regRunResult.run_id ? "✓" : "⎘"}
+                        </button>
+                        <span>Model: {regRunResult.model || "default"}</span>
+                        <span>Prompt: {regRunResult.prompt_version}</span>
+                        <span>Latency: {regRunResult.summary?.avg_latency_ms?.toFixed(0)}ms</span>
+                        <span>Cost: ${regRunResult.summary?.total_cost?.toFixed(4)}</span>
                       </div>
                     </div>
                     <PassFailBadge pass={regRunResult.summary?.failed === 0} />
@@ -916,6 +973,35 @@ export default function MonitoringPage() {
                       <span>Trace regressions: {regRunResult.summary.regressions.trace}</span>
                     </div>
                   )}
+                </div>
+              )}
+
+              {/* Multi-model run results */}
+              {regRunResult?.multi_run && (
+                <div className="card !p-3 space-y-2">
+                  <div className="text-sm font-medium">Multi-model run — {regRunResult.runs.length} models</div>
+                  {regRunResult.runs.map((r: any, i: number) => (
+                    <div key={i} className={`rounded border p-2 ${
+                      r.summary?.failed > 0 ? "border-red-200 bg-red-50/30" : "border-emerald-200 bg-emerald-50/30"
+                    }`}>
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <div className="text-xs font-medium">{r.model || "default"} — {r.summary?.passed}/{r.summary?.total_cases} passed</div>
+                          <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-muted)] mt-0.5">
+                            <span className="font-mono">{r.run_id}</span>
+                            <button onClick={() => copyRunId(r.run_id)}
+                              className="px-1 py-0.5 rounded border border-[var(--border)] hover:bg-[var(--bg-hover)] transition-colors"
+                              title="Copy run ID">
+                              {copiedRunId === r.run_id ? "✓" : "⎘"}
+                            </button>
+                            <span>Latency: {r.summary?.avg_latency_ms?.toFixed(0)}ms</span>
+                            <span>Cost: ${r.summary?.total_cost?.toFixed(4)}</span>
+                          </div>
+                        </div>
+                        <PassFailBadge pass={r.summary?.failed === 0} />
+                      </div>
+                    </div>
+                  ))}
                 </div>
               )}
               {regRunResult?.error && (
@@ -931,10 +1017,16 @@ export default function MonitoringPage() {
                   <div className="space-y-1 max-h-[250px] overflow-y-auto">
                     {regRuns.map(r => (
                       <div key={r.id}
-                        className="flex items-center justify-between text-xs py-2 border-b border-[var(--border)] cursor-pointer hover:bg-[var(--bg-hover)]"
+                        className="flex items-center justify-between text-xs py-2 px-1 border-b border-[var(--border)] cursor-pointer hover:bg-[var(--bg-hover)]"
                         onClick={() => loadRegResults(r.id)}>
                         <div className="flex items-center gap-2">
                           <span className="font-mono text-[var(--text-muted)]">{r.id}</span>
+                          <button
+                            onClick={e => { e.stopPropagation(); copyRunId(r.id); }}
+                            className="px-1 py-0.5 rounded border border-[var(--border)] hover:bg-[var(--bg-hover)] transition-colors text-[10px]"
+                            title="Copy run ID">
+                            {copiedRunId === r.id ? "✓" : "⎘"}
+                          </button>
                           <span className="badge bg-[var(--accent-light)] text-[var(--accent)]">{r.prompt_version || "v1"}</span>
                           <span className="text-[var(--text-muted)]">{r.model}</span>
                         </div>

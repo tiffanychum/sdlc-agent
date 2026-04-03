@@ -14,7 +14,7 @@
     "max_latency_ms": 30000,
     "complexity": "quick",
     "version": "3.0",
-    "reference_output": "src/llm/client.py provides role-specific LLM factory functions: get_llm() returns a LangChain ChatOpenAI instance with the default model, get_judge_llm() returns one configured for evaluation scoring, get_rca_llm() for root-cause analysis, and get_router_llm() for lightweight request routing. Thinking models (claude-sonnet-4.6) automatically get extra_body with budget_tokens injected."
+    "reference_output": "**`src/llm/client.py`** — role-specific LLM factory functions:\n\n- `get_llm()` — default `ChatOpenAI` instance using `LLM_MODEL`\n- `get_judge_llm()` — configured for evaluation scoring using `LLM_JUDGE_MODEL`\n- `get_rca_llm()` — root-cause analysis using `LLM_RCA_MODEL`\n- `get_router_llm()` — lightweight request routing using `LLM_ROUTER_MODEL`\n\nAll functions accept an OpenAI-compatible API via `LLM_BASE_URL`. Thinking models (e.g. `claude-sonnet-4.6`) automatically receive `extra_body` with `budget_tokens` injected."
   },
   {
     "id": "golden_002",
@@ -31,7 +31,7 @@
     "max_latency_ms": 30000,
     "complexity": "quick",
     "version": "3.0",
-    "reference_output": "The src/ folder contains subdirectories: agents/, db/, evaluation/, llm/, mcp_servers/, skills/, tools/, tracing/. Each subdirectory has an __init__.py and implementation files."
+    "reference_output": "The `src/` folder structure:\n\n| Directory | Purpose |\n|-----------|----------|\n| `db/` | SQLAlchemy models and database connection |\n| `evaluation/` | Metrics, G-Eval, DeepEval, regression, RCA |\n| `llm/` | LLM client factory (multi-model) |\n| `mcp_servers/` | 5 MCP tool servers (filesystem, shell, git, web, memory) |\n| `skills/` | Skill injection engine |\n| `tools/` | MCP → LangChain tool bridge |\n| `tracing/` | OTel trace collector and callbacks |\n\nEach subdirectory contains an `__init__.py` and one or more implementation files."
   },
   {
     "id": "golden_003",
@@ -48,7 +48,7 @@
     "max_latency_ms": 30000,
     "complexity": "quick",
     "version": "3.0",
-    "reference_output": "get_judge_llm is used in evaluation/regression.py (for semantic similarity and G-Eval quality scoring), evaluation/integrations.py (for trace-based agentic metrics), and evaluation/llm_judge.py (for G-Eval CoT scoring)."
+    "reference_output": "`get_judge_llm` is imported and called in **3 files**:\n\n- **`src/evaluation/regression.py`** — used for semantic similarity scoring and G-Eval quality scoring\n- **`src/evaluation/integrations.py`** — used for trace-based agentic metrics (DeepEval)\n- **`src/evaluation/llm_judge.py`** — used for G-Eval chain-of-thought criterion scoring"
   },
   {
     "id": "golden_004",
@@ -65,7 +65,7 @@
     "max_latency_ms": 90000,
     "complexity": "quick",
     "version": "3.0",
-    "reference_output": "The test suite was executed using pytest. Results show the number of tests passed, failed, and any error details."
+    "reference_output": "**Test suite executed** via `pytest`.\n\n- **Passed**: N tests completed successfully\n- **Failed**: M tests with error details\n- **Exit code**: `0` (all pass) or non-zero (failures present)\n\nAny failures are shown with the test name, assertion error, and short traceback."
   },
   {
     "id": "golden_005",
@@ -82,7 +82,7 @@
     "max_latency_ms": 30000,
     "complexity": "quick",
     "version": "3.0",
-    "reference_output": "Git status shows the current branch and lists any modified, staged, or untracked files in the repository."
+    "reference_output": "**Git status** output:\n\n- **Branch**: current branch name\n- **Modified (unstaged)**: files with `M` prefix\n- **Staged**: files ready to commit with `A`/`M` in index\n- **Untracked**: new files not yet tracked by git\n\nEach file is listed by relative path."
   },
   {
     "id": "golden_006",
@@ -99,7 +99,7 @@
     "max_latency_ms": 60000,
     "complexity": "medium",
     "version": "3.0",
-    "reference_output": "Current LLM evaluation best practices include multi-layer assessment (rule-based, LLM-as-judge, human evaluation), domain-specific benchmarks, trajectory evaluation for agents, and automated regression testing with golden datasets."
+    "reference_output": "**LLM Evaluation Best Practices (2026)**\n\n- **Multi-layer assessment**: rule-based checks → LLM-as-judge → human evaluation\n- **Domain-specific benchmarks**: task-specific test suites over generic leaderboards\n- **Trajectory evaluation**: score agent action sequences, not just final output\n- **Golden dataset regression**: automated regression with expected outputs and budget constraints\n- **Model-as-judge quality**: G-Eval style chain-of-thought criterion scoring\n- **Agentic metrics**: tool correctness, plan quality, plan adherence, task completion\n\n*Sources cited with URLs.*"
   },
   {
     "id": "golden_007",
@@ -116,7 +116,7 @@
     "max_latency_ms": 60000,
     "complexity": "medium",
     "version": "3.1",
-    "reference_output": "Reviewed src/orchestrator.py. SUMMARY: The orchestrator uses LangGraph to build multi-agent graphs with 4 strategies (router_decides, sequential, parallel, supervisor). Verdict: PASS with improvements suggested. FINDINGS: (1) _make_agent_executor does not normalise output message types — may fail with non-BaseMessage outputs (warning). (2) Router default falls back to agents_config[0] which may not be the best default (info). (3) No retry logic for LLM failures (warning). VERIFIED: HITL tool wrapping is applied consistently, per-agent model selection works, checkpointer is injected. RECOMMENDATIONS: (1) Add output message normalisation in _make_agent_executor. (2) Add retry/fallback logic for LLM calls. (3) Cache compiled graphs to reduce startup latency."
+    "reference_output": "**SUMMARY**: `src/orchestrator.py` — LangGraph multi-agent orchestrator using 4 strategies (router_decides, sequential, parallel, supervisor). Verdict: **PASS** with improvements suggested.\n\n**FINDINGS**:\n\n| # | Location | Issue | Severity |\n|---|----------|-------|----------|\n| 1 | `_make_agent_executor` | Output messages not normalised; may fail with non-BaseMessage types | warning |\n| 2 | `_build_router_prompt` | Default falls back to `agents_config[0]` — may not be optimal | info |\n| 3 | `execute()` | No retry logic for LLM call failures | warning |\n\n**VERIFIED**:\n- HITL tool wrapping applied consistently\n- Per-agent model selection works correctly\n- MemorySaver checkpointer injected properly\n\n**RECOMMENDATIONS**:\n1. Add output message normalisation in `_make_agent_executor`\n2. Add retry/fallback logic for transient LLM errors\n3. Cache compiled graphs to reduce startup latency"
   },
   {
     "id": "golden_008",
@@ -133,7 +133,7 @@
     "max_latency_ms": 150000,
     "complexity": "medium",
     "version": "3.2",
-    "reference_output": "Plan created with steps to locate and review the MCP communication test file. File found at tests/test_mcp_communication.py. The test suite covers filesystem, shell, web, and cross-server MCP tools. Assertion gaps identified: missing edge cases for concurrent access, incomplete error message validation, and limited coverage of timeout scenarios."
+    "reference_output": "**Plan**: locate → read → assess `tests/test_mcp_communication.py`.\n\n**File**: `tests/test_mcp_communication.py`\n\n**Coverage**:\n- Filesystem MCP tools (read, write, list, search, find)\n- Shell MCP tools (run_command, run_script, run_tests)\n- Web MCP tools (web_search, fetch_url, check_url)\n- Cross-server scenarios\n\n**Assertion gaps**:\n- Missing edge cases for concurrent access\n- Incomplete error message validation\n- Limited coverage of timeout/long-running command scenarios"
   },
   {
     "id": "golden_009",
@@ -150,7 +150,7 @@
     "max_latency_ms": 120000,
     "complexity": "medium",
     "version": "3.0",
-    "reference_output": "The 5 MCP servers (filesystem, shell, git, web, memory) share common patterns: each uses mcp.server.Server with @server.list_tools() and @server.call_tool() decorators, dataclass-based state tracking, _safe_path or equivalent sandboxing, and TextContent return types."
+    "reference_output": "**Common patterns across all 5 MCP servers** (`filesystem`, `shell`, `git`, `web`, `memory`):\n\n| Pattern | Detail |\n|---------|--------|\n| Server init | `mcp.server.Server` with server name |\n| Tool registration | `@server.list_tools()` decorator |\n| Tool execution | `@server.call_tool()` handler |\n| State tracking | Dataclass-based state object |\n| Path safety | `_safe_path()` or equivalent sandboxing |\n| Return type | `TextContent` with string `text` field |"
   },
   {
     "id": "golden_010",
@@ -167,7 +167,7 @@
     "max_latency_ms": 60000,
     "complexity": "medium",
     "version": "3.1",
-    "reference_output": "Recent git commits were reviewed using git_log and git_diff/git_show. The review identifies the latest commit, summarizes the nature of the changes (new features, bug fixes, refactors), and assesses whether the changes follow best practices such as clear commit messages, modular design, documentation updates, and security awareness. Specific file:line references and severity ratings are provided for any findings."
+    "reference_output": "**SUMMARY**: Recent git commits reviewed via `git_log` and `git_diff`. Verdict: **PASS** / **NEEDS WORK** (based on findings).\n\n**Latest commit**: `<hash>` — `<message>`\n\n**ASSESSMENT**:\n\n| Criterion | Status |\n|-----------|--------|\n| Commit message clarity | ✅ / ⚠️ |\n| Modular, isolated changes | ✅ / ⚠️ |\n| Documentation updated | ✅ / ⚠️ |\n| No security issues introduced | ✅ / ⚠️ |\n\n**FINDINGS**: Specific `file:line` references with severity ratings (critical / warning / info) for any issues.\n\n**RECOMMENDATIONS**: Up to 3 actionable next steps."
   },
   {
     "id": "golden_011",
@@ -184,7 +184,7 @@
     "max_latency_ms": 60000,
     "complexity": "quick",
     "version": "3.0",
-    "reference_output": "Pytest was executed with verbose output. Results list individual test pass/fail status for filesystem, shell, web, and cross-server MCP tests, with brief failure analysis for any failed tests."
+    "reference_output": "**Command**: `python -m pytest tests/test_mcp_communication.py -v --tb=short`\n\n**Results**:\n- Individual pass/fail status listed per test function\n- Coverage: filesystem, shell, web, and cross-server MCP tests\n- **Exit code**: `0` (all pass) or non-zero (failures)\n\nFor each failure:\n- Test name and assertion that failed\n- Short traceback (`--tb=short`)\n- Brief root-cause explanation"
   },
   {
     "id": "golden_012",
@@ -201,7 +201,7 @@
     "max_latency_ms": 180000,
     "complexity": "complex",
     "version": "3.0",
-    "reference_output": "Test files were discovered in the tests/ directory. Tests were executed and results analyzed. For any failures, the relevant source code was examined to identify the root cause."
+    "reference_output": "**Plan**: discover → run → debug.\n\n1. **Test discovery**: `tests/` contains `test_mcp_communication.py` and `test_evaluation.py`\n2. **Test execution**: pytest run with pass/fail counts\n3. **Failure analysis**: for each failing test, source code read and root cause identified\n\n**Outcome**:\n- All passing tests listed\n- Failing tests listed with root cause (e.g. missing mock, import error, logic bug)"
   },
   {
     "id": "golden_013",
@@ -218,7 +218,7 @@
     "max_latency_ms": 300000,
     "complexity": "complex",
     "version": "3.0",
-    "reference_output": "The SDLC agent system consists of: 5 MCP tool servers (filesystem, shell, git, web, memory), a LangGraph orchestrator with 4 strategies (router_decides, sequential, parallel, supervisor), 5 specialized agents (coder, runner, researcher, planner, reviewer) with per-agent model selection, a multi-model architecture (agent/judge/RCA tiers), and a three-layer evaluation framework (rule-based, G-Eval, DeepEval). Key recommendations include adding error recovery, improving context management, and implementing caching."
+    "reference_output": "**SDLC Agent Architecture Audit**\n\n**MCP Servers (5)**:\n- `filesystem_server.py` — 6 tools (read, write, edit, search, find, list)\n- `shell_server.py` — 3 tools (command, script, tests)\n- `git_server.py` — 6 tools (status, diff, log, commit, branch, show)\n- `web_server.py` — 3 tools (fetch, search, check)\n- `memory_server.py` — 6 tools (store, retrieve, list, delete, plan, update)\n\n**Orchestrator**: LangGraph with 4 strategies — router_decides, sequential, parallel, supervisor. MemorySaver checkpointer for HITL.\n\n**Agents (5)**: Coder (ReAct), Runner (ReAct), Researcher (ReAct), Planner (Plan+Execute), Reviewer (Reflexion).\n\n**Evaluation Pipeline (3 layers)**:\n1. Rule-based (7 metrics) — deterministic, zero LLM cost\n2. G-Eval (5 criteria) — LLM-as-judge with chain-of-thought\n3. DeepEval (8 agentic metrics) — tool correctness, plan quality, task completion\n\n**Recommendations**:\n1. Add retry/fallback logic for transient LLM failures\n2. Improve context management to reduce token usage per task\n3. Cache compiled LangGraph graphs to reduce startup latency"
   },
   {
     "id": "golden_014",
@@ -235,6 +235,6 @@
     "max_latency_ms": 120000,
     "complexity": "complex",
     "version": "3.0",
-    "reference_output": "Security review of MCP servers reveals: filesystem_server.py has _safe_path() for directory traversal prevention, shell_server.py has BLOCKED_COMMANDS allowlist, but web_server.py lacks URL validation against SSRF. Recommendations include adding input sanitization, URL allowlisting, and rate limiting."
+    "reference_output": "**SUMMARY**: Security review of `src/mcp_servers/`. Verdict: **NEEDS WORK**.\n\n**FINDINGS**:\n\n| File | Finding | Severity |\n|------|---------|----------|\n| `filesystem_server.py` | `_safe_path()` prevents directory traversal ✅ | pass |\n| `shell_server.py` | `BLOCKED_COMMANDS` allowlist in place ✅ | pass |\n| `web_server.py` | No URL validation — SSRF risk ⚠️ | warning |\n| All servers | Incomplete input sanitization | warning |\n\n**VERIFIED**: Path traversal protection in `filesystem_server.py` is functional.\n\n**RECOMMENDATIONS**:\n1. Add URL allowlisting/validation to `web_server.py` to prevent SSRF\n2. Add input sanitization to all tool argument handlers\n3. Implement rate limiting to prevent tool abuse"
   }
 ]

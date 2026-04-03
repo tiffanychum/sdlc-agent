@@ -239,10 +239,10 @@ class RegressionRunner:
 Consider meaning equivalence, not exact wording. 0.0 = completely unrelated, 1.0 = identical meaning.
 
 REFERENCE TEXT:
-{reference[:3000]}
+{reference}
 
 ACTUAL TEXT:
-{actual[:3000]}
+{actual}
 
 Respond with ONLY a JSON object: {{"score": <float>, "reasoning": "<brief explanation>"}}"""
         try:
@@ -286,7 +286,7 @@ EXECUTION TRACE:
 {trace_text[:1200]}
 
 AGENT OUTPUT:
-{actual_output[:3000]}
+{actual_output}
 
 First explain your reasoning step by step, then give a score.
 Respond with ONLY JSON: {{"reasoning": "<step-by-step analysis>", "score": <1-5>}}
