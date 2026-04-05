@@ -161,7 +161,7 @@ export default function MonitoringPage() {
     <div className="space-y-5 max-w-6xl">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-xl font-semibold">Monitoring & Observability</h1>
+        <h1 className="text-xl font-semibold">Monitoring & Observability</h1>
           <p className="text-xs text-[var(--text-muted)] mt-0.5">Agent performance, cost, latency and OTel tracing</p>
         </div>
         <div className="flex items-center gap-2">
@@ -173,7 +173,7 @@ export default function MonitoringPage() {
       </div>
 
       {/* Tabs */}
-        <div className="flex gap-1 border-b border-[var(--border)]">
+      <div className="flex gap-1 border-b border-[var(--border)]">
         {([
           { id: "overview" as const, label: "Overview" },
           { id: "otel" as const, label: "OTel Observability" },
@@ -235,11 +235,11 @@ export default function MonitoringPage() {
           {ragStats && ragStats.total_queries > 0 && (
             <div className="card space-y-3">
               <div className="flex items-center justify-between">
-                <div>
+                  <div>
                   <h2 className="text-sm font-medium">RAG Pipeline</h2>
                   <p className="text-[11px] text-[var(--text-muted)]">{ragStats.total_queries} queries · {ragStats.queries_with_eval} evaluated · {ragStats.pending_eval} pending</p>
-                </div>
-              </div>
+                  </div>
+                  </div>
               <div className="grid grid-cols-4 gap-3">
                 <div className="bg-zinc-50 rounded-lg p-3 text-center">
                   <div className="text-lg font-semibold">{ragStats.total_queries}</div>
@@ -248,18 +248,18 @@ export default function MonitoringPage() {
                 <div className="bg-zinc-50 rounded-lg p-3 text-center">
                   <div className="text-lg font-semibold">{ragStats.avg_latency_ms?.toFixed(0)}ms</div>
                   <div className="text-[10px] text-zinc-400 mt-0.5">Avg Latency</div>
-                </div>
+                  </div>
                 <div className="bg-zinc-50 rounded-lg p-3 text-center">
                   <div className="text-lg font-semibold">{ragStats.avg_tokens?.toLocaleString()}</div>
                   <div className="text-[10px] text-zinc-400 mt-0.5">Avg Tokens</div>
-                </div>
+                        </div>
                 <div className="bg-zinc-50 rounded-lg p-3 text-center">
                   <div className="text-lg font-semibold">{ragStats.queries_with_eval}</div>
                   <div className="text-[10px] text-zinc-400 mt-0.5">Evaluated</div>
-                </div>
-              </div>
+                        </div>
+                        </div>
               {Object.keys(ragStats.avg_scores || {}).length > 0 && (
-                <div>
+                            <div>
                   <div className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wide mb-2">Avg DeepEval Scores</div>
                   <div className="grid grid-cols-5 gap-2">
                     {[
@@ -275,20 +275,20 @@ export default function MonitoringPage() {
                         <div key={m.key} className={`rounded-lg p-2 text-center border ${pct == null ? "border-zinc-100 bg-zinc-50" : pct >= 70 ? "border-emerald-100 bg-emerald-50" : pct >= 40 ? "border-amber-100 bg-amber-50" : "border-red-100 bg-red-50"}`}>
                           <div className={`text-sm font-semibold ${pct == null ? "text-zinc-300" : pct >= 70 ? "text-emerald-700" : pct >= 40 ? "text-amber-600" : "text-red-600"}`}>
                             {pct != null ? `${pct}%` : "—"}
-                          </div>
+                            </div>
                           <div className="text-[9px] text-zinc-400 mt-0.5 leading-tight">{m.label}</div>
-                        </div>
+                              </div>
                       );
                     })}
-                  </div>
-                </div>
-              )}
+                          </div>
+                        </div>
+                      )}
             </div>
           )}
 
           {/* Charts row */}
           <div className="grid grid-cols-2 gap-4">
-            <div className="card">
+              <div className="card">
               <h2 className="text-sm font-medium mb-0.5">Latency per Request</h2>
               <p className="text-[11px] text-[var(--text-muted)] mb-3">Per-request end-to-end latency (last 30 requests)</p>
               {latencyData.length > 0 ? (
@@ -302,9 +302,9 @@ export default function MonitoringPage() {
                   </AreaChart>
                 </ResponsiveContainer>
               ) : <div className="text-sm text-[var(--text-muted)] text-center py-10">No traces yet</div>}
-            </div>
+                </div>
 
-            <div className="card">
+                <div className="card">
               <h2 className="text-sm font-medium mb-0.5">Cost per Request</h2>
               <p className="text-[11px] text-[var(--text-muted)] mb-3">Estimated cost per run based on token usage × model rates</p>
               {latencyData.length > 0 ? (
@@ -318,17 +318,17 @@ export default function MonitoringPage() {
                   </BarChart>
                 </ResponsiveContainer>
               ) : <div className="text-sm text-[var(--text-muted)] text-center py-10">No traces yet</div>}
-            </div>
-          </div>
+                        </div>
+                        </div>
 
           {/* Per-Model Performance */}
           {modelData.length > 0 && (
-            <div className="card">
+              <div className="card">
               <h2 className="text-sm font-medium mb-0.5">Per-Model Performance</h2>
               <p className="text-[11px] text-[var(--text-muted)] mb-3">Aggregated cost, token usage and call volume per LLM model (30-day window)</p>
               <div className="overflow-x-auto">
-                <table className="w-full text-xs">
-                  <thead>
+                    <table className="w-full text-xs">
+                      <thead>
                     <tr className="text-[10px] text-[var(--text-muted)] uppercase bg-[var(--bg)]">
                       <th className="text-left px-3 py-2">Model</th>
                       <th className="text-right px-3 py-2">LLM Calls</th>
@@ -337,20 +337,20 @@ export default function MonitoringPage() {
                       <th className="text-right px-3 py-2">Total Cost</th>
                       <th className="text-right px-3 py-2">Cost/Call</th>
                       <th className="px-3 py-2">Distribution</th>
-                    </tr>
-                  </thead>
-                  <tbody>
+                        </tr>
+                      </thead>
+                      <tbody>
                     {modelData.map((m, i) => {
                       const totalCalls = modelData.reduce((s, x) => s + x.count, 0);
                       const pct = totalCalls > 0 ? m.count / totalCalls : 0;
                       return (
                         <tr key={m.model} className="border-t border-[var(--border)]">
-                          <td className="px-3 py-2">
+                            <td className="px-3 py-2">
                             <div className="flex items-center gap-2">
                               <span className="w-2.5 h-2.5 rounded-sm" style={{ background: m.color }} />
                               <span className="font-mono">{m.shortModel}</span>
                             </div>
-                          </td>
+                            </td>
                           <td className="text-right px-3 py-2 font-semibold">{m.count.toLocaleString()}</td>
                           <td className="text-right px-3 py-2">{m.tokens_in.toLocaleString()}</td>
                           <td className="text-right px-3 py-2">{m.tokens_out.toLocaleString()}</td>
@@ -363,14 +363,14 @@ export default function MonitoringPage() {
                               </div>
                               <span className="text-[10px] text-[var(--text-muted)] w-8 shrink-0">{(pct * 100).toFixed(0)}%</span>
                             </div>
-                          </td>
-                        </tr>
+                            </td>
+                          </tr>
                       );
                     })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+                      </tbody>
+                    </table>
+                  </div>
+                    </div>
           )}
 
           {/* Per-Agent Activity + Tool Usage */}
@@ -381,8 +381,8 @@ export default function MonitoringPage() {
               <p className="text-[11px] text-[var(--text-muted)] mb-3">Calls, avg latency, avg cost and top tools per agent (derived from traces)</p>
               {agentStats.length > 0 ? (
                 <div className="overflow-x-auto">
-                  <table className="w-full text-xs">
-                    <thead>
+                        <table className="w-full text-xs">
+                          <thead>
                       <tr className="text-[10px] text-[var(--text-muted)] uppercase bg-[var(--bg)]">
                         <th className="text-left px-2 py-1.5">Agent</th>
                         <th className="text-right px-2 py-1.5">Calls</th>
@@ -390,14 +390,14 @@ export default function MonitoringPage() {
                         <th className="text-right px-2 py-1.5">Avg Cost</th>
                         <th className="text-right px-2 py-1.5">Avg Tokens</th>
                         <th className="px-2 py-1.5">Top Tools</th>
-                      </tr>
-                    </thead>
-                    <tbody>
+                            </tr>
+                          </thead>
+                          <tbody>
                       {agentStats.map(a => (
                         <tr key={a.agent} className="border-t border-[var(--border)]">
                           <td className="px-2 py-1.5">
                             <span className="px-1.5 py-0.5 rounded bg-zinc-100 text-zinc-600 text-[10px] border border-zinc-200 font-medium">{a.agent}</span>
-                          </td>
+                                </td>
                           <td className="text-right px-2 py-1.5 font-semibold">{a.calls}</td>
                           <td className="text-right px-2 py-1.5">{a.avgLatency > 0 ? `${a.avgLatency.toLocaleString()}ms` : "—"}</td>
                           <td className="text-right px-2 py-1.5">{a.avgCost > 0 ? `$${a.avgCost.toFixed(4)}` : "—"}</td>
@@ -409,19 +409,19 @@ export default function MonitoringPage() {
                               ))}
                               {a.topTools.length === 0 && <span className="text-[var(--text-muted)]">—</span>}
                             </div>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
               ) : (
                 <div className="text-sm text-[var(--text-muted)] text-center py-8">No agent span data yet — run some chat requests</div>
               )}
-            </div>
+                  </div>
 
             {/* Tool Usage */}
-            <div className="card">
+              <div className="card">
               <h2 className="text-sm font-medium mb-0.5">Tool Call Frequency</h2>
               <p className="text-[11px] text-[var(--text-muted)] mb-3">Most used tools across all recent requests</p>
               {toolUsage.length > 0 ? (
@@ -433,15 +433,15 @@ export default function MonitoringPage() {
                     <Tooltip {...tip} />
                     <Bar dataKey="count" name="Calls" fill="#10b981" radius={[0, 3, 3, 0]} />
                   </BarChart>
-                </ResponsiveContainer>
+                      </ResponsiveContainer>
               ) : (
                 <div className="text-sm text-[var(--text-muted)] text-center py-8">No tool call data yet</div>
               )}
-            </div>
-          </div>
+                            </div>
+                              </div>
 
           {/* Operational percentiles */}
-          <div className="card">
+                    <div className="card">
             <h2 className="text-sm font-medium mb-3">Operational Efficiency (P-Percentiles)</h2>
             <table className="w-full text-sm">
               <thead><tr className="text-[var(--text-muted)] text-xs">
@@ -452,7 +452,7 @@ export default function MonitoringPage() {
                 <th className="text-right">P99</th>
                 <th className="text-right">Total</th>
               </tr></thead>
-              <tbody>
+                          <tbody>
                 <tr className="border-t border-[var(--border)]">
                   <td className="py-2 font-medium">End-to-End Latency</td>
                   <td className="text-right">{avgLatency.toFixed(0)}ms</td>
@@ -460,7 +460,7 @@ export default function MonitoringPage() {
                   <td className="text-right">{(stats?.p95_latency_ms || 0).toFixed(0)}ms</td>
                   <td className="text-right">{(stats?.p99_latency_ms || 0).toFixed(0)}ms</td>
                   <td className="text-right text-[var(--text-muted)]">—</td>
-                </tr>
+                                  </tr>
                 <tr className="border-t border-[var(--border)]">
                   <td className="py-2 font-medium">Tokens per Run</td>
                   <td className="text-right">{avgTokensPerRun.toLocaleString()}</td>
@@ -479,16 +479,16 @@ export default function MonitoringPage() {
                     <span className={failures > 0 ? "text-red-600 font-semibold" : "text-emerald-600"}>
                       {totalRuns > 0 ? ((failures / totalRuns) * 100).toFixed(1) : "0"}% ({failures} / {totalRuns} requests)
                     </span>
-                  </td>
+                                      </td>
                   <td />
-                </tr>
-              </tbody>
-            </table>
-          </div>
+                                    </tr>
+                          </tbody>
+                        </table>
+                      </div>
 
           {/* Quality Trends */}
           {qualityData.length > 0 && (
-            <div className="card">
+                    <div className="card">
               <h2 className="text-sm font-medium mb-0.5">Quality Trends (Eval Runs)</h2>
               <p className="text-[11px] text-[var(--text-muted)] mb-3">Task success, tool accuracy, routing accuracy and faithfulness over evaluation runs</p>
               <ResponsiveContainer width="100%" height={200}>
@@ -504,11 +504,11 @@ export default function MonitoringPage() {
                   <Line type="monotone" dataKey="faithfulness" name="Faithfulness" stroke="#0891b2" strokeWidth={1.5} dot={{ r: 2 }} />
                 </LineChart>
               </ResponsiveContainer>
-            </div>
-          )}
+                    </div>
+                  )}
 
           {/* Recent requests */}
-          <div className="card">
+                  <div className="card">
             <h2 className="text-sm font-medium mb-3">Recent Requests</h2>
             <div className="space-y-0">
               {traces.slice(0, 15).map((t: any) => {
@@ -516,7 +516,7 @@ export default function MonitoringPage() {
                 const agentName = agentSpan ? (agentSpan.name || "").replace(/^agent_execution:/, "").replace(/^agent:/, "") : null;
                 const toolCount = (t.spans || []).filter((s: any) => s.span_type === "tool_call").length;
                 const llmCount = (t.spans || []).filter((s: any) => s.span_type === "llm_call").length;
-                return (
+                            return (
                   <div key={t.id} className="flex items-center gap-3 py-2 border-b border-[var(--border)] text-xs">
                     <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${t.status === "completed" ? "bg-emerald-500" : "bg-red-500"}`} />
                     <span className="flex-1 truncate text-[var(--text-muted)]">{t.user_prompt}</span>
@@ -530,13 +530,13 @@ export default function MonitoringPage() {
                       <span>${(t.total_cost || 0).toFixed(4)}</span>
                     </div>
                   </div>
-                );
-              })}
+                              );
+                            })}
               {traces.length === 0 && (
                 <div className="text-[var(--text-muted)] text-center py-8">No traces yet — send chat messages to generate data</div>
-              )}
+                  )}
+                </div>
             </div>
-          </div>
         </div>
       )}
 
@@ -682,16 +682,16 @@ export default function MonitoringPage() {
                                 {m.split("/").pop() || m}
                               </span>
                             ))}
-                          </div>
+                    </div>
                         )}
                       </div>
                       <div className="flex items-center gap-1.5 shrink-0 flex-wrap justify-end">
-                        {Object.entries(spanCounts).map(([type, count]) => (
-                          <span key={type} className="px-1.5 py-0.5 rounded text-[9px] border"
+                      {Object.entries(spanCounts).map(([type, count]) => (
+                        <span key={type} className="px-1.5 py-0.5 rounded text-[9px] border"
                             style={{ borderColor: SPAN_COLORS[type] || "#6b7280", color: SPAN_COLORS[type] || "#6b7280" }}>
-                            {type.replace(/_/g, " ")} ×{count}
-                          </span>
-                        ))}
+                          {type.replace(/_/g, " ")} ×{count}
+                        </span>
+                      ))}
                         <span className="text-[10px] text-[var(--text-muted)] ml-1">{(t.total_latency_ms || 0).toFixed(0)}ms</span>
                         <span className="text-[10px] text-[var(--text-muted)]">${(t.total_cost || 0).toFixed(4)}</span>
                       </div>
@@ -716,9 +716,9 @@ export default function MonitoringPage() {
                 <div key={item.title} className="p-2.5 rounded bg-zinc-50 border border-zinc-200 text-[var(--text-muted)]">
                   <div className="font-medium text-zinc-700 mb-1">{item.title}</div>
                   <div>{item.body}</div>
-                </div>
+              </div>
               ))}
-            </div>
+              </div>
           </div>
         </div>
       )}

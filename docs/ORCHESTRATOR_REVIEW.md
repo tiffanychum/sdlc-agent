@@ -1,232 +1,314 @@
 # Orchestrator Maintainability Review
 
-> **File reviewed:** `src/orchestrator.py`  
-> **Review scope:** Top 3 maintainability issues  
-> **Lines of code:** 610
+**File:** `src/orchestrator.py`  
+**Lines:** 811  
+**Reviewed:** 2024  
+**Verdict:** needs-work
 
 ---
 
-## Issue 1 — God Function: `build_orchestrator_from_team` Does Too Much
+## Issue 1: Monolithic File Structure
 
 ### Description
+The `orchestrator.py` file is 811 lines long and handles multiple distinct responsibilities:
+- Strategy selection (meta-router logic, lines 75-162)
+- Graph building for 4 different strategies (router, sequential, parallel, supervisor)
+- Agent execution and handoff coordination
+- Database queries and ORM operations (lines 368-414)
+- Prompt templates and routing logic
+- State management and synthesis
 
-`build_orchestrator_from_team` (lines 322–423) is a single ~100-line async function that
-is responsible for at least **five distinct concerns**:
+This violates the Single Responsibility Principle and makes the file difficult to navigate, test, and maintain. Changes to one strategy risk breaking others, and the cognitive load for understanding the entire orchestration system is high.
 
-1. Opening and querying the database (Teams, Agents, AgentToolMappings)
-2. Resolving the orchestration strategy
-3. Iterating over agents to assemble tool lists per agent
-4. Applying HITL wrappers (`wrap_dangerous_tool`, `wrap_reviewable_tool`, `ask_human`)
-5. Building LLM instances and `create_react_agent` objects
-6. Dispatching to one of four graph-builder functions
+**Affected Lines:** Entire file (1-811)
 
-Because all of this lives in one function, any single change — e.g. adding a new HITL
-wrapper type, changing how tools are loaded, or altering strategy resolution — requires
-reading and reasoning about the entire function. It is also effectively untestable in
-isolation: you cannot unit-test tool assembly without also triggering a real database
-query, and you cannot test DB loading without also triggering LLM construction.
-
-**Specific symptoms:**
-- The function has at least 3 levels of nested loops (`for ac in agents_config` → `for group
-  in ac["tool_groups"]` → `for t in agent_tools`).
-- The `try/except/finally` DB block and the tool-assembly loop are at the same indentation
-  level with no visual or logical boundary between them.
-- The `model_override` mutation loop (lines 378–380) is a side-effectful pass that alters
-  shared config dicts in-place.
+**Severity:** WARNING
 
 ### Suggested Fix
+Refactor into a modular structure:
 
-Decompose the function into focused, single-responsibility helpers:
-
-```python
-# 1. Pure DB concern — returns plain dicts, no LLM objects
-async def _load_team_config(team_id: str) -> tuple[str, list[dict]]:
-    """Return (strategy, agents_config) from the database."""
-    ...
-
-# 2. Pure tool concern — returns a list of (possibly-wrapped) StructuredTools
-def _build_agent_tools(
-    ac: dict,
-    tool_map: dict,
-) -> list[StructuredTool]:
-    """Assemble and HITL-wrap tools for a single agent config dict."""
-    ...
-
-# 3. Pure LLM / agent concern
-def _build_react_agent(ac: dict, tools: list, model_override=None):
-    """Construct the LLM and create_react_agent for one agent."""
-    ...
-
-# 4. Thin orchestrator — composes the above
-async def build_orchestrator_from_team(
-    team_id: str = "default",
-    model_override=None,
-    strategy_override: str = None,
-):
-    strategy, agents_config = await _load_team_config(team_id)
-    if strategy_override and strategy_override in VALID_STRATEGIES:
-        strategy = strategy_override
-    tool_map = await get_all_tools()
-    built_agents, exec_agents = {}, {}
-    for ac in agents_config:
-        tools = _build_agent_tools(ac, tool_map)
-        built_agents[ac["role"]] = _build_react_agent(ac, tools, model_override)
-        ...
-    return builders[strategy](agents_config, built_agents, ...)
+```
+src/orchestrator/
+├── __init__.py
+├── state.py              # OrchestratorState, reducers
+├── strategies/
+│   ├── __init__.py
+│   ├── router.py         # _build_router_graph
+│   ├── sequential.py     # _build_sequential_graph
+│   ├── parallel.py       # _build_parallel_graph
+│   └── supervisor.py     # _build_supervisor_graph
+├── synthesis.py          # _synthesize_outputs (unified)
+├── meta_router.py        # select_strategy_auto, _heuristic_strategy
+├── prompts.py            # All prompt templates
+└── builder.py            # build_orchestrator_from_team (DB logic)
 ```
 
-This structure means each helper can be unit-tested independently with mocks, and future
-changes (e.g. a new wrapping strategy) are localised to one small function.
+**Benefits:**
+- Each file has a single, clear responsibility
+- Easier to test individual strategies in isolation
+- Reduces merge conflicts in team environments
+- Improves code discoverability
 
 ---
 
-## Issue 2 — Prompt Strings Embedded as Raw f-strings Inside Logic Functions
+## Issue 2: Duplicated Synthesis Logic
 
 ### Description
+Three separate functions implement nearly identical synthesis logic:
+1. `_synthesize_outputs()` (lines 515-571) — used by sequential and supervisor
+2. `_merge()` inside `_build_parallel_graph()` (lines 611-646)
+3. Wrapper functions `_seq_synthesize()` and `_sup_synthesize()` (lines 587-588, 771-772)
 
-Two large natural-language prompt templates are constructed inline inside logic functions:
+All three:
+- Extract the original user request from messages
+- Collect AI agent outputs
+- Call an LLM with a synthesis prompt
+- Return a unified response
 
-- **Router prompt** — `_build_router_prompt` (lines 230–280): a 50-line f-string that
-  mixes routing rules, agent descriptions, and formatting directly in a Python function.
-- **Supervisor prompt** — inside `_build_supervisor_graph` (lines 525–530): a multi-line
-  f-string constructed at graph-build time inside a graph-builder function.
+The only differences are minor prompt wording variations ("sequential" vs "parallel" vs "supervisor"). This violates the DRY (Don't Repeat Yourself) principle and creates maintenance burden: bug fixes or improvements must be applied in three places.
 
-This pattern creates several problems:
+**Affected Lines:** 515-571, 587-588, 611-646, 771-772
 
-1. **Untestable in isolation.** The prompt content cannot be verified without calling the
-   full builder function. There is no way to assert "the router prompt contains rule 3"
-   without constructing a full `agents_config` fixture.
-2. **No versioning or swapping.** Changing from one prompt style to another (e.g. for a
-   different LLM provider that needs a different format) requires editing the middle of a
-   logic function rather than swapping a template.
-3. **Mixed abstraction levels.** `_build_router_prompt` is named as if it returns a string,
-   but it also encodes business rules (Jira routing, file access priority, etc.) that belong
-   in a configuration layer, not in a Python string literal.
-4. **The supervisor prompt** is not even extracted to a named constant or builder — it is
-   an anonymous f-string on lines 525–530, making it invisible to a reader scanning the
-   module's top-level symbols.
+**Severity:** WARNING
 
 ### Suggested Fix
-
-Extract all prompt templates into a dedicated module (e.g. `src/prompts/orchestrator.py`)
-as named template strings, and use `.format()` or a lightweight templating approach:
+Create a single, parameterized synthesis function:
 
 ```python
-# src/prompts/orchestrator.py
+async def synthesize_agent_outputs(
+    state: OrchestratorState,
+    mode: str = "multi-agent",
+    custom_instructions: str = ""
+) -> OrchestratorState:
+    """Unified synthesis for all orchestration strategies.
+    
+    Args:
+        state: Current orchestrator state with messages.
+        mode: Strategy label for logging ("sequential", "parallel", "supervisor").
+        custom_instructions: Optional extra guidance for the synthesis LLM.
+    """
+    msgs = _ensure_messages(state["messages"])
+    
+    user_request = next(
+        (m.content for m in msgs if isinstance(m, HumanMessage)), None
+    )
+    if not user_request:
+        logger.debug("%s synthesizer: no user request found, skipping.", mode)
+        return {}
+    
+    agent_outputs = [
+        m for m in msgs
+        if isinstance(m, AIMessage) and len(_extract_text(m.content).strip()) > 50
+    ]
+    if len(agent_outputs) <= 1:
+        return {}
+    
+    base_instructions = (
+        f"You are a synthesizer for a {mode} multi-agent workflow. "
+        "Multiple agents have completed their parts of a task. "
+        "Combine their outputs into ONE final, coherent response that directly "
+        "and completely answers the user's original request. "
+        "Preserve all important details (file paths, code, results, URLs). "
+        "Remove redundant preamble and agent self-introductions. "
+        "Structure the response clearly with headers if it spans multiple topics."
+    )
+    
+    synthesis_system = base_instructions + ("\n\n" + custom_instructions if custom_instructions else "")
+    
+    try:
+        llm = get_llm()
+        response = await llm.ainvoke([
+            SystemMessage(content=synthesis_system),
+            *msgs,
+            HumanMessage(content=(
+                f"Original request: {user_request}\n\n"
+                "Produce the single unified final answer now."
+            )),
+        ])
+        logger.info("%s synthesizer: produced unified response (%d chars).",
+                    mode, len(_extract_text(response.content)))
+        return {"messages": [response]}
+    except Exception as exc:
+        logger.warning("%s synthesizer LLM call failed (%s); returning raw outputs.", mode, exc)
+        return {}
+```
 
-ROUTER_PROMPT_TEMPLATE = """\
-You are a routing agent. Select the SINGLE best-fit agent ...
+Then replace all three implementations with calls to this function:
+
+```python
+# In _build_sequential_graph:
+async def _seq_synthesize(state: OrchestratorState) -> OrchestratorState:
+    return await synthesize_agent_outputs(state, mode="sequential")
+
+# In _build_parallel_graph:
+async def _merge(state: OrchestratorState) -> OrchestratorState:
+    return await synthesize_agent_outputs(
+        state, 
+        mode="parallel",
+        custom_instructions="If agents produced conflicting information, note the discrepancy."
+    )
+
+# In _build_supervisor_graph:
+async def _sup_synthesize(state: OrchestratorState) -> OrchestratorState:
+    return await synthesize_agent_outputs(state, mode="supervisor")
+```
+
+**Benefits:**
+- Single source of truth for synthesis logic
+- Bug fixes apply everywhere automatically
+- Easier to add new synthesis features (e.g., structured output, citations)
+- Reduces code size by ~80 lines
+
+---
+
+## Issue 3: Hardcoded Prompts Scattered Throughout Code
+
+### Description
+Large, multi-line prompt templates are embedded directly in the code at multiple locations:
+- `_META_ROUTER_PROMPT` (lines 41-72) — 32 lines
+- `STRATEGY_INSTRUCTIONS` dict (lines 200-212) — 13 lines
+- `_build_router_prompt()` function (lines 235-285) — 51 lines
+- `supervisor_prompt` in `_build_supervisor_graph()` (lines 680-701) — 22 lines
+
+**Problems:**
+1. **Prompt engineering is difficult** — Iterating on prompts requires navigating Python code, not dedicated prompt files
+2. **Version control noise** — Prompt tweaks create large diffs mixed with code changes
+3. **No prompt reusability** — Can't easily A/B test prompts or load them from external sources
+4. **Localization impossible** — No path to multi-language support
+5. **Hard to review** — Prompt quality reviews require reading Python source
+
+**Affected Lines:** 41-72, 200-212, 235-285, 680-701
+
+**Severity:** INFO
+
+### Suggested Fix
+Extract all prompts to a dedicated prompts module or configuration files:
+
+**Option A: Python module (immediate, low-risk)**
+
+Create `src/orchestrator/prompts.py`:
+
+```python
+"""Prompt templates for orchestrator strategies."""
+
+META_ROUTER_PROMPT = """\
+You are an orchestration meta-router. Given a user task and available agents, choose the best \
+multi-agent execution strategy.
 
 Available agents:
 {agent_descs}
 
-Routing rules:
+Strategy options and when to use each:
+- "router_decides" — Route to exactly ONE agent. Use when the task is a single, self-contained
+  action (read a file, run a search, check git status). One agent can do it all alone.
 ...
-
-Respond with ONLY the agent name from: {agent_names}.\
 """
 
-SUPERVISOR_PROMPT_TEMPLATE = """\
-You are a supervisor agent. Decide which agent handles the task, or if it's complete.
+STRATEGY_INSTRUCTIONS = {
+    "react": """## Decision Strategy: ReAct (Reason + Act)
+Think step by step: 1) Reason about what to do next 2) Take ONE action using a tool 3) Observe the result 4) Repeat until done. Always act, never just describe.""",
+    # ... etc
+}
 
-Available agents:
-{agent_descs}
+def build_router_prompt(agents_config: list[dict]) -> str:
+    """Generate the router prompt from agent configuration."""
+    agent_descs = "\n".join(f'- "{a["role"]}": {a["description"]}' for a in agents_config)
+    agent_names = ", ".join(f'"{a["role"]}"' for a in agents_config)
+    return f"""You are a routing agent. Select the SINGLE best-fit agent for the FIRST step of the task.
+...
+Respond with ONLY the agent name from: {agent_names}."""
 
-Respond with ONLY "DONE" or an agent name ({agent_names}).\
-"""
+def build_supervisor_prompt(agents_config: list[dict]) -> str:
+    """Generate the supervisor prompt from agent configuration."""
+    # ... implementation
 ```
 
 Then in `orchestrator.py`:
 
 ```python
-from src.prompts.orchestrator import ROUTER_PROMPT_TEMPLATE, SUPERVISOR_PROMPT_TEMPLATE
-
-def _build_router_prompt(agents_config: list[dict]) -> str:
-    return ROUTER_PROMPT_TEMPLATE.format(
-        agent_descs=...,
-        agent_names=...,
-    )
+from src.orchestrator.prompts import (
+    META_ROUTER_PROMPT,
+    STRATEGY_INSTRUCTIONS,
+    build_router_prompt,
+    build_supervisor_prompt,
+)
 ```
 
-Benefits: prompts become independently testable, can be loaded from files or a database,
-and changes to routing rules no longer touch the graph-building logic.
+**Option B: External YAML/JSON files (better for non-engineers)**
 
----
+Create `prompts/orchestrator.yaml`:
 
-## Issue 3 — Silent Exception Swallowing in the Database Block
-
-### Description
-
-The database query block in `build_orchestrator_from_team` (lines 369–373) uses:
-
-```python
-except Exception:
-    session.rollback()
-    raise
-```
-
-While `raise` does re-propagate the exception, this pattern has three maintainability
-problems:
-
-1. **No log entry at the point of failure.** When this path is hit in production, the
-   only signal is whatever the caller (potentially a LangGraph node or an HTTP handler)
-   decides to log — which may be far removed from the DB context. There is no log line
-   that says *"DB query for team X failed with error Y"*, making it hard to distinguish
-   a misconfigured team ID from a transient connection error from a schema mismatch.
-
-2. **Bare `except Exception` is too broad.** It catches everything from
-   `sqlalchemy.exc.OperationalError` (transient, retriable) to `ValueError` (programmer
-   error, not retriable) to `KeyboardInterrupt`-adjacent exceptions. These have very
-   different recovery strategies but are handled identically.
-
-3. **Inconsistency with the rest of the file.** `select_strategy_auto` (lines 108–116)
-   logs every retry attempt with structured fields (`type(exc).__name__`, `exc`). The DB
-   block provides none of that structure, making log correlation harder.
-
-**Contrast with the meta-router's error handling** (lines 108–116), which logs:
-```
-Meta-router attempt 1/3 failed (OpenAIError: rate limit); retrying…
-```
-versus the DB block, which logs: *(nothing)*.
-
-### Suggested Fix
-
-Add a structured `logger.exception` call before re-raising, and narrow the caught
-exception types where possible:
-
-```python
-from sqlalchemy.exc import SQLAlchemyError
-
-try:
-    team = session.query(Team).filter_by(id=team_id).first()
-    if not team:
-        raise ValueError(f"Team '{team_id}' not found")
+```yaml
+meta_router:
+  system: |
+    You are an orchestration meta-router. Given a user task and available agents, 
+    choose the best multi-agent execution strategy.
+    
+    Available agents:
+    {agent_descs}
+    
+    Strategy options and when to use each:
     ...
-except SQLAlchemyError as exc:
-    logger.exception(
-        "Database error while loading team %r: %s", team_id, exc
-    )
-    session.rollback()
-    raise
-except ValueError:
-    # Configuration errors (missing team, no agents) — log at WARNING, not ERROR
-    logger.warning("Configuration error for team %r", team_id, exc_info=True)
-    raise
-finally:
-    session.close()
+
+strategies:
+  react: |
+    ## Decision Strategy: ReAct (Reason + Act)
+    Think step by step: 1) Reason about what to do next...
+  
+  plan_execute: |
+    ## Decision Strategy: Plan-and-Execute
+    ALWAYS create a plan first...
+
+router:
+  system: |
+    You are a routing agent. Select the SINGLE best-fit agent...
 ```
 
-This ensures:
-- Every DB failure produces a structured log entry with `team_id` and the full traceback.
-- `SQLAlchemyError` and `ValueError` are handled at appropriate severity levels.
-- The `finally: session.close()` is preserved unchanged.
+Load with:
+
+```python
+import yaml
+from pathlib import Path
+
+_PROMPTS = yaml.safe_load(Path("prompts/orchestrator.yaml").read_text())
+
+def get_prompt(key: str, **kwargs) -> str:
+    """Retrieve and format a prompt template."""
+    template = _PROMPTS
+    for part in key.split("."):
+        template = template[part]
+    return template.format(**kwargs)
+```
+
+**Benefits:**
+- Prompts are first-class artifacts, easy to review and version
+- Non-engineers (product managers, prompt engineers) can iterate on prompts
+- A/B testing and experimentation become trivial
+- Cleaner git diffs (prompt changes separate from code changes)
+- Enables future features: prompt versioning, user-customizable prompts, localization
+
+**Recommended approach:** Start with Option A (Python module) for immediate improvement, then migrate to Option B (YAML) if prompt iteration velocity becomes a bottleneck.
 
 ---
 
 ## Summary
 
-| # | Issue | Location | Severity |
-|---|-------|----------|----------|
-| 1 | God function — `build_orchestrator_from_team` mixes DB, tool assembly, HITL wrapping, LLM construction, and graph dispatch | `lines 322–423` | **High** — blocks unit testing and increases change risk |
-| 2 | Prompt templates embedded as raw f-strings inside logic functions | `lines 230–280`, `525–530` | **Medium** — prompts are untestable and unversioned |
-| 3 | Bare `except Exception` with no logging in the DB block | `lines 369–373` | **Medium** — makes production debugging significantly harder |
+These three issues share a common theme: **separation of concerns**. The orchestrator currently mixes:
+- Business logic (strategy selection, graph building)
+- Data access (database queries)
+- Presentation (prompt templates)
+- Infrastructure (synthesis, state management)
+
+Addressing these issues will:
+1. Reduce cognitive load for developers
+2. Enable parallel development (multiple engineers can work on different strategies)
+3. Improve testability (unit test individual strategies, mock synthesis)
+4. Accelerate prompt engineering (non-engineers can contribute)
+5. Reduce bug surface area (changes are localized)
+
+**Recommended priority:**
+1. **Issue 2 (Duplicated synthesis)** — Quick win, immediate code reduction, low risk
+2. **Issue 3 (Hardcoded prompts)** — Medium effort, high long-term value
+3. **Issue 1 (Monolithic structure)** — Larger refactor, plan carefully, do incrementally
+
+All three can be addressed incrementally without breaking existing functionality by using the Strangler Fig pattern: create new modules alongside the existing code, migrate one function at a time, then remove the old code once all references are updated.

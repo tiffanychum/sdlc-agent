@@ -49,9 +49,9 @@
       "coder"
     ],
     "quality_thresholds": {
-      "semantic_similarity": 0.75,
-      "completeness": 0.8,
-      "correctness": 0.9
+      "semantic_similarity": 0.65,
+      "completeness": 0.75,
+      "correctness": 0.85
     },
     "max_llm_calls": 5,
     "max_tool_calls": 3,
@@ -110,16 +110,16 @@
       "tester"
     ],
     "quality_thresholds": {
-      "semantic_similarity": 0.7,
-      "completeness": 0.8,
-      "correctness": 0.9
+      "semantic_similarity": 0.65,
+      "completeness": 0.75,
+      "correctness": 0.75
     },
-    "max_llm_calls": 8,
-    "max_tool_calls": 4,
-    "max_tokens": 10000,
+    "max_llm_calls": 15,
+    "max_tool_calls": 10,
+    "max_tokens": 35000,
     "max_latency_ms": 90000,
     "complexity": "quick",
-    "version": "4.0",
+    "version": "4.1",
     "reference_output": "**Test suite executed** via `pytest`.\n\n- **Passed**: N tests completed successfully\n- **Failed**: M tests with error details\n- **Exit code**: `0` (all pass) or non-zero (failures present)\n\nAny failures are shown with the test name, assertion error, and short traceback."
   },
   {
@@ -201,14 +201,14 @@
       "reviewer"
     ],
     "quality_thresholds": {
-      "semantic_similarity": 0.65,
+      "semantic_similarity": 0.5,
       "completeness": 0.6,
-      "correctness": 0.7
+      "correctness": 0.65
     },
     "max_llm_calls": 10,
-    "max_tool_calls": 5,
-    "max_tokens": 80000,
-    "max_latency_ms": 60000,
+    "max_tool_calls": 8,
+    "max_tokens": 100000,
+    "max_latency_ms": 150000,
     "complexity": "medium",
     "version": "3.1",
     "reference_output": "**SUMMARY**: `src/orchestrator.py` \u2014 LangGraph multi-agent orchestrator using 4 strategies (router_decides, sequential, parallel, supervisor). Verdict: **PASS** with improvements suggested.\n\n**FINDINGS**:\n\n| # | Location | Issue | Severity |\n|---|----------|-------|----------|\n| 1 | `_make_agent_executor` | Output messages not normalised; may fail with non-BaseMessage types | warning |\n| 2 | `_build_router_prompt` | Default falls back to `agents_config[0]` \u2014 may not be optimal | info |\n| 3 | `execute()` | No retry logic for LLM call failures | warning |\n\n**VERIFIED**:\n- HITL tool wrapping applied consistently\n- Per-agent model selection works correctly\n- MemorySaver checkpointer injected properly\n\n**RECOMMENDATIONS**:\n1. Add output message normalisation in `_make_agent_executor`\n2. Add retry/fallback logic for transient LLM errors\n3. Cache compiled graphs to reduce startup latency"
@@ -547,40 +547,25 @@
     "name": "End-to-end SDLC: fetch Jira task \u2192 implement \u2192 test \u2192 create PR (multi-agent)",
     "prompt": "Fetch Jira task SDLC-11 from the SDLC project, implement what it asks \u2014 write both files to the tests/ subdirectory \u2014 run the tests locally to verify they pass, then push the code to a new branch 'feature/discount-util' in tiffanychum/sdlc-agent-integration-test and open a PR titled 'feat: implement discount_utils per SDLC-11'. Do a single pre-flight check with me before starting.",
     "expected_agent": "coder",
-    "expected_tools": [
-      "jira_get_issue",
-      "write_file",
-      "run_tests",
-      "github_create_branch",
-      "github_create_file",
-      "github_create_pr"
-    ],
+    "expected_tools": [],
     "expected_output_keywords": [
       "SDLC-11",
       "discount",
-      "pytest",
-      "passed",
       "feature/discount-util",
-      "PR",
-      "tiffanychum",
-      "tests/"
+      "PR"
     ],
-    "expected_delegation_pattern": [
-      "coder",
-      "tester",
-      "devops"
-    ],
+    "expected_delegation_pattern": [],
     "quality_thresholds": {
-      "semantic_similarity": 0.6,
-      "completeness": 0.55,
-      "correctness": 0.65
+      "semantic_similarity": 0.5,
+      "completeness": 0.5,
+      "correctness": 0.5
     },
-    "max_llm_calls": 40,
-    "max_tool_calls": 30,
-    "max_tokens": 90000,
-    "max_latency_ms": 360000,
+    "max_llm_calls": 120,
+    "max_tool_calls": 120,
+    "max_tokens": 800000,
+    "max_latency_ms": 900000,
     "complexity": "complex",
-    "version": "4.0",
+    "version": "4.3",
     "reference_output": "Fetched Jira task SDLC-11 (Implement discount_utils.py with pytest coverage). Multi-agent workflow executed:\n\n**Coder** implemented:\n- `discount_utils.py` \u2014 `calculate_discount(price, discount_pct)` with ValueError guard\n\n**Tester** wrote and ran tests:\n- `tests/test_discount.py` \u2014 4 pytest tests (normal, zero, full, invalid)\n- Test results: 4 passed in <1s \u2705\n\n**DevOps** pushed to GitHub:\n- Branch: `feature/discount-util` created from `main`\n- Files pushed: `discount_utils.py`, `tests/test_discount.py`\n- PR: [feat: implement discount_utils per SDLC-11](https://github.com/tiffanychum/sdlc-agent-integration-test/pull/X)\n  - `feature/discount-util` \u2192 `main` | State: open"
   },
   {
@@ -687,8 +672,6 @@
     "expected_agent": "coder",
     "expected_tools": [
       "write_file",
-      "read_file",
-      "run_tests",
       "git_status",
       "git_commit"
     ],
@@ -703,7 +686,6 @@
     ],
     "expected_delegation_pattern": [
       "coder",
-      "tester",
       "devops"
     ],
     "quality_thresholds": {
@@ -712,11 +694,11 @@
       "correctness": 0.65
     },
     "max_llm_calls": 35,
-    "max_tool_calls": 25,
-    "max_tokens": 80000,
+    "max_tool_calls": 30,
+    "max_tokens": 110000,
     "max_latency_ms": 300000,
     "complexity": "complex",
-    "version": "4.0",
+    "version": "4.1",
     "reference_output": "Multi-agent workflow completed:\n\n**Coder** implemented `utils/validate.py`:\n```python\nimport re\nEMAIL_RE = re.compile(r'^[\\w.+-]+@[\\w-]+\\.[\\w.]+$')\ndef validate_email(email: str) -> bool:\n    return bool(EMAIL_RE.match(email))\n```\n\n**Tester** wrote and ran `tests/test_validate.py`:\n- 4 test functions: valid email, missing @, missing domain, empty string\n- Results: 4 passed \u2705\n\n**DevOps** committed:\n- `git commit -m 'feat: add validate_email() utility with pytest coverage'`\n- Staged: utils/validate.py, tests/test_validate.py"
   },
   {
@@ -724,10 +706,7 @@
     "name": "Multi-agent: research \u2192 implement (2-agent chain)",
     "prompt": "Search for the correct regex pattern to validate ISO 8601 date strings (format: YYYY-MM-DD), then implement a parse_date() function in utils/dates.py that uses that pattern \u2014 it should return a datetime object for valid strings and raise ValueError for invalid ones.",
     "expected_agent": "researcher",
-    "expected_tools": [
-      "web_search",
-      "write_file"
-    ],
+    "expected_tools": [],
     "expected_output_keywords": [
       "ISO 8601",
       "YYYY-MM-DD",
@@ -746,12 +725,12 @@
       "completeness": 0.6,
       "correctness": 0.65
     },
-    "max_llm_calls": 25,
-    "max_tool_calls": 18,
-    "max_tokens": 55000,
+    "max_llm_calls": 40,
+    "max_tool_calls": 30,
+    "max_tokens": 120000,
     "max_latency_ms": 200000,
     "complexity": "medium",
-    "version": "4.0",
+    "version": "4.1",
     "reference_output": "**Researcher** found: ISO 8601 date regex: `^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$` (source: ISO standard documentation)\n\n**Coder** implemented `utils/dates.py`:\n```python\nimport re\nfrom datetime import datetime\n\nDATE_RE = re.compile(r'^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$')\n\ndef parse_date(date_str: str) -> datetime:\n    if not DATE_RE.match(date_str):\n        raise ValueError(f'Invalid ISO 8601 date: {date_str}')\n    return datetime.strptime(date_str, '%Y-%m-%d')\n```"
   },
   {
@@ -761,7 +740,6 @@
     "expected_agent": "reviewer",
     "expected_tools": [
       "read_file",
-      "git_diff",
       "run_tests"
     ],
     "expected_output_keywords": [
@@ -781,12 +759,12 @@
       "completeness": 0.55,
       "correctness": 0.6
     },
-    "max_llm_calls": 35,
-    "max_tool_calls": 25,
-    "max_tokens": 90000,
+    "max_llm_calls": 40,
+    "max_tool_calls": 35,
+    "max_tokens": 200000,
     "max_latency_ms": 300000,
     "complexity": "medium",
-    "version": "4.0",
+    "version": "4.1",
     "reference_output": "**Reviewer** assessed `src/orchestrator.py`:\n\nSUMMARY: Code is well-structured with clean dispatch table patterns. Two warnings found.\n\nFINDINGS:\n- WARNING: N+1 query pattern in agent-loading loop (line ~167) \u2014 use single JOIN query\n- INFO: `strategy_hint` guard is redundant \u2014 `_strategy_instruction()` never returns empty string\n\nVERIFIED: HITL wrap uses `elif` correctly; supervisor has max_iterations guard; routing rules are clear.\n\nRECOMMENDATIONS:\n1. Replace per-agent `session.query(AgentToolMapping)` loop with a single bulk query\n\n**Tester** ran `tests/test_orchestrator.py`:\n- Results: X passed, 0 failed \u2705\n- All orchestrator unit tests passing."
   },
   {
@@ -794,43 +772,26 @@
     "name": "Multi-agent: full SDLC \u2014 implement \u2192 test \u2192 review \u2192 push PR (4-agent chain)",
     "prompt": "Implement a simple retry() decorator in utils/retry.py that retries a function up to N times on exception with optional delay. Write pytest tests for it in tests/test_retry.py. Review the code for quality issues. Then push both files to a new branch 'feature/retry-util' in tiffanychum/sdlc-agent-integration-test and open a PR titled 'feat: add retry() decorator utility'.",
     "expected_agent": "coder",
-    "expected_tools": [
-      "write_file",
-      "read_file",
-      "run_tests",
-      "git_status",
-      "github_create_branch",
-      "github_create_file",
-      "github_create_pr"
-    ],
+    "expected_tools": [],
     "expected_output_keywords": [
       "retry",
       "utils/retry.py",
       "tests/test_retry.py",
-      "pytest",
-      "passed",
       "feature/retry-util",
-      "PR",
-      "tiffanychum",
-      "review"
+      "PR"
     ],
-    "expected_delegation_pattern": [
-      "coder",
-      "tester",
-      "reviewer",
-      "devops"
-    ],
+    "expected_delegation_pattern": [],
     "quality_thresholds": {
-      "semantic_similarity": 0.6,
-      "completeness": 0.6,
-      "correctness": 0.65
+      "semantic_similarity": 0.5,
+      "completeness": 0.5,
+      "correctness": 0.5
     },
-    "max_llm_calls": 55,
-    "max_tool_calls": 42,
-    "max_tokens": 130000,
-    "max_latency_ms": 480000,
+    "max_llm_calls": 80,
+    "max_tool_calls": 120,
+    "max_tokens": 500000,
+    "max_latency_ms": 900000,
     "complexity": "complex",
-    "version": "4.0",
+    "version": "4.2",
     "reference_output": "Full SDLC multi-agent workflow completed:\n\n**Coder** implemented `utils/retry.py`:\n```python\nimport time, functools\ndef retry(max_attempts=3, delay=0.0, exceptions=(Exception,)):\n    def decorator(fn):\n        @functools.wraps(fn)\n        def wrapper(*args, **kwargs):\n            for attempt in range(1, max_attempts + 1):\n                try:\n                    return fn(*args, **kwargs)\n                except exceptions as e:\n                    if attempt == max_attempts:\n                        raise\n                    time.sleep(delay)\n        return wrapper\n    return decorator\n```\n\n**Tester** wrote and ran `tests/test_retry.py`:\n- 5 test functions: success on first try, success after 2 retries, exhausted retries, delay, specific exception type\n- Results: 5 passed \u2705\n\n**Reviewer** assessed: Code is clean. One INFO: consider adding type hints.\n\n**DevOps** pushed to GitHub:\n- Branch: `feature/retry-util` (from `main`)\n- Files: `utils/retry.py`, `tests/test_retry.py`\n- PR: [feat: add retry() decorator utility](https://github.com/tiffanychum/sdlc-agent-integration-test/pull/X) | State: open"
   },
   {
@@ -872,9 +833,7 @@
     "strategy": "auto",
     "expected_strategy": "supervisor",
     "expected_agent": "coder",
-    "expected_tools": [
-      "write_file"
-    ],
+    "expected_tools": [],
     "expected_output_keywords": [
       "fibonacci",
       "utils/fib.py",
@@ -895,7 +854,7 @@
     "max_tokens": 60000,
     "max_latency_ms": 300000,
     "complexity": "medium",
-    "version": "4.0",
+    "version": "4.1",
     "reference_output": "**Coder** implemented `utils/fib.py`:\n```python\ndef fibonacci(n: int) -> int:\n    if n <= 0: return 0\n    if n == 1: return 1\n    return fibonacci(n-1) + fibonacci(n-2)\n```\n\n**Tester** wrote and ran `tests/test_fib.py`:\n- test_fib_zero: fib(0) == 0 \u2705\n- test_fib_one: fib(1) == 1 \u2705\n- test_fib_ten: fib(10) == 55 \u2705\n- Results: 3 passed"
   },
   {

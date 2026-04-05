@@ -71,12 +71,15 @@ class RegressionRunner:
 
         # ── Per-case strategy resolution ──────────────────────────────────────────
         # Each case may declare a `strategy` field:
-        #   - None / missing  → use whatever the team DB has (default)
+        #   - None / missing  → use the team's currently active strategy from DB
         #   - "auto"          → meta-router LLM picks the best strategy for this prompt
         #   - concrete name   → use that strategy regardless of team setting
         #
         # We pre-resolve all strategies so we can cache one orchestrator per unique
         # concrete strategy value (avoids rebuilding the full agent graph every case).
+
+        # Read the team's active strategy once — cases with no strategy inherit this.
+        team_active_strategy = _get_team_strategy(self.team_id)
 
         # Load agent descriptions once for the auto meta-router.
         agents_config_for_auto = await _load_agents_config(self.team_id)
@@ -84,7 +87,10 @@ class RegressionRunner:
         case_strategy_map: dict[str, str] = {}   # case.id -> resolved concrete strategy
         for case in cases:
             raw = getattr(case, "strategy", None) or None
-            if raw == "auto":
+            # Determine effective strategy: explicit case setting, or fall back to team's active.
+            effective = raw if raw else team_active_strategy
+            if effective == "auto":
+                # Meta-router picks the best concrete strategy for this specific prompt.
                 try:
                     resolved = await select_strategy_auto(case.prompt, agents_config_for_auto)
                 except Exception as exc:
@@ -94,10 +100,10 @@ class RegressionRunner:
                         case.id, type(exc).__name__, exc,
                     )
                     resolved = "supervisor"
-            elif raw in VALID_STRATEGIES:
-                resolved = raw
+            elif effective in VALID_STRATEGIES:
+                resolved = effective
             else:
-                resolved = "__team_default__"
+                resolved = "router_decides"
             case_strategy_map[case.id] = resolved
 
         # Build (and cache) one orchestrator per unique resolved strategy.
@@ -105,11 +111,10 @@ class RegressionRunner:
         for case in cases:
             strat = case_strategy_map[case.id]
             if strat not in orchestrator_cache:
-                override = strat if strat != "__team_default__" else None
                 orchestrator_cache[strat] = await build_orchestrator_from_team(
                     self.team_id,
                     model_override=self.model or None,
-                    strategy_override=override,
+                    strategy_override=strat,
                 )
 
         run_id = uuid.uuid4().hex[:12]
@@ -122,7 +127,7 @@ class RegressionRunner:
             result["run_id"] = run_id
             # Record strategy provenance: what was configured vs what ran.
             result["expected_strategy"] = getattr(case, "expected_strategy", None) or getattr(case, "strategy", None)
-            result["actual_strategy"] = resolved_strat if resolved_strat != "__team_default__" else None
+            result["actual_strategy"] = resolved_strat  # always a real strategy name now
             results.append(result)
 
         summary = self._build_summary(run_id, results, cases)
@@ -635,6 +640,19 @@ def _load_baseline_results(run_id: str) -> dict:
             "full_trace": r.full_trace or [],
             "actual_output": r.actual_output or "",
         } for r in rows}
+    finally:
+        session.close()
+
+
+def _get_team_strategy(team_id: str) -> str:
+    """Return the team's currently active decision strategy (falls back to 'router_decides')."""
+    from src.db.database import get_session
+    from src.db.models import Team
+
+    session = get_session()
+    try:
+        team = session.query(Team).filter_by(id=team_id).first()
+        return (team.decision_strategy if team else None) or "router_decides"
     finally:
         session.close()
 
