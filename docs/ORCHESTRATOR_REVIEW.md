@@ -1,220 +1,232 @@
 # Orchestrator Maintainability Review
 
-> **File reviewed:** `src/orchestrator.py`
-> **Review date:** 2025
-> **Issues identified:** 3
+> **File reviewed:** `src/orchestrator.py`  
+> **Review scope:** Top 3 maintainability issues  
+> **Lines of code:** 610
 
 ---
 
-## Issue 1 — Monolithic God Function: `build_orchestrator_from_team`
+## Issue 1 — God Function: `build_orchestrator_from_team` Does Too Much
 
 ### Description
 
 `build_orchestrator_from_team` (lines 322–423) is a single ~100-line async function that
-conflates at least five distinct responsibilities:
+is responsible for at least **five distinct concerns**:
 
-1. **Database access** — opens a session, queries `Team`, `Agent`, and `AgentToolMapping`,
-   and builds `agents_config`.
-2. **Tool resolution** — calls `get_all_tools()` and maps tool groups to per-agent lists.
-3. **HITL wrapping** — iterates over every tool and conditionally wraps it with
-   `wrap_dangerous_tool` / `wrap_reviewable_tool`.
-4. **Agent construction** — assembles prompts, calls `get_llm()`, and invokes
-   `create_react_agent` for every agent in the team.
-5. **Graph dispatch** — selects the correct `_build_*_graph` builder and compiles the
-   final LangGraph graph.
+1. Opening and querying the database (Teams, Agents, AgentToolMappings)
+2. Resolving the orchestration strategy
+3. Iterating over agents to assemble tool lists per agent
+4. Applying HITL wrappers (`wrap_dangerous_tool`, `wrap_reviewable_tool`, `ask_human`)
+5. Building LLM instances and `create_react_agent` objects
+6. Dispatching to one of four graph-builder functions
 
-Because all of this lives in one function, a change to any single concern (e.g., switching
-the ORM, adding a new HITL category, or changing how prompts are assembled) requires
-reading and modifying the entire function. It also makes unit-testing any individual step
-impossible without running the whole pipeline.
+Because all of this lives in one function, any single change — e.g. adding a new HITL
+wrapper type, changing how tools are loaded, or altering strategy resolution — requires
+reading and reasoning about the entire function. It is also effectively untestable in
+isolation: you cannot unit-test tool assembly without also triggering a real database
+query, and you cannot test DB loading without also triggering LLM construction.
+
+**Specific symptoms:**
+- The function has at least 3 levels of nested loops (`for ac in agents_config` → `for group
+  in ac["tool_groups"]` → `for t in agent_tools`).
+- The `try/except/finally` DB block and the tool-assembly loop are at the same indentation
+  level with no visual or logical boundary between them.
+- The `model_override` mutation loop (lines 378–380) is a side-effectful pass that alters
+  shared config dicts in-place.
 
 ### Suggested Fix
 
-Extract each responsibility into its own focused helper function and reduce
-`build_orchestrator_from_team` to an orchestrating coordinator:
+Decompose the function into focused, single-responsibility helpers:
 
 ```python
-# Step 1 – pure DB concern
-async def _load_agents_config(team_id: str) -> tuple[str, list[AgentConfig]]:
-    """Query DB and return (strategy, agents_config). No tool or LLM logic."""
+# 1. Pure DB concern — returns plain dicts, no LLM objects
+async def _load_team_config(team_id: str) -> tuple[str, list[dict]]:
+    """Return (strategy, agents_config) from the database."""
     ...
 
-# Step 2 – pure tool concern
-def _resolve_agent_tools(
-    ac: AgentConfig, tool_map: dict
+# 2. Pure tool concern — returns a list of (possibly-wrapped) StructuredTools
+def _build_agent_tools(
+    ac: dict,
+    tool_map: dict,
 ) -> list[StructuredTool]:
-    """Expand tool_groups → flat list of StructuredTool objects."""
+    """Assemble and HITL-wrap tools for a single agent config dict."""
     ...
 
-# Step 3 – pure HITL concern
-def _apply_hitl_wrappers(
-    tools: list[StructuredTool], role: str
-) -> list[StructuredTool]:
-    """Wrap dangerous / reviewable tools and ensure ask_human is present."""
+# 3. Pure LLM / agent concern
+def _build_react_agent(ac: dict, tools: list, model_override=None):
+    """Construct the LLM and create_react_agent for one agent."""
     ...
 
-# Step 4 – pure agent-construction concern
-def _build_agent(ac: AgentConfig, tools: list[StructuredTool]) -> CompiledGraph:
-    """Assemble prompt, get LLM, and create the react agent."""
-    ...
-
-# Coordinator – thin glue only
+# 4. Thin orchestrator — composes the above
 async def build_orchestrator_from_team(
     team_id: str = "default",
     model_override=None,
     strategy_override: str = None,
 ):
-    strategy, agents_config = await _load_agents_config(team_id)
+    strategy, agents_config = await _load_team_config(team_id)
     if strategy_override and strategy_override in VALID_STRATEGIES:
         strategy = strategy_override
     tool_map = await get_all_tools()
-    built_agents = {}
+    built_agents, exec_agents = {}, {}
     for ac in agents_config:
-        tools = _apply_hitl_wrappers(_resolve_agent_tools(ac, tool_map), ac.role)
-        built_agents[ac.role] = _build_agent(ac, tools)
-    return _build_graph(strategy, agents_config, built_agents)
+        tools = _build_agent_tools(ac, tool_map)
+        built_agents[ac["role"]] = _build_react_agent(ac, tools, model_override)
+        ...
+    return builders[strategy](agents_config, built_agents, ...)
 ```
 
-Each helper can now be unit-tested in isolation with straightforward mocks.
+This structure means each helper can be unit-tested independently with mocks, and future
+changes (e.g. a new wrapping strategy) are localised to one small function.
 
 ---
 
-## Issue 2 — Prompt Templates Hardcoded Inside Closures and Builder Functions
+## Issue 2 — Prompt Strings Embedded as Raw f-strings Inside Logic Functions
 
 ### Description
 
-Two large, multi-line prompt strings are defined inline inside function bodies rather than
-as module-level constants or in an external template layer:
+Two large natural-language prompt templates are constructed inline inside logic functions:
 
-- **Router prompt** — built and returned by `_build_router_prompt()` (lines 230–280) as a
-  plain f-string that embeds routing rules directly. Any change to routing logic requires
-  editing deep inside a function.
-- **Supervisor prompt** — constructed inside `_build_supervisor_graph()` (lines 525–530)
-  via an inline f-string that captures `agent_descs` and `agent_names` from the enclosing
-  scope. It is coupled to the graph-builder closure and cannot be read, tested, or iterated
-  on without also building a graph.
+- **Router prompt** — `_build_router_prompt` (lines 230–280): a 50-line f-string that
+  mixes routing rules, agent descriptions, and formatting directly in a Python function.
+- **Supervisor prompt** — inside `_build_supervisor_graph` (lines 525–530): a multi-line
+  f-string constructed at graph-build time inside a graph-builder function.
 
-Contrast this with `_META_ROUTER_PROMPT` (lines 40–67), which is correctly defined as a
-module-level constant with `{placeholder}` substitution. The router and supervisor prompts
-should follow the same pattern. The inconsistency makes it hard to find all prompts,
-compare them, or apply a common formatting / versioning strategy.
+This pattern creates several problems:
+
+1. **Untestable in isolation.** The prompt content cannot be verified without calling the
+   full builder function. There is no way to assert "the router prompt contains rule 3"
+   without constructing a full `agents_config` fixture.
+2. **No versioning or swapping.** Changing from one prompt style to another (e.g. for a
+   different LLM provider that needs a different format) requires editing the middle of a
+   logic function rather than swapping a template.
+3. **Mixed abstraction levels.** `_build_router_prompt` is named as if it returns a string,
+   but it also encodes business rules (Jira routing, file access priority, etc.) that belong
+   in a configuration layer, not in a Python string literal.
+4. **The supervisor prompt** is not even extracted to a named constant or builder — it is
+   an anonymous f-string on lines 525–530, making it invisible to a reader scanning the
+   module's top-level symbols.
 
 ### Suggested Fix
 
-Define all prompt templates as module-level constants with named placeholders, mirroring
-the existing `_META_ROUTER_PROMPT` pattern:
+Extract all prompt templates into a dedicated module (e.g. `src/prompts/orchestrator.py`)
+as named template strings, and use `.format()` or a lightweight templating approach:
 
 ```python
-# At module level, alongside _META_ROUTER_PROMPT
+# src/prompts/orchestrator.py
 
-_ROUTER_PROMPT_TEMPLATE = """\
-You are a routing agent. Select the SINGLE best-fit agent for the FIRST step of the task.
-...
+ROUTER_PROMPT_TEMPLATE = """\
+You are a routing agent. Select the SINGLE best-fit agent ...
+
 Available agents:
 {agent_descs}
 
-Routing rules (apply in strict priority order):
+Routing rules:
 ...
-Respond with ONLY the agent name from: {agent_names}."""
 
-_SUPERVISOR_PROMPT_TEMPLATE = """\
+Respond with ONLY the agent name from: {agent_names}.\
+"""
+
+SUPERVISOR_PROMPT_TEMPLATE = """\
 You are a supervisor agent. Decide which agent handles the task, or if it's complete.
 
 Available agents:
 {agent_descs}
 
-Respond with ONLY "DONE" or an agent name ({agent_names})."""
+Respond with ONLY "DONE" or an agent name ({agent_names}).\
+"""
 ```
 
-Then the builder functions become simple one-liners:
+Then in `orchestrator.py`:
 
 ```python
-def _build_router_prompt(agents_config: list) -> str:
-    return _ROUTER_PROMPT_TEMPLATE.format(
-        agent_descs="\n".join(f'- "{a["role"]}": {a["description"]}' for a in agents_config),
-        agent_names=", ".join(f'"{a["role"]}"' for a in agents_config),
+from src.prompts.orchestrator import ROUTER_PROMPT_TEMPLATE, SUPERVISOR_PROMPT_TEMPLATE
+
+def _build_router_prompt(agents_config: list[dict]) -> str:
+    return ROUTER_PROMPT_TEMPLATE.format(
+        agent_descs=...,
+        agent_names=...,
     )
 ```
 
-Benefits:
-- All prompt text is findable at the top of the file.
-- Prompts can be unit-tested without instantiating a graph.
-- A future move to external `.jinja2` / `.txt` template files requires only changing the
-  constant's assignment, not hunting through closures.
+Benefits: prompts become independently testable, can be loaded from files or a database,
+and changes to routing rules no longer touch the graph-building logic.
 
 ---
 
-## Issue 3 — Untyped `dict` Used as the Agent Config Contract
+## Issue 3 — Silent Exception Swallowing in the Database Block
 
 ### Description
 
-Throughout the file, agent configuration is passed as an untyped `list[dict]` under the
-name `agents_config`. Every consumer accesses fields via ad-hoc patterns with silent
-fallbacks:
+The database query block in `build_orchestrator_from_team` (lines 369–373) uses:
 
-| Location | Pattern | Risk |
-|---|---|---|
-| `build_orchestrator_from_team` line 358 | `getattr(a, "model", "") or ""` | Silently hides a missing ORM column |
-| `build_orchestrator_from_team` line 359 | `getattr(a, "decision_strategy", "react") or "react"` | Same |
-| `_build_router_graph` line 431 | `agents_config[0]["role"]` | `KeyError` if `"role"` absent |
-| `_build_sequential_graph` line 483 | `roles[i]` iterating list of strings | No traceability back to source dict |
-| `_get_executor` / every builder | `ac.get("model") or None` | Conflates absent key with empty string |
+```python
+except Exception:
+    session.rollback()
+    raise
+```
 
-Because the shape of `agents_config` is never formally declared, a typo in a key name
-(e.g., `"desciption"` instead of `"description"`) silently produces empty strings or
-`None` values that surface only at LLM call time. There is no IDE auto-complete, no static
-analysis, and no centralised place to see what fields are required vs. optional.
+While `raise` does re-propagate the exception, this pattern has three maintainability
+problems:
+
+1. **No log entry at the point of failure.** When this path is hit in production, the
+   only signal is whatever the caller (potentially a LangGraph node or an HTTP handler)
+   decides to log — which may be far removed from the DB context. There is no log line
+   that says *"DB query for team X failed with error Y"*, making it hard to distinguish
+   a misconfigured team ID from a transient connection error from a schema mismatch.
+
+2. **Bare `except Exception` is too broad.** It catches everything from
+   `sqlalchemy.exc.OperationalError` (transient, retriable) to `ValueError` (programmer
+   error, not retriable) to `KeyboardInterrupt`-adjacent exceptions. These have very
+   different recovery strategies but are handled identically.
+
+3. **Inconsistency with the rest of the file.** `select_strategy_auto` (lines 108–116)
+   logs every retry attempt with structured fields (`type(exc).__name__`, `exc`). The DB
+   block provides none of that structure, making log correlation harder.
+
+**Contrast with the meta-router's error handling** (lines 108–116), which logs:
+```
+Meta-router attempt 1/3 failed (OpenAIError: rate limit); retrying…
+```
+versus the DB block, which logs: *(nothing)*.
 
 ### Suggested Fix
 
-Introduce a lightweight `dataclass` (or `TypedDict`) to act as the contract between the
-DB-loading step and the graph-building step:
+Add a structured `logger.exception` call before re-raising, and narrow the caught
+exception types where possible:
 
 ```python
-from dataclasses import dataclass, field
+from sqlalchemy.exc import SQLAlchemyError
 
-@dataclass
-class AgentConfig:
-    id: str
-    name: str
-    role: str
-    description: str
-    system_prompt: str
-    tool_groups: list[str] = field(default_factory=list)
-    model: str = ""
-    decision_strategy: str = "react"
+try:
+    team = session.query(Team).filter_by(id=team_id).first()
+    if not team:
+        raise ValueError(f"Team '{team_id}' not found")
+    ...
+except SQLAlchemyError as exc:
+    logger.exception(
+        "Database error while loading team %r: %s", team_id, exc
+    )
+    session.rollback()
+    raise
+except ValueError:
+    # Configuration errors (missing team, no agents) — log at WARNING, not ERROR
+    logger.warning("Configuration error for team %r", team_id, exc_info=True)
+    raise
+finally:
+    session.close()
 ```
 
-Constructing it from the ORM row becomes an explicit, validated operation:
-
-```python
-AgentConfig(
-    id=a.id,
-    name=a.name,
-    role=a.role,
-    description=a.description or "",
-    system_prompt=a.system_prompt or "",
-    tool_groups=mapping_by_agent[a.id],
-    model=getattr(a, "model", "") or "",
-    decision_strategy=getattr(a, "decision_strategy", "react") or "react",
-)
-```
-
-All downstream builder functions then receive `list[AgentConfig]` and access
-`ac.role`, `ac.model`, etc. — getting IDE support, static type checking, and an
-`AttributeError` (not silent `None`) if a field is accessed incorrectly.
-The `getattr` fallback noise is confined to the one construction site instead of
-being duplicated across every builder.
+This ensures:
+- Every DB failure produces a structured log entry with `team_id` and the full traceback.
+- `SQLAlchemyError` and `ValueError` are handled at appropriate severity levels.
+- The `finally: session.close()` is preserved unchanged.
 
 ---
 
 ## Summary
 
-| # | Issue | Affected Lines | Severity |
-|---|---|---|---|
-| 1 | Monolithic god function `build_orchestrator_from_team` | 322–423 | High |
-| 2 | Prompt templates hardcoded inside closures / builder functions | 230–280, 525–530 | Medium |
-| 3 | Untyped `dict` used as the agent config contract | Throughout | Medium |
-
-Addressing these three issues in order will make the orchestrator significantly easier to
-test, extend, and reason about without altering any runtime behaviour.
+| # | Issue | Location | Severity |
+|---|-------|----------|----------|
+| 1 | God function — `build_orchestrator_from_team` mixes DB, tool assembly, HITL wrapping, LLM construction, and graph dispatch | `lines 322–423` | **High** — blocks unit testing and increases change risk |
+| 2 | Prompt templates embedded as raw f-strings inside logic functions | `lines 230–280`, `525–530` | **Medium** — prompts are untestable and unversioned |
+| 3 | Bare `except Exception` with no logging in the DB block | `lines 369–373` | **Medium** — makes production debugging significantly harder |
