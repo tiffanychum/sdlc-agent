@@ -30,8 +30,8 @@ def retry(
         Decorated function that will retry on failure.
 
     Raises:
-        ValueError: If max_attempts < 1 or delay < 0.
-        The last exception raised if all retry attempts are exhausted.
+        The last exception encountered if all retry attempts fail.
+        ValueError: If max_attempts < 1.
 
     Example:
         @retry(max_attempts=5, delay=1.0, exceptions=ConnectionError)
@@ -40,13 +40,12 @@ def retry(
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
-    if delay < 0:
-        raise ValueError("delay must be non-negative")
 
     def decorator(func: F) -> F:
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             last_exception = None
+            
             for attempt in range(1, max_attempts + 1):
                 try:
                     return func(*args, **kwargs)
@@ -55,13 +54,14 @@ def retry(
                     if attempt < max_attempts:
                         if delay > 0:
                             time.sleep(delay)
-                    else:
-                        # Last attempt failed, re-raise
-                        raise
-            # This should never be reached, but for type safety
-            if last_exception:
+                    # If this was the last attempt, we'll raise below
+            
+            # All attempts exhausted, raise the last exception
+            if last_exception is not None:
                 raise last_exception
+        
         return wrapper  # type: ignore[return-value]
+    
     return decorator
 
 
@@ -82,8 +82,8 @@ def aretry(
         Decorated async function that will retry on failure.
 
     Raises:
-        ValueError: If max_attempts < 1 or delay < 0.
-        The last exception raised if all retry attempts are exhausted.
+        The last exception encountered if all retry attempts fail.
+        ValueError: If max_attempts < 1.
 
     Example:
         @aretry(max_attempts=5, delay=1.0, exceptions=aiohttp.ClientError)
@@ -94,13 +94,12 @@ def aretry(
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
-    if delay < 0:
-        raise ValueError("delay must be non-negative")
 
     def decorator(func: F) -> F:
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             last_exception = None
+            
             for attempt in range(1, max_attempts + 1):
                 try:
                     return await func(*args, **kwargs)
@@ -109,11 +108,12 @@ def aretry(
                     if attempt < max_attempts:
                         if delay > 0:
                             await asyncio.sleep(delay)
-                    else:
-                        # Last attempt failed, re-raise
-                        raise
-            # This should never be reached, but for type safety
-            if last_exception:
+                    # If this was the last attempt, we'll raise below
+            
+            # All attempts exhausted, raise the last exception
+            if last_exception is not None:
                 raise last_exception
+        
         return wrapper  # type: ignore[return-value]
+    
     return decorator

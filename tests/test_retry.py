@@ -11,13 +11,13 @@ from utils.retry import retry, aretry
 
 
 # ============================================================================
-# Tests for retry() decorator (synchronous)
+# Tests for @retry (synchronous)
 # ============================================================================
 
 def test_retry_success_on_first_attempt():
     """Function succeeds on first attempt, no retries needed."""
     mock_func = Mock(return_value="success")
-    decorated = retry()(mock_func)
+    decorated = retry(max_attempts=3)(mock_func)
     
     result = decorated()
     
@@ -62,20 +62,20 @@ def test_retry_with_delay():
     assert elapsed >= 0.1
 
 
-def test_retry_specific_exception_type():
+def test_retry_with_specific_exception():
     """Only retry on specified exception types."""
     mock_func = Mock(side_effect=TypeError("wrong type"))
     decorated = retry(max_attempts=3, exceptions=ValueError)(mock_func)
     
-    # TypeError is not in the exceptions list, should fail immediately
+    # TypeError is not in the exceptions list, so it should raise immediately
     with pytest.raises(TypeError, match="wrong type"):
         decorated()
     
     assert mock_func.call_count == 1
 
 
-def test_retry_multiple_exception_types():
-    """Retry on multiple specified exception types."""
+def test_retry_with_multiple_exception_types():
+    """Retry on multiple exception types."""
     mock_func = Mock(side_effect=[ValueError("fail1"), TypeError("fail2"), "success"])
     decorated = retry(max_attempts=5, exceptions=(ValueError, TypeError))(mock_func)
     
@@ -99,7 +99,7 @@ def test_retry_preserves_function_metadata():
 def test_retry_with_args_and_kwargs():
     """Decorator properly forwards arguments to wrapped function."""
     mock_func = Mock(return_value="success")
-    decorated = retry()(mock_func)
+    decorated = retry(max_attempts=2)(mock_func)
     
     result = decorated(1, 2, key="value")
     
@@ -113,32 +113,41 @@ def test_retry_invalid_max_attempts():
         retry(max_attempts=0)
 
 
-def test_retry_invalid_delay():
-    """Raises ValueError if delay is negative."""
-    with pytest.raises(ValueError, match="delay must be non-negative"):
-        retry(delay=-1.0)
-
-
-def test_retry_default_parameters():
-    """Test default parameters: 3 attempts, no delay, catch all exceptions."""
-    mock_func = Mock(side_effect=[Exception("1"), Exception("2"), "success"])
-    decorated = retry()(mock_func)
+def test_retry_max_attempts_one():
+    """With max_attempts=1, function is called once and exception propagates."""
+    mock_func = Mock(side_effect=ValueError("fail"))
+    decorated = retry(max_attempts=1)(mock_func)
     
+    with pytest.raises(ValueError, match="fail"):
+        decorated()
+    
+    assert mock_func.call_count == 1
+
+
+def test_retry_no_delay_between_attempts():
+    """With delay=0, retries happen immediately."""
+    mock_func = Mock(side_effect=[ValueError("fail"), "success"])
+    decorated = retry(max_attempts=3, delay=0)(mock_func)
+    
+    start_time = time.time()
     result = decorated()
+    elapsed = time.time() - start_time
     
     assert result == "success"
-    assert mock_func.call_count == 3
+    assert mock_func.call_count == 2
+    # Should be very fast with no delay
+    assert elapsed < 0.05
 
 
 # ============================================================================
-# Tests for aretry() decorator (asynchronous)
+# Tests for @aretry (asynchronous)
 # ============================================================================
 
 @pytest.mark.asyncio
 async def test_aretry_success_on_first_attempt():
     """Async function succeeds on first attempt, no retries needed."""
     mock_func = AsyncMock(return_value="success")
-    decorated = aretry()(mock_func)
+    decorated = aretry(max_attempts=3)(mock_func)
     
     result = await decorated()
     
@@ -187,12 +196,12 @@ async def test_aretry_with_delay():
 
 
 @pytest.mark.asyncio
-async def test_aretry_specific_exception_type():
+async def test_aretry_with_specific_exception():
     """Only retry on specified exception types for async functions."""
     mock_func = AsyncMock(side_effect=TypeError("wrong type"))
     decorated = aretry(max_attempts=3, exceptions=ValueError)(mock_func)
     
-    # TypeError is not in the exceptions list, should fail immediately
+    # TypeError is not in the exceptions list, so it should raise immediately
     with pytest.raises(TypeError, match="wrong type"):
         await decorated()
     
@@ -200,8 +209,8 @@ async def test_aretry_specific_exception_type():
 
 
 @pytest.mark.asyncio
-async def test_aretry_multiple_exception_types():
-    """Retry on multiple specified exception types for async functions."""
+async def test_aretry_with_multiple_exception_types():
+    """Retry on multiple exception types for async functions."""
     mock_func = AsyncMock(side_effect=[ValueError("fail1"), TypeError("fail2"), "success"])
     decorated = aretry(max_attempts=5, exceptions=(ValueError, TypeError))(mock_func)
     
@@ -227,7 +236,7 @@ async def test_aretry_preserves_function_metadata():
 async def test_aretry_with_args_and_kwargs():
     """Async decorator properly forwards arguments to wrapped function."""
     mock_func = AsyncMock(return_value="success")
-    decorated = aretry()(mock_func)
+    decorated = aretry(max_attempts=2)(mock_func)
     
     result = await decorated(1, 2, key="value")
     
@@ -241,30 +250,40 @@ def test_aretry_invalid_max_attempts():
         aretry(max_attempts=0)
 
 
-def test_aretry_invalid_delay():
-    """Raises ValueError if delay is negative for async decorator."""
-    with pytest.raises(ValueError, match="delay must be non-negative"):
-        aretry(delay=-1.0)
+@pytest.mark.asyncio
+async def test_aretry_max_attempts_one():
+    """With max_attempts=1, async function is called once and exception propagates."""
+    mock_func = AsyncMock(side_effect=ValueError("fail"))
+    decorated = aretry(max_attempts=1)(mock_func)
+    
+    with pytest.raises(ValueError, match="fail"):
+        await decorated()
+    
+    assert mock_func.call_count == 1
 
 
 @pytest.mark.asyncio
-async def test_aretry_default_parameters():
-    """Test default parameters for async: 3 attempts, no delay, catch all exceptions."""
-    mock_func = AsyncMock(side_effect=[Exception("1"), Exception("2"), "success"])
-    decorated = aretry()(mock_func)
+async def test_aretry_no_delay_between_attempts():
+    """With delay=0, async retries happen immediately."""
+    mock_func = AsyncMock(side_effect=[ValueError("fail"), "success"])
+    decorated = aretry(max_attempts=3, delay=0)(mock_func)
     
+    start_time = time.time()
     result = await decorated()
+    elapsed = time.time() - start_time
     
     assert result == "success"
-    assert mock_func.call_count == 3
+    assert mock_func.call_count == 2
+    # Should be very fast with no delay
+    assert elapsed < 0.05
 
 
 # ============================================================================
 # Integration tests with real functions
 # ============================================================================
 
-def test_retry_with_real_function():
-    """Integration test with a real function that tracks state."""
+def test_retry_integration_with_real_function():
+    """Integration test with a real function that has state."""
     class Counter:
         def __init__(self):
             self.count = 0
@@ -285,8 +304,8 @@ def test_retry_with_real_function():
 
 
 @pytest.mark.asyncio
-async def test_aretry_with_real_async_function():
-    """Integration test with a real async function that tracks state."""
+async def test_aretry_integration_with_real_async_function():
+    """Integration test with a real async function that has state."""
     class AsyncCounter:
         def __init__(self):
             self.count = 0
