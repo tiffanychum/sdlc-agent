@@ -1,24 +1,25 @@
 """
 tests/test_retry.py
-===================
-Pytest test-suite for :func:`utils.retry.retry`.
+-------------------
+Pytest tests for the `retry` decorator defined in utils/retry.py.
 
-Coverage targets
-----------------
-* Successful call on the first attempt.
-* Success after N-1 failures (function eventually succeeds).
-* Failure after exhausting all retries (exception is re-raised).
-* Correct total number of call attempts.
-* Delay behaviour (``time.sleep`` is called with the right arguments).
-* Edge case: ``max_attempts=1`` (no retries, single attempt only).
-* Parameter validation: ``max_attempts < 1`` and ``delay < 0``.
-* Non-retried exceptions pass through immediately.
+Test matrix
+~~~~~~~~~~~
+* Succeeds on first attempt            -> returns value, called once
+* Succeeds after N-1 failures          -> returns value, called N times
+* Fails all attempts                   -> raises the last exception
+* Non-matching exception               -> propagates immediately, no retry
+* Delay is honoured between attempts   -> time.sleep called with correct args
+* Preserves wrapped function metadata  -> __name__, __doc__ intact
+* Bad constructor arguments raise early:
+  - times < 1
+  - delay < 0
+  - exceptions not a tuple
 """
 
-from __future__ import annotations
-
+import time
 import pytest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch, call
 
 from utils.retry import retry
 
@@ -27,174 +28,167 @@ from utils.retry import retry
 # Helpers
 # ---------------------------------------------------------------------------
 
-class CustomError(Exception):
-    """Distinct error type used in selectivity tests."""
+class TransientError(Exception):
+    """Raised intentionally to simulate a transient failure."""
+
+
+class FatalError(Exception):
+    """Raised intentionally to simulate a non-retryable failure."""
+
+
+def make_flaky(total_calls: int, fail_times: int, exc=TransientError):
+    """Return a MagicMock that raises *exc* for the first *fail_times* calls,
+    then returns ``"ok"``."""
+    side_effects = [exc("boom")] * fail_times + ["ok"] * (total_calls - fail_times)
+    mock = MagicMock(side_effect=side_effects)
+    return mock
 
 
 # ---------------------------------------------------------------------------
-# Happy-path tests
+# Basic success / failure
 # ---------------------------------------------------------------------------
 
-class TestRetrySuccess:
+class TestRetryBasicBehaviour:
+
     def test_succeeds_on_first_attempt(self):
-        """Function that never raises should return its value immediately."""
+        """Function that never raises should be called exactly once."""
         mock_fn = MagicMock(return_value=42)
-        decorated = retry(max_attempts=3, delay=0)(mock_fn)
 
-        result = decorated()
+        @retry(times=3)
+        def always_ok():
+            return mock_fn()
 
+        result = always_ok()
         assert result == 42
         mock_fn.assert_called_once()
 
-    def test_succeeds_after_n_minus_one_failures(self):
-        """Function that fails twice then succeeds should return the success value."""
-        side_effects = [ValueError("fail"), ValueError("fail"), "ok"]
-        mock_fn = MagicMock(side_effect=side_effects)
-        decorated = retry(max_attempts=3, delay=0)(mock_fn)
+    def test_succeeds_after_partial_failures(self):
+        """Function should succeed once transient failures are exhausted."""
+        fail_times = 2
+        mock_fn = make_flaky(total_calls=3, fail_times=fail_times)
 
-        result = decorated()
+        @retry(times=3, exceptions=(TransientError,))
+        def flaky():
+            return mock_fn()
 
+        result = flaky()
         assert result == "ok"
         assert mock_fn.call_count == 3
 
-    def test_passes_args_and_kwargs_correctly(self):
-        """Positional and keyword arguments must be forwarded unchanged."""
-        mock_fn = MagicMock(return_value="done")
-        decorated = retry(max_attempts=2, delay=0)(mock_fn)
+    def test_raises_after_all_attempts_exhausted(self):
+        """Should raise the last exception when every attempt fails."""
+        mock_fn = MagicMock(side_effect=TransientError("always fails"))
 
-        decorated("a", "b", key="value")
+        @retry(times=3, exceptions=(TransientError,))
+        def always_fails():
+            return mock_fn()
 
-        mock_fn.assert_called_once_with("a", "b", key="value")
+        with pytest.raises(TransientError, match="always fails"):
+            always_fails()
 
+        assert mock_fn.call_count == 3
 
-# ---------------------------------------------------------------------------
-# Failure / exhaustion tests
-# ---------------------------------------------------------------------------
+    def test_times_equals_one_no_retry(self):
+        """With times=1 the function should be tried exactly once and the
+        exception re-raised immediately."""
+        mock_fn = MagicMock(side_effect=TransientError("once"))
 
-class TestRetryExhaustion:
-    def test_raises_last_exception_after_all_attempts(self):
-        """After max_attempts failures the last exception should propagate."""
-        mock_fn = MagicMock(side_effect=RuntimeError("boom"))
-        decorated = retry(max_attempts=3, delay=0)(mock_fn)
+        @retry(times=1, exceptions=(TransientError,))
+        def one_shot():
+            return mock_fn()
 
-        with pytest.raises(RuntimeError, match="boom"):
-            decorated()
-
-    def test_correct_number_of_attempts_on_total_failure(self):
-        """The decorated function must be called exactly max_attempts times."""
-        mock_fn = MagicMock(side_effect=OSError("io error"))
-        max_attempts = 5
-        decorated = retry(max_attempts=max_attempts, delay=0)(mock_fn)
-
-        with pytest.raises(OSError):
-            decorated()
-
-        assert mock_fn.call_count == max_attempts
-
-    def test_max_attempts_one_does_not_retry(self):
-        """With max_attempts=1 the function is called exactly once; no retry."""
-        mock_fn = MagicMock(side_effect=ValueError("single shot"))
-        decorated = retry(max_attempts=1, delay=0)(mock_fn)
-
-        with pytest.raises(ValueError, match="single shot"):
-            decorated()
+        with pytest.raises(TransientError):
+            one_shot()
 
         mock_fn.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
-# Delay behaviour tests
+# Non-matching exceptions
 # ---------------------------------------------------------------------------
 
-class TestRetryDelay:
-    @patch("utils.retry.time.sleep")
-    def test_sleep_called_between_attempts(self, mock_sleep: MagicMock):
-        """time.sleep must be called (max_attempts - 1) times with *delay* seconds."""
-        mock_fn = MagicMock(side_effect=Exception("err"))
-        delay = 0.5
-        max_attempts = 4
-        decorated = retry(max_attempts=max_attempts, delay=delay)(mock_fn)
+class TestRetryExceptionFiltering:
 
-        with pytest.raises(Exception):
-            decorated()
+    def test_non_matching_exception_propagates_immediately(self):
+        """An exception not in *exceptions* must propagate without retrying."""
+        call_count = 0
 
-        expected_calls = [call(delay)] * (max_attempts - 1)
-        mock_sleep.assert_has_calls(expected_calls)
-        assert mock_sleep.call_count == max_attempts - 1
+        @retry(times=5, exceptions=(TransientError,))
+        def raises_fatal():
+            nonlocal call_count
+            call_count += 1
+            raise FatalError("fatal")
 
-    @patch("utils.retry.time.sleep")
-    def test_no_sleep_when_delay_is_zero(self, mock_sleep: MagicMock):
-        """time.sleep must NOT be called when delay=0."""
-        mock_fn = MagicMock(side_effect=Exception("err"))
-        decorated = retry(max_attempts=3, delay=0)(mock_fn)
+        with pytest.raises(FatalError, match="fatal"):
+            raises_fatal()
 
-        with pytest.raises(Exception):
-            decorated()
+        # Must NOT have retried
+        assert call_count == 1
 
-        mock_sleep.assert_not_called()
+    def test_only_specified_exceptions_trigger_retry(self):
+        """Multiple exception types: matching ones retry, others propagate."""
+        mock_fn = MagicMock(side_effect=[TransientError("t"), FatalError("f")])
 
-    @patch("utils.retry.time.sleep")
-    def test_no_sleep_after_last_attempt(self, mock_sleep: MagicMock):
-        """No sleep should occur after the final (exhausting) attempt."""
-        mock_fn = MagicMock(side_effect=[Exception("e"), "success"])
-        decorated = retry(max_attempts=2, delay=1.0)(mock_fn)
+        @retry(times=5, exceptions=(TransientError,))
+        def mixed():
+            return mock_fn()
 
-        result = decorated()
+        with pytest.raises(FatalError):
+            mixed()
 
-        assert result == "success"
-        # Sleep only between attempt 1 → 2 (one call), not after success
-        mock_sleep.assert_called_once_with(1.0)
-
-
-# ---------------------------------------------------------------------------
-# Selective exception tests
-# ---------------------------------------------------------------------------
-
-class TestRetrySelectiveExceptions:
-    def test_only_specified_exceptions_are_retried(self):
-        """Exceptions not in the *exceptions* tuple must not be retried."""
-        mock_fn = MagicMock(side_effect=CustomError("custom"))
-        decorated = retry(max_attempts=5, delay=0, exceptions=(ValueError,))(mock_fn)
-
-        with pytest.raises(CustomError):
-            decorated()
-
-        # Should bail out on the first attempt — no retry
-        mock_fn.assert_called_once()
-
-    def test_specified_subclass_exception_is_retried(self):
-        """Subclasses of a listed exception type must also trigger retries."""
-        class SubError(ValueError):
-            pass
-
-        mock_fn = MagicMock(side_effect=[SubError("sub"), "ok"])
-        decorated = retry(max_attempts=2, delay=0, exceptions=(ValueError,))(mock_fn)
-
-        result = decorated()
-
-        assert result == "ok"
+        # Called twice: first raises TransientError (retried), second FatalError (not)
         assert mock_fn.call_count == 2
 
 
 # ---------------------------------------------------------------------------
-# Parameter validation tests
+# Delay between attempts
 # ---------------------------------------------------------------------------
 
-class TestRetryValidation:
-    def test_raises_value_error_for_zero_max_attempts(self):
-        """max_attempts=0 must raise ValueError at decoration time."""
-        with pytest.raises(ValueError, match="max_attempts"):
-            retry(max_attempts=0)
+class TestRetryDelay:
 
-    def test_raises_value_error_for_negative_max_attempts(self):
-        """Negative max_attempts must raise ValueError at decoration time."""
-        with pytest.raises(ValueError, match="max_attempts"):
-            retry(max_attempts=-3)
+    def test_delay_is_respected_between_attempts(self):
+        """time.sleep should be called (times-1) times with the correct delay."""
+        mock_fn = make_flaky(total_calls=3, fail_times=2)
 
-    def test_raises_value_error_for_negative_delay(self):
-        """Negative delay must raise ValueError at decoration time."""
-        with pytest.raises(ValueError, match="delay"):
-            retry(max_attempts=3, delay=-1.0)
+        @retry(times=3, delay=0.5, exceptions=(TransientError,))
+        def flaky():
+            return mock_fn()
+
+        with patch("utils.retry.time.sleep") as mock_sleep:
+            result = flaky()
+
+        assert result == "ok"
+        # sleep should be called after attempt 1 and attempt 2, but NOT after 3
+        assert mock_sleep.call_count == 2
+        mock_sleep.assert_has_calls([call(0.5), call(0.5)])
+
+    def test_no_delay_means_no_sleep(self):
+        """With delay=0 (default) time.sleep must never be called."""
+        mock_fn = make_flaky(total_calls=2, fail_times=1)
+
+        @retry(times=2, exceptions=(TransientError,))
+        def flaky():
+            return mock_fn()
+
+        with patch("utils.retry.time.sleep") as mock_sleep:
+            flaky()
+
+        mock_sleep.assert_not_called()
+
+    def test_sleep_not_called_after_final_failed_attempt(self):
+        """sleep must NOT be called after the last (exhausted) attempt."""
+        mock_fn = MagicMock(side_effect=TransientError("fail"))
+
+        @retry(times=3, delay=1.0, exceptions=(TransientError,))
+        def always_fails():
+            return mock_fn()
+
+        with patch("utils.retry.time.sleep") as mock_sleep:
+            with pytest.raises(TransientError):
+                always_fails()
+
+        # 3 attempts => sleep between attempt 1→2 and 2→3, NOT after 3
+        assert mock_sleep.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -202,18 +196,95 @@ class TestRetryValidation:
 # ---------------------------------------------------------------------------
 
 class TestRetryMetadata:
-    def test_functools_wraps_preserves_name(self):
-        """The wrapped function's __name__ must match the original."""
-        @retry(max_attempts=2, delay=0)
+
+    def test_wrapped_function_name_preserved(self):
+        """functools.wraps should preserve __name__."""
+
+        @retry(times=2)
         def my_function():
-            pass
+            """My docstring."""
 
         assert my_function.__name__ == "my_function"
 
-    def test_functools_wraps_preserves_docstring(self):
-        """The wrapped function's __doc__ must match the original."""
-        @retry(max_attempts=2, delay=0)
-        def documented():
-            """My docstring."""
+    def test_wrapped_function_docstring_preserved(self):
+        """functools.wraps should preserve __doc__."""
 
-        assert documented.__doc__ == "My docstring."
+        @retry(times=2)
+        def documented():
+            """Important docs."""
+
+        assert documented.__doc__ == "Important docs."
+
+
+# ---------------------------------------------------------------------------
+# Constructor argument validation
+# ---------------------------------------------------------------------------
+
+class TestRetryArgumentValidation:
+
+    def test_times_zero_raises_value_error(self):
+        with pytest.raises(ValueError, match="`times`"):
+            retry(times=0)
+
+    def test_times_negative_raises_value_error(self):
+        with pytest.raises(ValueError, match="`times`"):
+            retry(times=-1)
+
+    def test_times_non_integer_raises_value_error(self):
+        with pytest.raises(ValueError, match="`times`"):
+            retry(times=2.5)  # type: ignore[arg-type]
+
+    def test_delay_negative_raises_value_error(self):
+        with pytest.raises(ValueError, match="`delay`"):
+            retry(times=3, delay=-0.1)
+
+    def test_exceptions_not_tuple_raises_type_error(self):
+        with pytest.raises(TypeError, match="`exceptions`"):
+            retry(times=3, exceptions=ValueError)  # type: ignore[arg-type]
+
+    def test_exceptions_empty_tuple_raises_type_error(self):
+        with pytest.raises(TypeError, match="`exceptions`"):
+            retry(times=3, exceptions=())
+
+    def test_valid_arguments_do_not_raise(self):
+        """Sanity check: correct arguments produce a decorator without error."""
+        dec = retry(times=5, delay=0.1, exceptions=(ValueError, IOError))
+        assert callable(dec)
+
+
+# ---------------------------------------------------------------------------
+# Edge / integration cases
+# ---------------------------------------------------------------------------
+
+class TestRetryEdgeCases:
+
+    def test_return_value_is_passed_through(self):
+        """Decorator must not alter the return value."""
+
+        @retry(times=3)
+        def give_dict():
+            return {"key": [1, 2, 3]}
+
+        assert give_dict() == {"key": [1, 2, 3]}
+
+    def test_args_and_kwargs_forwarded(self):
+        """Positional and keyword arguments must be forwarded correctly."""
+
+        @retry(times=2)
+        def add(a, b, *, multiplier=1):
+            return (a + b) * multiplier
+
+        assert add(3, 4, multiplier=2) == 14
+
+    def test_retry_multiple_exception_types(self):
+        """Retry should trigger for any exception listed in *exceptions*."""
+        side_effects = [TransientError("t"), FatalError("f"), "ok"]
+        mock_fn = MagicMock(side_effect=side_effects)
+
+        @retry(times=3, exceptions=(TransientError, FatalError))
+        def multi_exc():
+            return mock_fn()
+
+        result = multi_exc()
+        assert result == "ok"
+        assert mock_fn.call_count == 3

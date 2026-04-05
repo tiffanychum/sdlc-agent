@@ -1,90 +1,93 @@
 """
 utils/retry.py
-==============
-Provides a ``retry`` decorator that automatically retries a function call
-up to *max_attempts* times when it raises an exception, with an optional
-fixed delay between attempts.
+--------------
+Provides the `retry` decorator for automatically retrying a function call
+on exception.
 
-Typical usage
--------------
-::
+Usage example::
 
-    from utils.retry import retry
-
-    @retry(max_attempts=3, delay=1.0)
-    def flaky_network_call():
+    @retry(times=3, delay=0.5, exceptions=(ValueError, IOError))
+    def flaky_operation():
         ...
+
 """
 
-from __future__ import annotations
-
+import time
 import functools
 import logging
-import time
-from typing import Callable, Optional, Type, Tuple, TypeVar, Any
+from typing import Tuple, Type
 
 logger = logging.getLogger(__name__)
 
-F = TypeVar("F", bound=Callable[..., Any])
-
 
 def retry(
-    max_attempts: int = 3,
+    times: int = 3,
     delay: float = 0.0,
     exceptions: Tuple[Type[BaseException], ...] = (Exception,),
-) -> Callable[[F], F]:
-    """Decorator – retry *func* up to *max_attempts* times on exception.
+):
+    """Decorator that retries the wrapped function up to *times* attempts.
 
     Parameters
     ----------
-    max_attempts:
-        Total number of times the decorated function may be called.
-        Must be >= 1.  A value of 1 means no retries (one attempt only).
-    delay:
-        Seconds to wait between attempts.  Must be >= 0.
-    exceptions:
-        Tuple of exception types that trigger a retry.  Defaults to
-        ``(Exception,)``.  Only exceptions whose type is a subclass of one
-        of these will be caught; all others propagate immediately.
+    times : int
+        Maximum number of attempts (must be >= 1).  The first call counts as
+        attempt #1, so the function is retried at most ``times - 1`` extra
+        times.
+    delay : float
+        Seconds to wait between attempts.  Must be >= 0.  Defaults to 0.
+    exceptions : tuple of exception types
+        Only retry when one of these exception types is raised.  Any other
+        exception propagates immediately without retrying.  Defaults to
+        ``(Exception,)``.
 
     Returns
     -------
     Callable
-        The decorated function with retry behaviour applied.
+        A decorator that wraps the target function with retry logic.
 
     Raises
     ------
     ValueError
-        If *max_attempts* < 1 or *delay* < 0.
+        If *times* < 1 or *delay* < 0.
+    TypeError
+        If *exceptions* is not a tuple of exception types.
     """
-    if max_attempts < 1:
-        raise ValueError(f"max_attempts must be >= 1, got {max_attempts!r}")
+    if not isinstance(times, int) or times < 1:
+        raise ValueError(f"`times` must be an integer >= 1, got {times!r}")
     if delay < 0:
-        raise ValueError(f"delay must be >= 0, got {delay!r}")
+        raise ValueError(f"`delay` must be >= 0, got {delay!r}")
+    if not isinstance(exceptions, tuple) or not exceptions:
+        raise TypeError(
+            "`exceptions` must be a non-empty tuple of exception types, "
+            f"got {exceptions!r}"
+        )
 
-    def decorator(func: F) -> F:
+    def decorator(func):
         @functools.wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            last_exception: Optional[BaseException] = None
+        def wrapper(*args, **kwargs):
+            last_exception: BaseException | None = None
 
-            for attempt in range(1, max_attempts + 1):
+            for attempt in range(1, times + 1):
                 try:
                     return func(*args, **kwargs)
                 except exceptions as exc:
                     last_exception = exc
                     logger.warning(
-                        "Attempt %d/%d for '%s' failed: %s: %s",
+                        "Attempt %d/%d for %r failed with %s: %s",
                         attempt,
-                        max_attempts,
+                        times,
                         func.__qualname__,
                         type(exc).__name__,
                         exc,
                     )
-                    if attempt < max_attempts and delay > 0:
-                        time.sleep(delay)
+                    if attempt < times:
+                        if delay > 0:
+                            time.sleep(delay)
+                    # Non-matching exceptions propagate immediately (not caught)
 
-            raise last_exception from None  # type: ignore[misc]
+            # All attempts exhausted — re-raise the last captured exception
+            raise last_exception  # type: ignore[misc]
 
-        return wrapper  # type: ignore[return-value]
+        return wrapper
 
     return decorator
