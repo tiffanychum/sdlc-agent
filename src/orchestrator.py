@@ -45,22 +45,26 @@ Available agents:
 {agent_descs}
 
 Strategy options and when to use each:
-- "router_decides" — Route to exactly ONE agent. Use when the task is a single, self-contained \
-action (read a file, run a search, check git status). One agent can do it all alone.
-- "sequential" — Agents run in a strict, predefined order (A then B then C). Use when the task \
-has a clear, fixed pipeline with explicit ordering keywords ("first … then …", "after … do …").
-- "parallel" — All agents run simultaneously on independent sub-tasks. Use when the task \
-explicitly contains multiple independent parts that do not depend on each other and can run \
-at the same time ("simultaneously", "at the same time", "both … and …").
-- "supervisor" — A supervisor dynamically decides which agent runs next after each step. Use for \
-complex tasks requiring multiple agents in an adaptive order (implement → test → deploy), where \
-the next step depends on the outcome of the previous.
+- "router_decides" — Route to exactly ONE agent. Use when the task is a single, self-contained
+  action (read a file, run a search, check git status). One agent can do it all alone.
+- "sequential" — ALL agents in the team run in a fixed, predefined pipeline order. ONLY use this
+  when the task describes a strict end-to-end pipeline where EVERY team role must execute
+  (e.g. "compile → test → security-scan → deploy → notify"). Do NOT choose sequential just
+  because the user says "first … then …" — that phrasing alone describes a 2-step task, not
+  a full pipeline.
+- "parallel" — All agents run simultaneously on independent sub-tasks. Use only when the task
+  explicitly contains multiple INDEPENDENT parts that share no dependencies and can truly run
+  at the same time ("simultaneously", "at the same time", "both … and …").
+- "supervisor" — A supervisor dynamically decides which agent runs next after each step. Use for
+  ANY multi-step task where only a SUBSET of agents are needed (implement + test, review + write,
+  research + implement, etc.). Prefer supervisor whenever only 2–3 specific agents are needed;
+  it is more efficient and adaptive than sequential.
 
 Decision rules (apply in order):
 1. If the task is ONE clear action → "router_decides"
-2. If the task uses "first … then …" or "after … write/do …" with a fixed pipeline → "sequential"
-3. If the task says "simultaneously", "at the same time", or has clearly independent sub-tasks → "parallel"
-4. If the task spans multiple agents and the flow is complex or adaptive → "supervisor"
+2. If the task says "simultaneously", "at the same time", or has clearly INDEPENDENT sub-tasks → "parallel"
+3. If the task describes a strict full-team pipeline where EVERY agent role must run → "sequential"
+4. Otherwise (multi-step, subset of agents, "first X then Y" coding tasks, adaptive workflows) → "supervisor"
 
 User task: {prompt}
 
@@ -126,11 +130,12 @@ def _heuristic_strategy(prompt: str) -> str:
     """
     Keyword-based strategy picker used when the LLM meta-router is unavailable.
 
-    Decision order mirrors the _META_ROUTER_PROMPT rules:
-    1. Parallel markers  → parallel
-    2. Sequential markers → sequential
-    3. Complex / multi-step → supervisor
-    4. Everything else  → router_decides  (single-agent tasks)
+    Decision order (aligns with updated _META_ROUTER_PROMPT):
+    1. Parallel markers → parallel
+    2. Whole-team pipeline markers → sequential (rare — only full-pipeline tasks)
+    3. Multi-step / "first then" tasks → supervisor (NOT sequential — sequential
+       runs ALL agents; supervisor is smarter for 2-3 agent tasks)
+    4. Single-action → router_decides
     """
     text = prompt.lower()
     # Parallel signals
@@ -139,18 +144,17 @@ def _heuristic_strategy(prompt: str) -> str:
         "both … and", "both and ", "two independent", "two completely independent",
     )):
         return "parallel"
-    # Sequential signals
+    # True full-pipeline sequential (rare — only explicit full-team pipelines)
     if any(kw in text for kw in (
-        "first … then", "first, then", "after that", "afterwards",
-        "step 1", "step 2", "step one", "step two",
-        "then based on", "then fix", "then write", "then deploy",
-        "first review", "first read", "first search",
+        "compile then test then deploy", "build pipeline",
+        "step 1", "step 2", "step 3",
     )):
         return "sequential"
-    # Complex multi-step / ambiguous → supervisor
+    # Multi-step tasks (including "first X then Y" coding tasks) → supervisor
     if any(kw in text for kw in (
-        "implement", "build", "create a", "develop", "design",
-        "multiple", "several", "various", "complex",
+        "first ", "then ", "after that", "afterwards",
+        "implement", "build", "write", "create", "develop", "design",
+        "multiple", "several", "various", "complex", "review", "test",
     )):
         return "supervisor"
     # Simple single-action → router_decides
@@ -522,12 +526,13 @@ def _build_supervisor_graph(agents_config, built_agents, checkpointer=None,
     agent_descs = "\n".join(f'- "{a["role"]}": {a["description"]}' for a in agents_config)
     agent_names = ", ".join(f'"{a["role"]}"' for a in agents_config)
 
-    supervisor_prompt = f"""You are a supervisor agent. Decide which agent handles the task, or if it's complete.
+    supervisor_prompt = f"""You are a supervisor. Look at what has been done so far and decide what to do next.
 
-Available agents:
+Agents: {agent_names}
 {agent_descs}
 
-Respond with ONLY "DONE" or an agent name ({agent_names})."""
+Reply with ONLY "DONE" (if every part of the original request is complete) or ONLY one agent name.
+Check ALL deliverables before saying DONE — e.g. if files need to be written AND tested, both must be finished."""
 
     async def supervisor_decide(state: OrchestratorState) -> OrchestratorState:
         iterations = state.get("supervisor_iterations", 0)

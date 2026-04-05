@@ -254,7 +254,7 @@ def make_planner_executor(role: str, built_agents: dict, exec_agent=None, agent_
     async def execute(state: dict) -> dict:
         from src.orchestrator import _ensure_messages, _extract_text
         from src.llm.client import get_llm
-        from langchain_core.messages import HumanMessage, SystemMessage
+        from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
         msgs = _ensure_messages(state["messages"])
 
@@ -266,7 +266,14 @@ def make_planner_executor(role: str, built_agents: dict, exec_agent=None, agent_
             "Do NOT execute anything yet. Just output a clear numbered plan.\n"
             "Format: one step per line, numbered 1. 2. 3. etc."
         ))
-        plan_response = await planning_llm.ainvoke([plan_prompt, *msgs])
+        # Some models (e.g. Claude) reject requests where the conversation ends
+        # with an AIMessage. In sequential flows a prior agent's AIMessage may be
+        # the last message in state. Add a sentinel to keep the API happy.
+        planning_msgs = list(msgs)
+        if planning_msgs and isinstance(planning_msgs[-1], AIMessage):
+            planning_msgs = [*planning_msgs,
+                             HumanMessage(content="Now create your numbered plan for the request above.")]
+        plan_response = await planning_llm.ainvoke([plan_prompt, *planning_msgs])
         plan_text = _extract_text(plan_response.content)
         plan_steps = _parse_plan(plan_text)
 

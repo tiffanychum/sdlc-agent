@@ -30,6 +30,22 @@ LATENCY_REGRESSION_THRESHOLD = 0.20
 QUALITY_REGRESSION_THRESHOLD = -0.10
 
 
+def _auto_approve_hitl(iv) -> dict:
+    """Return the appropriate auto-approve resume value for a HITL interrupt."""
+    if not isinstance(iv, dict):
+        return {"approved": True, "answer": "auto-approved for regression test"}
+    htype = iv.get("type", "")
+    if htype == "plan_review":
+        return {"type": "plan_review", "approved": True, "edited_plan": iv.get("plan", [])}
+    if htype == "action_confirmation":
+        return {"type": "action_confirmation", "approved": True}
+    if htype == "tool_review":
+        return {"type": "tool_review", "action": "continue"}
+    if htype == "clarification":
+        return {"type": "clarification", "answer": "Yes, proceed exactly as planned."}
+    return {"approved": True, "answer": "auto-approved for regression test"}
+
+
 class RegressionRunner:
     def __init__(
         self,
@@ -151,42 +167,26 @@ class RegressionRunner:
 
                 # Collect ALL pending interrupts across all tasks (parallel strategy
                 # can produce multiple simultaneous HITL interrupts).
-                pending_interrupts = []
+                # Build a dict mapping interrupt.id -> auto-approved value, because
+                # LangGraph requires interrupt IDs when there are multiple pending interrupts.
+                interrupt_map: dict = {}
                 if state.tasks:
                     for task in state.tasks:
                         if hasattr(task, "interrupts") and task.interrupts:
                             for intr in task.interrupts:
-                                pending_interrupts.append(intr)
+                                iv = intr.value if hasattr(intr, "value") else intr
+                                interrupt_map[intr.id] = _auto_approve_hitl(iv)
 
-                def _auto_approve(iv):
-                    """Return the appropriate auto-approve resume value for one interrupt."""
-                    if not isinstance(iv, dict):
-                        return {"approved": True, "answer": "auto-approved for regression test"}
-                    htype = iv.get("type", "")
-                    if htype == "plan_review":
-                        return {"type": "plan_review", "approved": True,
-                                "edited_plan": iv.get("plan", [])}
-                    if htype == "action_confirmation":
-                        return {"type": "action_confirmation", "approved": True}
-                    if htype == "tool_review":
-                        return {"type": "tool_review", "action": "continue"}
-                    if htype == "clarification":
-                        return {"type": "clarification",
-                                "answer": "Yes, proceed exactly as planned."}
-                    return {"approved": True, "answer": "auto-approved for regression test"}
-
-                if not pending_interrupts:
-                    # No interrupts found but state.next is set — just resume with default
+                if not interrupt_map:
+                    # No interrupt IDs found — use plain default resume value
                     resume_cmd = LGCommand(resume={"approved": True,
                                                    "answer": "auto-approved for regression test"})
-                elif len(pending_interrupts) == 1:
-                    resume_cmd = LGCommand(resume=_auto_approve(pending_interrupts[0].value))
+                elif len(interrupt_map) == 1:
+                    # Single interrupt — plain value is fine (avoids unnecessary nesting)
+                    resume_cmd = LGCommand(resume=next(iter(interrupt_map.values())))
                 else:
-                    # Multiple parallel interrupts — resume each one with its own approved value.
-                    # LangGraph expects a list whose length matches the number of pending interrupts.
-                    resume_cmd = LGCommand(
-                        resume=[_auto_approve(intr.value) for intr in pending_interrupts]
-                    )
+                    # Multiple parallel interrupts — LangGraph requires dict keyed by interrupt.id
+                    resume_cmd = LGCommand(resume=interrupt_map)
 
                 result = await orchestrator.ainvoke(resume_cmd, config=config)
 
