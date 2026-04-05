@@ -186,8 +186,12 @@ class TestEvalScenarios:
         for s in SCENARIOS:
             assert s.name, "Scenario missing name"
             assert s.prompt, "Scenario missing prompt"
-            assert s.expected_agent in ("coder", "runner", "researcher"), \
-                f"Invalid expected_agent: {s.expected_agent}"
+            valid_agents = {
+                "coder", "tester", "devops", "researcher",
+                "reviewer", "planner", "project_manager", "business_analyst",
+            }
+            assert s.expected_agent in valid_agents, \
+                f"Invalid expected_agent: {s.expected_agent} (must be one of {sorted(valid_agents)})"
 
     def test_scenario_names_unique(self):
         names = [s.name for s in SCENARIOS]

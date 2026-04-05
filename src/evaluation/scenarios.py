@@ -35,14 +35,14 @@ QUICK_SCENARIOS = [
     EvalScenario(
         name="run_tests",
         prompt="Run the test suite and tell me the results",
-        expected_agent="runner", expected_tools=["run_tests"],
+        expected_agent="tester", expected_tools=["run_tests"],
         success_keywords=["test", "pass", "fail"],
         expected_min_steps=1, complexity="quick",
     ),
     EvalScenario(
         name="check_git_status",
         prompt="What is the current git status? Show me changed files.",
-        expected_agent="coder", expected_tools=["git_status"],
+        expected_agent="devops", expected_tools=["git_status"],
         success_keywords=["modified", "clean", "branch"],
         expected_min_steps=1, complexity="quick",
     ),
@@ -67,9 +67,9 @@ QUICK_SCENARIOS = [
 MEDIUM_SCENARIOS = [
     EvalScenario(
         name="search_and_read",
-        prompt="Find where the AgentConfig class is defined, then read that file and explain the class",
+        prompt="Find where AGENT_DEFINITIONS is defined, then read that file and explain what each entry contains",
         expected_agent="coder", expected_tools=["search_files", "read_file"],
-        success_keywords=["AgentConfig", "name", "role", "description"],
+        success_keywords=["AGENT_DEFINITIONS", "prompt", "tools", "role"],
         expected_min_steps=2, complexity="medium",
     ),
     EvalScenario(
@@ -82,7 +82,7 @@ MEDIUM_SCENARIOS = [
     EvalScenario(
         name="run_specific_test",
         prompt="Run only the test_evaluation.py tests and report how many passed",
-        expected_agent="runner", expected_tools=["run_tests", "run_command"],
+        expected_agent="tester", expected_tools=["run_tests", "run_command"],
         success_keywords=["passed", "test"],
         expected_min_steps=1, complexity="medium",
     ),
@@ -96,7 +96,7 @@ MEDIUM_SCENARIOS = [
     EvalScenario(
         name="git_history_analysis",
         prompt="Show me the last 5 commits and explain what changes were made recently",
-        expected_agent="coder", expected_tools=["git_log"],
+        expected_agent="devops", expected_tools=["git_log"],
         success_keywords=["commit"],
         expected_min_steps=1, complexity="medium",
     ),
@@ -124,7 +124,7 @@ COMPLEX_SCENARIOS = [
     EvalScenario(
         name="test_debug_cycle",
         prompt="Run all the tests. If any fail, find the test file and read the failing test to understand what it expects.",
-        expected_agent="runner",
+        expected_agent="tester",
         expected_tools=["run_tests", "run_command"],
         success_keywords=["test", "pass"],
         expected_min_steps=2, complexity="complex",

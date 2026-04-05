@@ -175,6 +175,9 @@ class GoldenTestCase(Base):
     complexity = Column(String, default="quick")
     version = Column(String, default="1.0")
     reference_output = Column(Text, default="")
+    # "auto", "supervisor", "sequential", "parallel", "router_decides", or None (team default)
+    strategy = Column(String, nullable=True)
+    expected_strategy = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -216,9 +219,84 @@ class RegressionResult(Base):
     rca_analysis = Column(JSON, nullable=True)
     model_used = Column(String, default="")
     prompt_version = Column(String, default="v1")
+    # Strategy fields: what was configured vs what was actually executed
+    expected_strategy = Column(String, nullable=True)
+    actual_strategy = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     eval_run = relationship("EvalRun", back_populates="regression_results")
+
+
+# ── RAG Pipeline ─────────────────────────────────────────────────
+
+class RagConfig(Base):
+    """Stores the full configuration for one RAG pipeline instance."""
+    __tablename__ = "rag_configs"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    name = Column(String, nullable=False)
+    description = Column(Text, default="")
+    embedding_model = Column(String, default="openai/text-embedding-3-small")
+    vector_store = Column(String, default="chroma")
+    llm_model = Column(String, nullable=True)
+    chunk_size = Column(Integer, default=1000)
+    chunk_overlap = Column(Integer, default=200)
+    chunk_strategy = Column(String, default="recursive")
+    retrieval_strategy = Column(String, default="similarity")
+    top_k = Column(Integer, default=5)
+    mmr_lambda = Column(Float, default=0.5)
+    multi_query_n = Column(Integer, default=3)
+    system_prompt = Column(Text, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    sources = relationship("RagSource", back_populates="config", cascade="all, delete-orphan")
+    queries = relationship("RagQuery", back_populates="config", cascade="all, delete-orphan")
+
+
+class RagSource(Base):
+    """One document source ingested into a RAG pipeline."""
+    __tablename__ = "rag_sources"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    config_id = Column(String, ForeignKey("rag_configs.id"), nullable=False)
+    source_type = Column(String, nullable=False)   # text | file | url
+    content = Column(Text, nullable=False)          # raw text, file path, or URL
+    label = Column(String, default="")              # user-friendly name
+    chunks_count = Column(Integer, default=0)
+    tokens_estimated = Column(Integer, default=0)
+    status = Column(String, default="pending")      # pending | ingested | error
+    error_message = Column(Text, nullable=True)
+    ingested_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    config = relationship("RagConfig", back_populates="sources")
+
+
+class RagQuery(Base):
+    """One RAG chat query log with citations, metrics, and evaluation."""
+    __tablename__ = "rag_queries"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    config_id = Column(String, ForeignKey("rag_configs.id"), nullable=False)
+    query = Column(Text, nullable=False)
+    answer = Column(Text, default="")
+    citations = Column(JSON, default=list)          # list of {source, chunk, page, score, snippet}
+    strategy_used = Column(String, default="similarity")
+    chunks_retrieved = Column(Integer, default=0)
+    tokens_in = Column(Integer, default=0)
+    tokens_out = Column(Integer, default=0)
+    latency_ms = Column(Float, default=0.0)
+    # Evaluation results (populated async after query)
+    eval_scores = Column(JSON, nullable=True)       # {metric: {score, passed, reason}}
+    eval_status = Column(String, default="pending") # pending | running | done | error
+    eval_error = Column(Text, nullable=True)
+    # Tracing linkage
+    trace_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    config = relationship("RagConfig", back_populates="queries")
 
 
 # ── Prompt Versioning ────────────────────────────────────────────

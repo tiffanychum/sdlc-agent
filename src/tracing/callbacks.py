@@ -17,11 +17,17 @@ class TracingCallbackHandler(BaseCallbackHandler):
 
     def __init__(self, collector: TraceCollector):
         self.collector = collector
-        self._span_map: dict[str, str] = {}
+        # Maps run_id -> (span_id, model_at_start) so on_llm_end can fall back
+        # to the model name already known at start time.
+        self._span_map: dict[str, tuple[str, str]] = {}
 
     def on_llm_start(self, serialized: dict, prompts: list[str], *, run_id, **kwargs):
         kw = serialized.get("kwargs", {})
-        model = kw.get("model_name") or kw.get("model") or kwargs.get("invocation_params", {}).get("model", "unknown")
+        model = (
+            kw.get("model_name") or kw.get("model")
+            or kwargs.get("invocation_params", {}).get("model", "")
+            or ""
+        )
         span_id = self.collector.start_span(
             name=f"llm_call:{model}",
             span_type="llm_call",
@@ -31,12 +37,13 @@ class TracingCallbackHandler(BaseCallbackHandler):
                 "gen_ai.prompt.count": len(prompts),
             },
         )
-        self._span_map[str(run_id)] = span_id
+        self._span_map[str(run_id)] = (span_id, model)
 
     def on_llm_end(self, response: LLMResult, *, run_id, **kwargs):
-        span_id = self._span_map.pop(str(run_id), None)
-        if not span_id:
+        entry = self._span_map.pop(str(run_id), None)
+        if not entry:
             return
+        span_id, model_at_start = entry
 
         tokens_in = 0
         tokens_out = 0
@@ -46,29 +53,42 @@ class TracingCallbackHandler(BaseCallbackHandler):
             usage = response.llm_output.get("token_usage", {})
             tokens_in = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
             tokens_out = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
-            model = response.llm_output.get("model_name", "") or response.llm_output.get("model", "")
+            model = (
+                response.llm_output.get("model_name", "")
+                or response.llm_output.get("model", "")
+            )
 
-        if not tokens_in and response.generations:
+        if response.generations:
             for gen_list in response.generations:
                 for gen in gen_list:
                     gen_info = getattr(gen, "generation_info", {}) or {}
-                    meta = gen_info if gen_info else {}
-                    if not tokens_in and meta.get("token_usage"):
-                        tokens_in = meta["token_usage"].get("prompt_tokens", 0)
-                        tokens_out = meta["token_usage"].get("completion_tokens", 0)
+                    if not tokens_in and gen_info.get("token_usage"):
+                        tokens_in = gen_info["token_usage"].get("prompt_tokens", 0)
+                        tokens_out = gen_info["token_usage"].get("completion_tokens", 0)
                     msg = getattr(gen, "message", None)
                     if msg:
                         resp_meta = getattr(msg, "response_metadata", {}) or {}
-                        u = resp_meta.get("token_usage") or resp_meta.get("usage", {})
-                        if u and not tokens_in:
-                            tokens_in = u.get("prompt_tokens", 0) or u.get("input_tokens", 0)
-                            tokens_out = u.get("completion_tokens", 0) or u.get("output_tokens", 0)
-                        if not model and resp_meta.get("model_name"):
-                            model = resp_meta["model_name"]
+                        # Token counts — try multiple key variants (OpenAI / Anthropic)
+                        if not tokens_in:
+                            u = resp_meta.get("token_usage") or resp_meta.get("usage", {}) or {}
+                            tokens_in = (u.get("prompt_tokens") or u.get("input_tokens") or 0)
+                            tokens_out = (u.get("completion_tokens") or u.get("output_tokens") or 0)
+                        # Model name — try model_name / model / OpenAI-style keys
+                        if not model:
+                            model = (
+                                resp_meta.get("model_name") or resp_meta.get("model")
+                                or resp_meta.get("system_fingerprint", "").split("-")[0]
+                                or ""
+                            )
+                        # Anthropic usage_metadata on the message
                         um = getattr(msg, "usage_metadata", None)
                         if um and not tokens_in:
                             tokens_in = getattr(um, "input_tokens", 0) or 0
                             tokens_out = getattr(um, "output_tokens", 0) or 0
+
+        # Fall back to the model name captured at on_llm_start if still unknown
+        if not model:
+            model = model_at_start
 
         self.collector.end_span(
             span_id, tokens_in=tokens_in, tokens_out=tokens_out, model=model,
@@ -81,8 +101,9 @@ class TracingCallbackHandler(BaseCallbackHandler):
         )
 
     def on_llm_error(self, error: BaseException, *, run_id, **kwargs):
-        span_id = self._span_map.pop(str(run_id), None)
-        if span_id:
+        entry = self._span_map.pop(str(run_id), None)
+        if entry:
+            span_id, _ = entry
             self.collector.end_span(span_id, error=str(error))
 
     def on_tool_start(self, serialized: dict, input_str: str, *, run_id, **kwargs):

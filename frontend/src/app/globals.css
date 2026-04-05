@@ -1,97 +1,129 @@
 @import "tailwindcss";
 
+/* ─── Design tokens: monochromatic zinc palette ─────────────────────────────
+   Primary accent = zinc-900 (near-black). All interactive elements use this.
+   No blue accent — colours are only used where they carry semantic meaning
+   (errors, success, warnings) or for data visualisation charts.
+   ─────────────────────────────────────────────────────────────────────────── */
+
 :root {
-  --bg: #f8f9fb;
-  --bg-card: #ffffff;
-  --bg-hover: #f1f3f5;
-  --bg-sidebar: #fafbfc;
-  --border: #e5e7eb;
-  --text: #111827;
-  --text-muted: #6b7280;
-  --accent: #2563eb;
-  --accent-hover: #1d4ed8;
-  --accent-light: #eff6ff;
-  --success: #16a34a;
-  --success-light: #f0fdf4;
-  --warning: #ca8a04;
-  --warning-light: #fefce8;
-  --error: #dc2626;
-  --error-light: #fef2f2;
-  --purple: #7c3aed;
+  --bg:           #fafafa;
+  --bg-card:      #ffffff;
+  --bg-hover:     #f4f4f5;   /* zinc-100 */
+  --bg-sidebar:   #fafafa;
+  --border:       #e4e4e7;   /* zinc-200 */
+  --text:         #18181b;   /* zinc-900 */
+  --text-muted:   #71717a;   /* zinc-500 */
+  --text-secondary: #52525b; /* zinc-600 */
+  --accent:       #18181b;   /* zinc-900 — buttons, active states, links */
+  --accent-hover: #3f3f46;   /* zinc-700 */
+  --accent-light: #f4f4f5;   /* zinc-100 — active bg tint */
+  --success:      #16a34a;
+  --success-light:#f0fdf4;
+  --warning:      #d97706;
+  --warning-light:#fffbeb;
+  --error:        #dc2626;
+  --error-light:  #fef2f2;
+  /* kept for semantic agent/tool badges only */
+  --purple:       #6d28d9;
   --purple-light: #f5f3ff;
 }
 
 body {
   background: var(--bg);
   color: var(--text);
+  -webkit-font-smoothing: antialiased;
 }
+
+/* ─── Cards ─────────────────────────────────────────────────────────────── */
 
 .card {
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 20px;
-  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
 }
+
+/* ─── Buttons ───────────────────────────────────────────────────────────── */
 
 .btn-primary {
   background: var(--accent);
-  color: white;
+  color: #fff;
   padding: 7px 14px;
-  border-radius: 7px;
+  border-radius: 8px;
   font-size: 13px;
   font-weight: 500;
-  transition: background 0.15s;
   cursor: pointer;
+  transition: background 0.12s;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
-.btn-primary:hover { background: var(--accent-hover); }
-.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+.btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
 
 .btn-secondary {
-  background: var(--bg);
+  background: var(--bg-card);
   color: var(--text);
   border: 1px solid var(--border);
   padding: 7px 14px;
-  border-radius: 7px;
+  border-radius: 8px;
   font-size: 13px;
   font-weight: 500;
-  transition: all 0.15s;
   cursor: pointer;
+  transition: all 0.12s;
 }
-.btn-secondary:hover { background: var(--bg-hover); }
+.btn-secondary:hover { background: var(--bg-hover); border-color: #a1a1aa; }
 
 .btn-ghost {
   color: var(--text-muted);
   padding: 7px 14px;
-  border-radius: 7px;
+  border-radius: 8px;
   font-size: 13px;
-  transition: all 0.15s;
   cursor: pointer;
+  transition: all 0.12s;
 }
 .btn-ghost:hover { color: var(--text); background: var(--bg-hover); }
 
 .btn-danger {
-  color: var(--error);
+  color: var(--text-muted);
   padding: 7px 14px;
-  border-radius: 7px;
+  border-radius: 8px;
   font-size: 13px;
-  transition: all 0.15s;
   cursor: pointer;
+  transition: all 0.12s;
 }
-.btn-danger:hover { background: var(--error-light); }
+.btn-danger:hover { color: var(--error); background: var(--error-light); }
+
+/* ─── Inputs & selects ──────────────────────────────────────────────────── */
 
 .input {
   background: var(--bg-card);
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-radius: 8px;
   padding: 7px 11px;
   font-size: 13px;
   color: var(--text);
   width: 100%;
   outline: none;
-  transition: border-color 0.15s;
+  transition: border-color 0.12s;
+  font-family: inherit;
 }
-.input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-light); }
+.input:focus { border-color: #a1a1aa; }
+.input::placeholder { color: #a1a1aa; }
+
+/* Consistent custom arrow for all select elements */
+select.input {
+  -webkit-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' fill='none'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23a1a1aa' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
+  cursor: pointer;
+}
+
+/* ─── Badges ────────────────────────────────────────────────────────────── */
 
 .badge {
   font-size: 11px;
@@ -99,4 +131,16 @@ body {
   border-radius: 99px;
   font-weight: 500;
   display: inline-block;
+  line-height: 1.5;
+}
+
+/* ─── Tailwind-compatible select override (for elements not using .input) ─ */
+
+select {
+  -webkit-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' fill='none'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23a1a1aa' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px !important;
 }

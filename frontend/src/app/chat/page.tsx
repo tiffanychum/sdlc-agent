@@ -7,7 +7,12 @@ import { api, SSEEvent } from "@/lib/api";
 // ── Types ────────────────────────────────────────────────────────
 
 interface ToolCall { tool: string; args: Record<string, any>; agent?: string }
-interface SpanInfo { id: string; name: string; span_type: string; tokens_in: number; tokens_out: number; cost: number; model: string; status: string; error?: string | null }
+interface SpanInfo {
+  id: string; name: string; span_type: string;
+  tokens_in: number; tokens_out: number; cost: number;
+  model: string; status: string; error?: string | null;
+  agent?: string;
+}
 interface TraceInfo { trace_id: string; total_latency_ms: number; total_tokens: number; total_cost: number; spans: SpanInfo[] }
 
 interface Message {
@@ -62,8 +67,8 @@ const CONVOS_KEY = "sdlc_conversations";
 const LAST_TRACE_KEY = "sdlc_last_trace";
 const CHAT_MODEL_KEY = "sdlc_chat_model";
 const TYPE_DOT: Record<string, string> = {
-  routing: "bg-blue-500", llm_call: "bg-purple-500", tool_call: "bg-green-500",
-  agent_execution: "bg-cyan-500", hitl: "bg-orange-500", supervisor: "bg-yellow-500",
+  routing: "bg-blue-400", llm_call: "bg-violet-400", tool_call: "bg-emerald-400",
+  agent_execution: "bg-sky-400", hitl: "bg-orange-400", supervisor: "bg-amber-400",
 };
 
 function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
@@ -84,6 +89,73 @@ function titleFromMessages(msgs: Message[]): string {
   if (!first) return "New Chat";
   const t = first.content.slice(0, 40);
   return t.length < first.content.length ? t + "..." : t;
+}
+
+/**
+ * Human-readable label for a span row.
+ * - llm_call  → model shortname (e.g. "claude-sonnet-4-6")
+ * - tool_call → tool name (suffix after first ":")
+ * - others    → name suffix after first ":" or bare name
+ */
+function spanDisplayLabel(s: SpanInfo): { primary: string; badge?: string } {
+  if (s.span_type === "llm_call") {
+    const model = s.model ? (s.model.split("/").pop() || s.model) : (s.name.split(":").slice(1).join(":") || "llm");
+    return { primary: model, badge: "llm" };
+  }
+  if (s.span_type === "tool_call") {
+    const tool = s.name.split(":").slice(1).join(":") || s.name;
+    return { primary: tool, badge: "tool" };
+  }
+  const label = s.name.split(":").slice(1).join(":") || s.name;
+  return { primary: label };
+}
+
+/** Model shortname helper. */
+function shortModel(model: string): string {
+  return model ? (model.split("/").pop() || model) : "";
+}
+
+/**
+ * Group completed trace spans by agent for sequential display.
+ *
+ * The backend emits spans in end-order:
+ *   routing → llm_call:model → tool:name → agent:agent_name
+ *
+ * The "agent_execution" span always ends last and wraps all its children.
+ * We scan the flat list: collect pending llm/tool spans until we hit an
+ * agent_execution span, then bundle them as that agent's group.
+ * Routing/supervisor spans are placed in a "system" group first.
+ */
+interface AgentGroup { agent: string; agentSpan?: SpanInfo; spans: SpanInfo[] }
+
+function groupSpansByAgent(spans: SpanInfo[]): AgentGroup[] {
+  const systemSpans: SpanInfo[] = [];
+  const groups: AgentGroup[] = [];
+  let pending: SpanInfo[] = [];
+
+  for (const s of spans) {
+    if (s.span_type === "routing" || s.span_type === "supervisor") {
+      systemSpans.push(s);
+    } else if (s.span_type === "agent_execution") {
+      // Suffix of "agent:{name}" is the real agent name
+      const agentName = s.name.includes(":") ? s.name.split(":").slice(1).join(":") : s.name;
+      groups.push({ agent: agentName, agentSpan: s, spans: [...pending] });
+      pending = [];
+    } else {
+      pending.push(s);
+    }
+  }
+
+  // Orphaned spans (no wrapping agent_execution) — show under their type
+  if (pending.length > 0) {
+    groups.push({ agent: "agent", spans: pending });
+  }
+
+  if (systemSpans.length > 0) {
+    groups.unshift({ agent: "system", spans: systemSpans });
+  }
+
+  return groups;
 }
 
 // ── Markdown ─────────────────────────────────────────────────────
@@ -143,6 +215,9 @@ export default function ChatPage() {
   const [input, setInput] = useState("");
   const [threadId, setThreadId] = useState<string | null>(null);
 
+  // Which assistant message is selected (its trace shows in inspector)
+  const [selectedMsgIndex, setSelectedMsgIndex] = useState<number | null>(null);
+
   const [queryActive, setQueryActive] = useState(false);
   const [inputLocked, setInputLocked] = useState(false);
   const [statusText, setStatusText] = useState("Working...");
@@ -161,8 +236,9 @@ export default function ChatPage() {
   const [pendingHITL, setPendingHITL] = useState<HITLData | null>(null);
   const [activeTrace, setActiveTrace] = useState<TraceInfo | null>(null);
 
-  // Track which agent is active when a span starts so we can group accurately
+  // Ref mirrors for stale-closure-safe reads inside the SSE callback
   const agentRef = useRef<string | null>(null);
+  const thinkingTextRef = useRef("");
 
   const endRef = useRef<HTMLDivElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
@@ -188,7 +264,6 @@ export default function ChatPage() {
       setThreadId(latest.threadId);
       setTeamId(latest.teamId);
     }
-    // Restore last trace and model preference from localStorage
     try {
       const saved = localStorage.getItem(LAST_TRACE_KEY);
       if (saved) setActiveTrace(JSON.parse(saved));
@@ -200,7 +275,7 @@ export default function ChatPage() {
     setHydrated(true);
   }, []);
 
-  // Persist last trace and model preference
+  // Persist last trace
   useEffect(() => {
     if (!hydrated) return;
     try {
@@ -208,6 +283,7 @@ export default function ChatPage() {
     } catch { /* quota */ }
   }, [activeTrace, hydrated]);
 
+  // Persist model preference
   useEffect(() => {
     if (!hydrated) return;
     try { localStorage.setItem(CHAT_MODEL_KEY, chatModel); } catch { /* quota */ }
@@ -241,12 +317,16 @@ export default function ChatPage() {
   // ── Reset helpers ──────────────────────────────────────────
   const resetLiveState = useCallback(() => {
     setLiveSpans([]); setTrajectory([]); setActiveAgent(null); setActiveTool(null);
-    setLiveTokens(0); setLiveCost(0); setThinkingText(""); setThinkingCollapsed(false);
+    setLiveTokens(0); setLiveCost(0);
+    setThinkingText(""); thinkingTextRef.current = "";
+    setThinkingCollapsed(false);
     setPendingHITL(null); setElapsedFinal(0); setActiveTrace(null);
+    setSelectedMsgIndex(null);
     agentRef.current = null;
   }, []);
 
   // ── SSE handler ────────────────────────────────────────────
+  // Uses refs for values that need to be current inside the stable callback
   const handleSSEEvent = useCallback((event: SSEEvent) => {
     const { type, data } = event;
     switch (type) {
@@ -291,7 +371,8 @@ export default function ChatPage() {
         break;
 
       case "llm_token":
-        setThinkingText(prev => prev + data.token);
+        thinkingTextRef.current += data.token;
+        setThinkingText(thinkingTextRef.current);
         break;
 
       case "trace_span": {
@@ -310,7 +391,8 @@ export default function ChatPage() {
       }
 
       case "hitl_request": {
-        const capturedThinkingHITL = thinkingText;
+        // Read from ref to avoid stale closure
+        const capturedThinkingHITL = thinkingTextRef.current;
         setInputLocked(false);
         setStatusText("Waiting for your input...");
         setPendingHITL(data as HITLData);
@@ -330,24 +412,36 @@ export default function ChatPage() {
             hitl: data as HITLData,
           },
         ]);
+        thinkingTextRef.current = "";
         setThinkingText("");
         break;
       }
 
       case "response": {
-        const capturedThinking = thinkingText;
-        setMessages(prev => [...prev, {
-          role: "assistant", content: data.content, agent: data.agent_used,
-          toolCalls: data.tool_calls, trace: data.trace,
-          thinkingContent: capturedThinking || undefined,
-        }]);
+        // Read from ref to avoid stale closure
+        const capturedThinking = thinkingTextRef.current;
+        setMessages(prev => {
+          const next = [...prev, {
+            role: "assistant" as const,
+            content: data.content,
+            agent: data.agent_used,
+            toolCalls: data.tool_calls,
+            trace: data.trace,
+            thinkingContent: capturedThinking || undefined,
+          }];
+          // Auto-select this new message so its trace shows immediately
+          setSelectedMsgIndex(next.length - 1);
+          return next;
+        });
         setActiveTrace(data.trace || null);
+        thinkingTextRef.current = "";
         setThinkingText("");
         break;
       }
 
       case "error":
         setMessages(prev => [...prev, { role: "assistant", content: `Error: ${data.message}` }]);
+        thinkingTextRef.current = "";
         setThinkingText("");
         break;
 
@@ -364,6 +458,7 @@ export default function ChatPage() {
         ));
         break;
     }
+  // Stable callback — all mutable values read through refs
   }, []);
 
   // ── Conversation management ────────────────────────────────
@@ -382,6 +477,10 @@ export default function ChatPage() {
     setThreadId(c.threadId);
     setTeamId(c.teamId);
     setQueryActive(false); setInputLocked(false);
+    setSelectedMsgIndex(null);
+    // Restore the last assistant message's trace for this conversation
+    const lastAssistant = [...c.messages].reverse().find(m => m.role === "assistant" && m.trace);
+    if (lastAssistant?.trace) setActiveTrace(lastAssistant.trace);
   }
 
   function deleteConversation(id: string) {
@@ -404,6 +503,7 @@ export default function ChatPage() {
   function stopProcessing() {
     abortRef.current?.abort();
     setQueryActive(false); setInputLocked(false);
+    thinkingTextRef.current = "";
     setThinkingText(""); setStatusText("Working...");
   }
 
@@ -436,7 +536,7 @@ export default function ChatPage() {
   async function resumeHITL(response: Record<string, any>) {
     if (!threadId) return;
     setPendingHITL(null); setInputLocked(true);
-    setStatusText("Resuming after your input..."); setThinkingText("");
+    setStatusText("Resuming after your input..."); thinkingTextRef.current = ""; setThinkingText("");
     userNearBottom.current = true;
     abortRef.current = new AbortController();
     try {
@@ -448,6 +548,15 @@ export default function ChatPage() {
     }
   }
 
+  // ── Trace panel selection ──────────────────────────────────
+  function selectMessage(i: number, m: Message) {
+    if (m.role !== "assistant" || !m.trace) return;
+    setSelectedMsgIndex(i);
+    setActiveTrace(m.trace);
+    // Clear live overlay so the historical trace renders
+    setLiveSpans([]); setTrajectory([]);
+  }
+
   const hasLiveData = liveSpans.length > 0 || trajectory.length > 0;
   const showTrace = queryActive || hasLiveData;
   const elapsedMs = liveStartTime
@@ -457,7 +566,7 @@ export default function ChatPage() {
   return (
     <div className="flex h-[calc(100vh-4rem)]">
       {/* ══════ Sidebar ══════ */}
-      <div className="w-56 flex-shrink-0 border-r border-[var(--border)] flex flex-col bg-[var(--bg)]">
+        <div className="w-56 flex-shrink-0 border-r border-[var(--border)] flex flex-col bg-white">
         <div className="p-3 border-b border-[var(--border)]">
           <button onClick={createConversation}
             className="w-full btn-primary !text-[12px] flex items-center justify-center gap-1.5">
@@ -469,14 +578,14 @@ export default function ChatPage() {
             <div key={c.id}
               className={`group flex items-center gap-1.5 px-3 py-2 cursor-pointer border-b border-[var(--border)] transition-colors ${
                 c.id === activeConvoId
-                  ? "bg-[var(--accent-light)] border-l-2 border-l-[var(--accent)]"
-                  : "hover:bg-[var(--bg-card)] border-l-2 border-l-transparent"
+                  ? "bg-zinc-900 border-l-2 border-l-zinc-900"
+                  : "hover:bg-[var(--bg-hover)] border-l-2 border-l-transparent"
               }`}
               onClick={() => c.id !== activeConvoId && switchToConversation(c)}
             >
               <div className="flex-1 min-w-0">
-                <div className="text-[12px] font-medium truncate">{c.title}</div>
-                <div className="text-[10px] text-[var(--text-muted)]">
+                <div className={`text-[12px] font-medium truncate ${c.id === activeConvoId ? "text-white" : ""}`}>{c.title}</div>
+                <div className={`text-[10px] ${c.id === activeConvoId ? "text-zinc-400" : "text-[var(--text-muted)]"}`}>
                   {c.messages.length} msgs &middot; {new Date(c.updatedAt).toLocaleDateString()}
                 </div>
               </div>
@@ -517,7 +626,6 @@ export default function ChatPage() {
               <button onClick={clearCurrentChat} className="btn-ghost !text-[11px]"
                 title="Clear messages in this chat">Clear</button>
             )}
-            {/* Global model override — applies to all agents for this session */}
             <select
               value={chatModel}
               onChange={e => setChatModel(e.target.value)}
@@ -562,34 +670,46 @@ export default function ChatPage() {
                   disabled={inputLocked || pendingHITL?.thread_id !== m.hitl.thread_id} />
               ) : (
                 <div className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-                  <div className={`max-w-[85%] rounded-xl px-4 py-2.5 ${
-                    m.role === "user" ? "bg-[var(--accent)] text-white" : "card !p-3"
-                  }`}>
-                    {m.agent && <div className="text-[11px] text-[var(--accent)] font-medium mb-1">{m.agent}</div>}
+                  {/* Assistant messages are clickable to load their trace */}
+                  <div
+                    onClick={() => selectMessage(i, m)}
+                    className={`max-w-[85%] rounded-xl px-4 py-2.5 transition-all ${
+                      m.role === "user"
+                        ? "bg-zinc-900 text-white"
+                        : `card !p-3 ${m.trace ? "cursor-pointer" : ""} ${
+                            selectedMsgIndex === i
+                              ? "ring-2 ring-zinc-300 ring-offset-1"
+                              : m.trace ? "hover:ring-1 hover:ring-zinc-200" : ""
+                          }`
+                    }`}
+                  >
+                    {m.agent && (
+                      <div className="flex flex-wrap items-center gap-1 mb-1.5">
+                        {m.agent.split(" > ").map((a: string, idx: number) => (
+                          <span key={idx} className="flex items-center gap-1">
+                            {idx > 0 && <span className="text-[10px] text-[var(--text-muted)]">→</span>}
+                            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-zinc-100 text-zinc-600 border border-zinc-200">{a}</span>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Thinking content — expanded by default so users can read it */}
                     {m.thinkingContent && <ThinkingHistory content={m.thinkingContent} />}
+
                     {m.role === "user"
                       ? <div className="text-[13px] whitespace-pre-wrap leading-relaxed">{m.content}</div>
                       : m.content ? <Md content={m.content} /> : null
                     }
-                    {m.toolCalls && m.toolCalls.length > 0 && (
-                      <div className="mt-2 pt-1.5 border-t border-[var(--border)] space-y-0.5">
-                        {m.toolCalls.map((tc, j) => (
-                          <div key={j} className="flex items-center gap-1 text-[11px]">
-                            <span className="text-[var(--success)]">&#10003;</span>
-                            <span className="font-mono">{tc.tool}</span>
-                            {tc.agent && <span className="text-[var(--text-muted)]">({tc.agent})</span>}
-                          </div>
-                        ))}
-                      </div>
-                    )}
+
+                    {/* Trace stats — shown below response, clicking also selects the message */}
                     {m.trace && (
-                      <button onClick={() => { setActiveTrace(m.trace!); resetLiveState(); }}
-                        className="flex gap-3 mt-1.5 text-[10px] text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors">
+                      <div className="flex gap-3 mt-1.5 text-[10px] text-[var(--text-muted)]">
                         <span>{m.trace.total_latency_ms.toFixed(0)}ms</span>
                         <span>{m.trace.total_tokens} tokens</span>
                         <span>${m.trace.total_cost.toFixed(4)}</span>
-                        <span className="underline">{m.trace.spans.length} spans</span>
-                      </button>
+                        <span className="text-zinc-500">{m.trace.spans.length} spans ↗</span>
+                      </div>
                     )}
                   </div>
                 </div>
@@ -597,14 +717,14 @@ export default function ChatPage() {
             </div>
           ))}
 
-          {/* Thinking box */}
+          {/* Live thinking box — stays visible during streaming */}
           {inputLocked && thinkingText && (
             <div className="flex justify-start">
               <div className="max-w-[85%] w-full">
                 <button onClick={() => setThinkingCollapsed(c => !c)}
-                  className="flex items-center gap-1.5 mb-1 text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] transition-colors">
+                  className="flex items-center gap-1.5 mb-1 text-[11px] text-[var(--text-muted)] hover:text-[var(--text)] transition-colors">
                   <span className={`transition-transform text-[9px] ${thinkingCollapsed ? "" : "rotate-90"}`}>&#9654;</span>
-                  <span className="h-2 w-2 rounded-full bg-[var(--accent)] animate-pulse" />
+                  <span className="h-2 w-2 rounded-full bg-zinc-400 animate-pulse" />
                   {activeAgent ? `${activeAgent} is thinking...` : "Thinking..."}
                 </button>
                 {!thinkingCollapsed && (
@@ -623,9 +743,9 @@ export default function ChatPage() {
             <div className="flex justify-start">
               <div className="card !p-3 flex items-center gap-2.5">
                 <div className="flex gap-1">
-                  <div className="h-2 w-2 rounded-full bg-[var(--accent)] animate-bounce [animation-delay:0ms]" />
-                  <div className="h-2 w-2 rounded-full bg-[var(--accent)] animate-bounce [animation-delay:150ms]" />
-                  <div className="h-2 w-2 rounded-full bg-[var(--accent)] animate-bounce [animation-delay:300ms]" />
+                  <div className="h-2 w-2 rounded-full bg-zinc-400 animate-bounce [animation-delay:0ms]" />
+                  <div className="h-2 w-2 rounded-full bg-zinc-400 animate-bounce [animation-delay:150ms]" />
+                  <div className="h-2 w-2 rounded-full bg-zinc-400 animate-bounce [animation-delay:300ms]" />
                 </div>
                 <span className="text-[13px] text-[var(--text-muted)]">{statusText}</span>
               </div>
@@ -634,7 +754,7 @@ export default function ChatPage() {
           <div ref={endRef} />
         </div>
 
-        {/* Input bar with stop button */}
+        {/* Input bar */}
         <div className="flex gap-2 px-4 py-2.5 border-t border-[var(--border)]">
           <input value={input} onChange={e => setInput(e.target.value)}
             onKeyDown={e => e.key === "Enter" && !e.shiftKey && send()}
@@ -653,11 +773,16 @@ export default function ChatPage() {
         </div>
       </div>
 
-      {/* ══════ Trace Panel ══════ */}
+      {/* ══════ Trace Inspector ══════ */}
       <div className="w-72 flex-shrink-0 border-l border-[var(--border)] pl-4 pr-3 py-3 overflow-y-auto">
-        <h2 className="text-sm font-medium text-[var(--text-muted)] mb-3">Trace Inspector</h2>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-medium text-[var(--text-muted)]">Trace Inspector</h2>
+          {selectedMsgIndex !== null && !hasLiveData && (
+            <span className="text-[10px] text-[var(--accent)] font-medium">msg #{selectedMsgIndex + 1}</span>
+          )}
+        </div>
 
-        {/* Trajectory */}
+        {/* Trajectory pills */}
         {trajectory.length > 0 && (
           <div className="mb-4">
             <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide mb-1.5">
@@ -670,15 +795,15 @@ export default function ChatPage() {
                   <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium leading-tight ${
                     t.status === "active"
                       ? t.action.startsWith("hitl:")
-                        ? "bg-orange-50 text-orange-600 ring-1 ring-orange-400 dark:bg-orange-900/20 dark:text-orange-400"
-                        : "bg-[var(--accent-light)] text-[var(--accent)] ring-1 ring-[var(--accent)]"
+                        ? "bg-orange-50 text-orange-600 ring-1 ring-orange-300"
+                        : "bg-zinc-900 text-white ring-1 ring-zinc-700"
                       : t.status === "error"
-                      ? "bg-red-50 text-red-600 dark:bg-red-900/20 dark:text-red-400"
-                      : "bg-[var(--bg)] text-[var(--text-secondary)]"
+                      ? "bg-red-50 text-red-600"
+                      : "bg-zinc-100 text-zinc-500"
                   }`}>
                     {t.status === "active" && (
                       <span className={`h-1.5 w-1.5 rounded-full animate-pulse ${
-                        t.action.startsWith("hitl:") ? "bg-orange-500" : "bg-[var(--accent)]"
+                        t.action.startsWith("hitl:") ? "bg-orange-500" : "bg-white"
                       }`} />
                     )}
                     {t.status === "completed" && <span className="text-green-500 text-[9px]">&#10003;</span>}
@@ -720,17 +845,19 @@ export default function ChatPage() {
           </div>
         )}
 
-        {/* Spans grouped by agent */}
+        {/* Live spans grouped by agent */}
         {liveSpans.length > 0 && (
           <SpanTree spans={liveSpans} activeAgent={queryActive ? activeAgent : null} activeTool={queryActive ? activeTool : null} isLive={queryActive} />
         )}
 
-        {/* Clicked trace from history */}
-        {!hasLiveData && activeTrace && <CompletedTrace trace={activeTrace} />}
+        {/* Historical trace — clicked message or last response */}
+        {!hasLiveData && activeTrace && (
+          <CompletedTrace trace={activeTrace} />
+        )}
 
         {!showTrace && !activeTrace && (
           <div className="text-[12px] text-[var(--text-muted)] text-center py-10">
-            Send a message to see the trace
+            Send a message — or click any response to inspect its trace
           </div>
         )}
       </div>
@@ -740,13 +867,14 @@ export default function ChatPage() {
 
 
 // ── Thinking History ─────────────────────────────────────────────
+// Starts expanded so users can immediately read the model's reasoning.
 
 function ThinkingHistory({ content }: { content: string }) {
-  const [collapsed, setCollapsed] = useState(true);
+  const [collapsed, setCollapsed] = useState(false);
   return (
     <div className="mb-2">
       <button
-        onClick={() => setCollapsed(c => !c)}
+        onClick={e => { e.stopPropagation(); setCollapsed(c => !c); }}
         className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] transition-colors mb-1"
       >
         <span className={`transition-transform text-[9px] ${collapsed ? "" : "rotate-90"}`}>&#9654;</span>
@@ -765,17 +893,77 @@ function ThinkingHistory({ content }: { content: string }) {
 }
 
 
-// ── Span Tree ────────────────────────────────────────────────────
+// ── Span Detail Panel ────────────────────────────────────────────
+
+function SpanDetail({ span }: { span: SpanInfo }) {
+  return (
+    <div className="mt-1 mb-1 ml-4 p-2 rounded-lg bg-[var(--bg-card)] border border-[var(--border)] text-[10px] space-y-1">
+      <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
+        <span className="text-[var(--text-muted)]">Type</span>
+        <span className="font-mono">{span.span_type}</span>
+        {span.model && <>
+          <span className="text-[var(--text-muted)]">Model</span>
+          <span className="font-mono truncate" title={span.model}>{span.model}</span>
+        </>}
+        {(span.tokens_in > 0 || span.tokens_out > 0) && <>
+          <span className="text-[var(--text-muted)]">Tokens in</span>
+          <span>{span.tokens_in}</span>
+          <span className="text-[var(--text-muted)]">Tokens out</span>
+          <span>{span.tokens_out}</span>
+        </>}
+        {span.cost > 0 && <>
+          <span className="text-[var(--text-muted)]">Cost</span>
+          <span>${span.cost.toFixed(6)}</span>
+        </>}
+        <span className="text-[var(--text-muted)]">Status</span>
+        <span className={span.status === "completed" ? "text-green-500" : span.status === "running" ? "text-[var(--accent)]" : "text-red-500"}>
+          {span.status}
+        </span>
+      </div>
+      {span.error && (
+        <div className="mt-1 pt-1 border-t border-[var(--border)]">
+          <span className="text-red-500 font-medium">Error: </span>
+          <span className="text-red-400 whitespace-pre-wrap break-words">{span.error}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ── Span Tree (live) ─────────────────────────────────────────────
 
 function SpanTree({ spans, activeAgent, activeTool, isLive }: {
   spans: LiveSpan[]; activeAgent: string | null; activeTool: string | null; isLive: boolean;
 }) {
+  // Group by s.agent (set from agentRef in SSE handler), preserving arrival order
   const grouped = new Map<string, LiveSpan[]>();
   for (const s of spans) {
-    const agent = s.agent || (s.name.includes(":") ? s.name.split(":")[0] : "system");
+    // Use the agent field directly (set from agentRef during streaming)
+    // Fall back to name prefix only for system spans
+    let agent: string;
+    if (s.agent) {
+      agent = s.agent;
+    } else if (s.span_type === "routing" || s.span_type === "supervisor") {
+      agent = "system";
+    } else if (s.span_type === "agent_execution") {
+      // Name is "agent:{name}" — extract the real agent name
+      agent = s.name.includes(":") ? s.name.split(":").slice(1).join(":") : s.name;
+    } else {
+      agent = "system";
+    }
     const group = grouped.get(agent) || [];
     group.push(s);
     grouped.set(agent, group);
+  }
+
+  // Extract model from agent_execution span (preferred) or first llm_call span
+  const agentModels = new Map<string, string>();
+  for (const [agent, agentSpans] of grouped) {
+    const execSpan = agentSpans.find(s => s.span_type === "agent_execution" && s.model);
+    const llmSpan = agentSpans.find(s => s.span_type === "llm_call" && s.model);
+    const m = execSpan?.model || llmSpan?.model || "";
+    if (m) agentModels.set(agent, m);
   }
 
   return (
@@ -784,7 +972,9 @@ function SpanTree({ spans, activeAgent, activeTool, isLive }: {
         {isLive ? "Live Spans" : "Spans"}
       </div>
       {Array.from(grouped.entries()).map(([agent, agentSpans]) => (
-        <AgentSpanGroup key={agent} agent={agent} spans={agentSpans}
+        <AgentSpanGroup key={agent} agent={agent} model={agentModels.get(agent)}
+          // Exclude the agent_execution span from rows — it IS the group header
+          spans={agentSpans.filter(s => s.span_type !== "agent_execution")}
           isActive={!!activeAgent && agent.toLowerCase().includes(activeAgent.toLowerCase())}
           activeTool={activeTool} isLive={isLive} />
       ))}
@@ -792,10 +982,12 @@ function SpanTree({ spans, activeAgent, activeTool, isLive }: {
   );
 }
 
-function AgentSpanGroup({ agent, spans, isActive, activeTool, isLive }: {
-  agent: string; spans: LiveSpan[]; isActive: boolean; activeTool: string | null; isLive: boolean;
+function AgentSpanGroup({ agent, model, spans, isActive, activeTool, isLive }: {
+  agent: string; model?: string; spans: LiveSpan[];
+  isActive: boolean; activeTool: string | null; isLive: boolean;
 }) {
   const [expanded, setExpanded] = useState(true);
+  const [expandedSpanId, setExpandedSpanId] = useState<string | null>(null);
   const completedCount = spans.filter(s => s.status === "completed").length;
   const totalTokens = spans.reduce((a, s) => a + (s.tokens_in || 0) + (s.tokens_out || 0), 0);
   const totalCost = spans.reduce((a, s) => a + (s.cost || 0), 0);
@@ -804,12 +996,15 @@ function AgentSpanGroup({ agent, spans, isActive, activeTool, isLive }: {
     <div className="border border-[var(--border)] rounded-lg overflow-hidden">
       <button onClick={() => setExpanded(e => !e)}
         className={`flex items-center gap-2 px-2 py-1.5 w-full text-xs font-medium text-left transition-colors ${
-          isActive ? "bg-[var(--accent-light)] text-[var(--accent)]" : "bg-[var(--bg)] text-[var(--text-secondary)] hover:bg-[var(--bg-card)]"
+          isActive ? "bg-zinc-900 text-white" : "bg-[var(--bg)] text-[var(--text-secondary)] hover:bg-[var(--bg-card)]"
         }`}>
         <span className={`text-[9px] transition-transform ${expanded ? "rotate-90" : ""}`}>&#9654;</span>
-        {isActive && isLive && <span className="h-2 w-2 rounded-full bg-[var(--accent)] animate-pulse" />}
-        <span className="flex-1 truncate">{agent}</span>
-        <span className="text-[10px] text-[var(--text-muted)] font-normal whitespace-nowrap">
+        {isActive && isLive && <span className="h-2 w-2 rounded-full bg-white animate-pulse" />}
+        <span className="flex-1 min-w-0 truncate">
+          {agent}
+          {model && <span className={`text-[9px] ml-1 font-normal ${isActive ? "text-zinc-300" : "text-[var(--text-muted)]"}`}>· {shortModel(model)}</span>}
+        </span>
+        <span className="text-[10px] text-[var(--text-muted)] font-normal whitespace-nowrap flex-shrink-0">
           {completedCount}/{spans.length}
           {totalTokens > 0 && <>&middot;{totalTokens}t</>}
           {totalCost > 0 && <>&middot;${totalCost.toFixed(4)}</>}
@@ -819,19 +1014,36 @@ function AgentSpanGroup({ agent, spans, isActive, activeTool, isLive }: {
         <div className="divide-y divide-[var(--border)]">
           {spans.map(s => {
             const isToolActive = isLive && activeTool && s.name.includes(activeTool);
+            const { primary, badge } = spanDisplayLabel(s);
+            const isOpen = expandedSpanId === s.id;
             return (
-              <div key={s.id} className={`flex items-center gap-1.5 px-2 py-1 text-[11px] ${isToolActive ? "bg-blue-50/50 dark:bg-blue-900/10" : ""}`}>
-                <div className={`h-1.5 w-1.5 rounded-full flex-shrink-0 ${TYPE_DOT[s.span_type] || "bg-gray-400"}`} />
-                <div className="flex-1 min-w-0 truncate" title={s.name}>{s.name.split(":").slice(1).join(":") || s.name}</div>
-                <div className="flex items-center gap-1 text-[10px] text-[var(--text-muted)] flex-shrink-0">
-                  {(s.tokens_in + s.tokens_out) > 0 && <span>{s.tokens_in + s.tokens_out}t</span>}
-                  {s.model && <span className="max-w-[50px] truncate" title={s.model}>{s.model}</span>}
-                </div>
-                {s.status === "running" ? (
-                  <div className="h-2.5 w-2.5 border border-[var(--border)] border-t-[var(--accent)] rounded-full animate-spin flex-shrink-0" />
-                ) : (
-                  <div className={`h-1.5 w-1.5 rounded-full flex-shrink-0 ${s.status === "completed" ? "bg-green-500" : "bg-red-500"}`} />
-                )}
+              <div key={s.id}>
+                <button
+                  onClick={() => setExpandedSpanId(isOpen ? null : s.id)}
+                  className={`flex items-center gap-1.5 px-2 py-1 text-[11px] w-full text-left transition-colors ${
+                    isOpen ? "bg-zinc-100" : isToolActive ? "bg-zinc-50" : "hover:bg-[var(--bg-card)]"
+                  }`}
+                >
+                  <div className={`h-1.5 w-1.5 rounded-full flex-shrink-0 ${TYPE_DOT[s.span_type] || "bg-gray-400"}`} />
+                  <div className="flex-1 min-w-0 truncate text-left" title={s.name}>{primary}</div>
+                  <div className="flex items-center gap-1 text-[10px] flex-shrink-0">
+                    {badge === "llm" && (
+                      <span className="px-1 py-0.5 rounded bg-zinc-100 text-zinc-500 text-[9px] font-medium">llm</span>
+                    )}
+                    {badge === "tool" && (
+                      <span className="px-1 py-0.5 rounded bg-emerald-50 text-emerald-600 text-[9px] font-medium">tool</span>
+                    )}
+                    {(s.tokens_in + s.tokens_out) > 0 && (
+                      <span className="text-[var(--text-muted)]">{s.tokens_in + s.tokens_out}t</span>
+                    )}
+                  </div>
+                  {s.status === "running" ? (
+                    <div className="h-2.5 w-2.5 border border-zinc-200 border-t-zinc-600 rounded-full animate-spin flex-shrink-0" />
+                  ) : (
+                    <div className={`h-1.5 w-1.5 rounded-full flex-shrink-0 ${s.status === "completed" ? "bg-green-500" : "bg-red-500"}`} />
+                  )}
+                </button>
+                {isOpen && <SpanDetail span={s} />}
               </div>
             );
           })}
@@ -843,8 +1055,11 @@ function AgentSpanGroup({ agent, spans, isActive, activeTool, isLive }: {
 
 
 // ── Completed Trace ──────────────────────────────────────────────
+// Groups spans by agent using end-order heuristic (see groupSpansByAgent).
 
 function CompletedTrace({ trace }: { trace: TraceInfo }) {
+  const groups = groupSpansByAgent(trace.spans);
+
   return (
     <div className="space-y-3">
       <div className="grid grid-cols-3 gap-1.5 text-center">
@@ -861,23 +1076,86 @@ function CompletedTrace({ trace }: { trace: TraceInfo }) {
           <div className="text-[9px] text-[var(--text-muted)]">Cost</div>
         </div>
       </div>
-      <div className="space-y-1">
+
+      <div className="space-y-1.5">
         <div className="text-[11px] text-[var(--text-muted)] uppercase tracking-wide">Spans</div>
-        {trace.spans.map(s => (
-          <div key={s.id} className="flex items-center gap-2 p-1.5 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] text-xs">
-            <div className={`h-2 w-2 rounded-full flex-shrink-0 ${TYPE_DOT[s.span_type] || "bg-gray-400"}`} />
-            <div className="flex-1 min-w-0">
-              <div className="font-medium truncate">{s.name}</div>
-              <div className="text-[var(--text-muted)] text-[10px]">{s.span_type}</div>
-            </div>
-            <div className="text-right text-[10px] text-[var(--text-muted)]">
-              {s.tokens_in + s.tokens_out > 0 && <div>{s.tokens_in + s.tokens_out} tok</div>}
-              {s.cost > 0 && <div>${s.cost.toFixed(4)}</div>}
-            </div>
-            <div className={`h-1.5 w-1.5 rounded-full ${s.status === "completed" ? "bg-green-500" : "bg-red-500"}`} />
-          </div>
+        {groups.map((g, idx) => (
+          <CompletedAgentGroup key={`${g.agent}-${idx}`}
+            agent={g.agent} agentSpan={g.agentSpan} spans={g.spans} />
         ))}
       </div>
+    </div>
+  );
+}
+
+function CompletedAgentGroup({ agent, agentSpan, spans }: {
+  agent: string; agentSpan?: SpanInfo; spans: SpanInfo[];
+}) {
+  const [expanded, setExpanded] = useState(true);
+  const [expandedSpanId, setExpandedSpanId] = useState<string | null>(null);
+
+  // Model: prefer agent_execution span's model, then first llm_call span's model
+  const model = agentSpan?.model
+    || spans.find(s => s.span_type === "llm_call" && s.model)?.model
+    || "";
+
+  const totalTokens = spans.reduce((a, s) => a + (s.tokens_in || 0) + (s.tokens_out || 0), 0);
+  const totalCost = spans.reduce((a, s) => a + (s.cost || 0), 0);
+  const errCount = spans.filter(s => s.status !== "completed").length;
+
+  return (
+    <div className="border border-[var(--border)] rounded-lg overflow-hidden">
+      <button onClick={() => setExpanded(e => !e)}
+        className="flex items-center gap-2 px-2 py-1.5 w-full text-xs font-medium text-left bg-[var(--bg)] text-[var(--text-secondary)] hover:bg-[var(--bg-card)] transition-colors">
+        <span className={`text-[9px] transition-transform ${expanded ? "rotate-90" : ""}`}>&#9654;</span>
+        <span className="flex-1 min-w-0 truncate">
+          {agent}
+          {model && <span className="text-[9px] text-[var(--text-muted)] ml-1 font-normal">· {shortModel(model)}</span>}
+        </span>
+        <span className="text-[10px] text-[var(--text-muted)] font-normal whitespace-nowrap flex-shrink-0">
+          {spans.length > 0 && <>{spans.length} spans</>}
+          {totalTokens > 0 && <>&middot;{totalTokens}t</>}
+          {totalCost > 0 && <>&middot;${totalCost.toFixed(4)}</>}
+          {errCount > 0 && <span className="text-red-400 ml-1">·{errCount}err</span>}
+        </span>
+      </button>
+      {expanded && (
+        <div className="divide-y divide-[var(--border)]">
+          {spans.map(s => {
+            const { primary, badge } = spanDisplayLabel(s);
+            const isOpen = expandedSpanId === s.id;
+            return (
+              <div key={s.id}>
+                <button
+                  onClick={() => setExpandedSpanId(isOpen ? null : s.id)}
+                  className={`flex items-center gap-1.5 p-1.5 w-full text-left text-[11px] transition-colors ${
+                    isOpen ? "bg-zinc-100" : "hover:bg-[var(--bg-card)]"
+                  }`}
+                >
+                  <div className={`h-1.5 w-1.5 rounded-full flex-shrink-0 ${TYPE_DOT[s.span_type] || "bg-gray-400"}`} />
+                  <div className="flex-1 min-w-0 truncate font-medium" title={s.name}>{primary}</div>
+                  <div className="flex items-center gap-1 text-[10px] flex-shrink-0">
+                    {badge === "llm" && (
+                      <span className="px-1 py-0.5 rounded bg-zinc-100 text-zinc-500 text-[9px] font-medium">llm</span>
+                    )}
+                    {badge === "tool" && (
+                      <span className="px-1 py-0.5 rounded bg-emerald-50 text-emerald-600 text-[9px] font-medium">tool</span>
+                    )}
+                    {s.tokens_in + s.tokens_out > 0 && (
+                      <span className="text-[var(--text-muted)]">{s.tokens_in + s.tokens_out}t</span>
+                    )}
+                    {s.cost > 0 && (
+                      <span className="text-[var(--text-muted)]">${s.cost.toFixed(4)}</span>
+                    )}
+                  </div>
+                  <div className={`h-1.5 w-1.5 rounded-full flex-shrink-0 ${s.status === "completed" ? "bg-green-500" : "bg-red-500"}`} />
+                </button>
+                {isOpen && <SpanDetail span={s} />}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -921,7 +1199,7 @@ function ClarificationWidget({ hitl, onSubmit, disabled }: {
         <div className="flex flex-wrap gap-2 mb-3">
           {hitl.options.map((opt, i) => (
             <button key={i} onClick={() => submit(opt)} disabled={disabled || submitted}
-              className="px-3 py-1.5 rounded-lg text-[12px] border border-[var(--border)] bg-[var(--bg)] hover:bg-[var(--accent-light)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-all disabled:opacity-50">{opt}</button>
+              className="px-3 py-1.5 rounded-lg text-[12px] border border-[var(--border)] bg-[var(--bg)] hover:bg-zinc-900 hover:text-white hover:border-zinc-900 transition-all disabled:opacity-50">{opt}</button>
           ))}
         </div>
       )}

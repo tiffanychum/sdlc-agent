@@ -22,13 +22,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from src.db.database import init_db, seed_defaults, patch_agent_prompts, get_session
+from src.db.database import init_db, seed_defaults, update_agent_data, get_session
 from src.db.models import (
     Team, Agent, AgentToolMapping, Skill, AgentSkillMapping,
     Trace, Span, EvalRun, GoldenTestCase, RegressionResult, PromptVersion,
+    RagConfig as RagConfigModel, RagSource, RagQuery,
 )
 from src.orchestrator import build_orchestrator_from_team, _extract_text, get_graph_config
-from src.tracing.collector import TraceCollector
+from src.tracing.collector import TraceCollector, _flush_pending_spans, estimate_cost
 
 
 orchestrators: dict = {}
@@ -38,7 +39,7 @@ orchestrators: dict = {}
 async def lifespan(app: FastAPI):
     init_db()
     seed_defaults()
-    patch_agent_prompts()
+    update_agent_data()
     from src.evaluation.golden import sync_golden_to_db
     sync_golden_to_db()
     orchestrators["default"] = await build_orchestrator_from_team("default")
@@ -1370,6 +1371,8 @@ def list_golden_cases():
         "max_tokens": c.max_tokens, "max_latency_ms": c.max_latency_ms,
         "complexity": c.complexity, "version": c.version,
         "reference_output": c.reference_output, "is_active": c.is_active,
+        "strategy": getattr(c, "strategy", None),
+        "expected_strategy": getattr(c, "expected_strategy", None),
     } for c in cases]
     session.close()
     return result
@@ -1535,6 +1538,8 @@ def get_regression_results(run_id: str):
         "quality_regression": r.quality_regression, "trace_regression": r.trace_regression,
         "overall_pass": r.overall_pass,
         "model_used": r.model_used, "prompt_version": r.prompt_version,
+        "expected_strategy": getattr(r, "expected_strategy", None),
+        "actual_strategy": getattr(r, "actual_strategy", None),
         "created_at": r.created_at.isoformat() if r.created_at else None,
     } for r in rows]
     session.close()
@@ -1590,6 +1595,8 @@ def get_regression_case_detail(run_id: str, case_id: str):
             "overall_pass": r.overall_pass,
             "rca_analysis": r.rca_analysis,
             "model_used": r.model_used, "prompt_version": r.prompt_version,
+            "expected_strategy": getattr(r, "expected_strategy", None),
+            "actual_strategy": getattr(r, "actual_strategy", None),
         },
     }
     session.close()
@@ -1635,6 +1642,8 @@ def regression_trace_diff(run_a: str, run_b: str, case_id: str):
             "eval_reasoning": r.eval_reasoning or {},
             "overall_pass": r.overall_pass,
             "model_used": r.model_used,
+            "expected_strategy": getattr(r, "expected_strategy", None),
+            "actual_strategy": getattr(r, "actual_strategy", None),
         }
 
     return {
@@ -1789,6 +1798,762 @@ async def ws_chat(websocket: WebSocket, team_id: str):
 
     except WebSocketDisconnect:
         pass
+
+
+# ── RAG Pipeline Endpoints ─────────────────────────────────────────────────
+
+
+class RagConfigCreate(BaseModel):
+    name: str
+    description: str = ""
+    embedding_model: str = "openai/text-embedding-3-small"
+    vector_store: str = "chroma"
+    llm_model: Optional[str] = None
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
+    chunk_strategy: str = "recursive"
+    retrieval_strategy: str = "similarity"
+    top_k: int = 5
+    mmr_lambda: float = 0.5
+    multi_query_n: int = 3
+    system_prompt: Optional[str] = None
+
+
+class RagSourceCreate(BaseModel):
+    source_type: str    # text | file | url
+    content: str
+    label: str = ""
+
+
+class RagChatRequest(BaseModel):
+    query: str
+    config_id: str
+    auto_evaluate: bool = False
+
+
+class RagEvalRequest(BaseModel):
+    config_id: str
+    samples: list[dict]   # [{query, expected_answer}]
+    thresholds: Optional[dict] = None
+
+
+def _cfg_to_pipeline_config(cfg_row: RagConfigModel):
+    from src.rag.pipeline import RAGConfig
+    return RAGConfig(
+        config_id=cfg_row.id,
+        name=cfg_row.name,
+        embedding_model=cfg_row.embedding_model,
+        vector_store=cfg_row.vector_store,
+        llm_model=cfg_row.llm_model,
+        chunk_size=cfg_row.chunk_size,
+        chunk_overlap=cfg_row.chunk_overlap,
+        chunk_strategy=cfg_row.chunk_strategy,
+        retrieval_strategy=cfg_row.retrieval_strategy,
+        top_k=cfg_row.top_k,
+        mmr_lambda=cfg_row.mmr_lambda or 0.5,
+        multi_query_n=cfg_row.multi_query_n or 3,
+        system_prompt=cfg_row.system_prompt,
+    )
+
+
+def _cfg_row_to_dict(r: RagConfigModel) -> dict:
+    return {
+        "id": r.id,
+        "name": r.name,
+        "description": r.description,
+        "embedding_model": r.embedding_model,
+        "vector_store": r.vector_store,
+        "llm_model": r.llm_model,
+        "chunk_size": r.chunk_size,
+        "chunk_overlap": r.chunk_overlap,
+        "chunk_strategy": r.chunk_strategy,
+        "retrieval_strategy": r.retrieval_strategy,
+        "top_k": r.top_k,
+        "mmr_lambda": r.mmr_lambda,
+        "multi_query_n": r.multi_query_n,
+        "system_prompt": r.system_prompt,
+        "is_active": r.is_active,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "sources": [
+            {
+                "id": s.id,
+                "source_type": s.source_type,
+                "content": s.content[:120],
+                "label": s.label,
+                "chunks_count": s.chunks_count,
+                "tokens_estimated": s.tokens_estimated,
+                "status": s.status,
+                "error_message": s.error_message,
+                "ingested_at": s.ingested_at.isoformat() if s.ingested_at else None,
+            }
+            for s in (r.sources or [])
+        ],
+    }
+
+
+@app.get("/api/rag/models")
+def list_rag_models():
+    """Return available embedding models and vector store options."""
+    from src.rag.embeddings import EMBEDDING_MODELS
+    from src.rag.vectorstore import VECTOR_STORES
+    return {
+        "embedding_models": {k: v for k, v in EMBEDDING_MODELS.items()},
+        "vector_stores": VECTOR_STORES,
+        "chunk_strategies": ["recursive", "fixed", "semantic", "code"],
+        "retrieval_strategies": ["similarity", "mmr", "multi_query", "hybrid"],
+    }
+
+
+@app.get("/api/rag/configs")
+def list_rag_configs():
+    session = get_session()
+    try:
+        rows = session.query(RagConfigModel).order_by(RagConfigModel.created_at.desc()).all()
+        return [_cfg_row_to_dict(r) for r in rows]
+    finally:
+        session.close()
+
+
+@app.post("/api/rag/configs", status_code=201)
+def create_rag_config(body: RagConfigCreate):
+    session = get_session()
+    try:
+        row = RagConfigModel(
+            name=body.name,
+            description=body.description,
+            embedding_model=body.embedding_model,
+            vector_store=body.vector_store,
+            llm_model=body.llm_model,
+            chunk_size=body.chunk_size,
+            chunk_overlap=body.chunk_overlap,
+            chunk_strategy=body.chunk_strategy,
+            retrieval_strategy=body.retrieval_strategy,
+            top_k=body.top_k,
+            mmr_lambda=body.mmr_lambda,
+            multi_query_n=body.multi_query_n,
+            system_prompt=body.system_prompt,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return _cfg_row_to_dict(row)
+    finally:
+        session.close()
+
+
+@app.get("/api/rag/configs/{config_id}")
+def get_rag_config(config_id: str):
+    session = get_session()
+    try:
+        row = session.query(RagConfigModel).filter_by(id=config_id).first()
+        if not row:
+            raise HTTPException(404, "RAG config not found")
+        return _cfg_row_to_dict(row)
+    finally:
+        session.close()
+
+
+@app.put("/api/rag/configs/{config_id}")
+def update_rag_config(config_id: str, body: RagConfigCreate):
+    session = get_session()
+    try:
+        row = session.query(RagConfigModel).filter_by(id=config_id).first()
+        if not row:
+            raise HTTPException(404, "RAG config not found")
+        for field, val in body.model_dump().items():
+            setattr(row, field, val)
+        session.commit()
+        # Evict cached pipeline so new config takes effect
+        from src.rag.pipeline import evict_pipeline
+        evict_pipeline(config_id)
+        session.refresh(row)
+        return _cfg_row_to_dict(row)
+    finally:
+        session.close()
+
+
+@app.delete("/api/rag/configs/{config_id}", status_code=204)
+def delete_rag_config(config_id: str):
+    session = get_session()
+    try:
+        row = session.query(RagConfigModel).filter_by(id=config_id).first()
+        if not row:
+            raise HTTPException(404, "RAG config not found")
+        session.delete(row)
+        session.commit()
+        from src.rag.pipeline import evict_pipeline
+        evict_pipeline(config_id)
+    finally:
+        session.close()
+
+
+@app.post("/api/rag/configs/{config_id}/ingest")
+async def ingest_source(config_id: str, body: RagSourceCreate):
+    """Ingest a new document source into the RAG pipeline."""
+    session = get_session()
+    try:
+        cfg_row = session.query(RagConfigModel).filter_by(id=config_id).first()
+        if not cfg_row:
+            raise HTTPException(404, "RAG config not found")
+
+        src_row = RagSource(
+            config_id=config_id,
+            source_type=body.source_type,
+            content=body.content,
+            label=body.label or body.content[:60],
+            status="ingesting",
+        )
+        session.add(src_row)
+        session.commit()
+        src_id = src_row.id
+        cfg_config = _cfg_to_pipeline_config(cfg_row)
+    finally:
+        session.close()
+
+    # Run ingestion asynchronously; update status when done
+    async def _do_ingest():
+        from src.rag.pipeline import get_pipeline
+        sess2 = get_session()
+        try:
+            pipeline = get_pipeline(cfg_config)
+            result = await pipeline.ingest(body.source_type, body.content)
+            src = sess2.query(RagSource).filter_by(id=src_id).first()
+            if src:
+                src.chunks_count = result.get("chunks", 0)
+                src.tokens_estimated = result.get("tokens_estimated", 0)
+                src.status = "ingested"
+                src.ingested_at = datetime.utcnow()
+            sess2.commit()
+        except Exception as e:
+            src = sess2.query(RagSource).filter_by(id=src_id).first()
+            if src:
+                src.status = "error"
+                src.error_message = str(e)
+            sess2.commit()
+        finally:
+            sess2.close()
+
+    asyncio.create_task(_do_ingest())
+    return {"source_id": src_id, "status": "ingesting"}
+
+
+@app.delete("/api/rag/configs/{config_id}/sources/{source_id}", status_code=204)
+def delete_source(config_id: str, source_id: str):
+    session = get_session()
+    try:
+        src = session.query(RagSource).filter_by(id=source_id, config_id=config_id).first()
+        if not src:
+            raise HTTPException(404, "Source not found")
+        session.delete(src)
+        session.commit()
+    finally:
+        session.close()
+
+
+@app.post("/api/rag/chat")
+async def rag_chat(body: RagChatRequest):
+    """Query the RAG pipeline and return an answer with citations."""
+    import uuid as _uuid_mod
+    session = get_session()
+    try:
+        cfg_row = session.query(RagConfigModel).filter_by(id=body.config_id).first()
+        if not cfg_row:
+            raise HTTPException(404, "RAG config not found")
+        cfg_config = _cfg_to_pipeline_config(cfg_row)
+    finally:
+        session.close()
+
+    from src.rag.pipeline import get_pipeline
+    pipeline = get_pipeline(cfg_config)
+    if pipeline.chunk_count() == 0:
+        raise HTTPException(400, "No documents ingested yet. Please add data sources first.")
+
+    trace_id = _uuid_mod.uuid4().hex[:12]
+    response = await pipeline.query(body.query)
+
+    # Persist query log + OTel spans
+    sess2 = get_session()
+    query_id = None
+    try:
+        q_row = RagQuery(
+            config_id=body.config_id,
+            query=body.query,
+            answer=response.answer,
+            citations=[
+                {"source": c.source, "chunk_index": c.chunk_index, "total_chunks": c.total_chunks,
+                 "page": c.page, "score": c.score, "snippet": c.snippet}
+                for c in response.citations
+            ],
+            strategy_used=response.strategy_used,
+            chunks_retrieved=response.chunks_retrieved,
+            tokens_in=response.tokens_in,
+            tokens_out=response.tokens_out,
+            latency_ms=response.latency_ms,
+            eval_status="pending",
+            trace_id=trace_id,
+        )
+        sess2.add(q_row)
+
+        # Flush OTel spans (rag.ingest / rag.retrieve / rag.generate / rag.embed)
+        # and persist them under a synthetic Trace record so they appear in the
+        # OTel monitoring dashboard and evaluation page.
+        otel_spans = _flush_pending_spans(trace_id)
+        if otel_spans:
+            rag_trace = Trace(
+                id=trace_id,
+                team_id=None,
+                user_prompt=body.query[:500],
+                agent_used="rag",
+                agent_response=response.answer[:500],
+                total_latency_ms=response.latency_ms,
+                total_tokens=response.tokens_in + response.tokens_out,
+                total_cost=sum(s.get("cost", 0) for s in otel_spans),
+                status="completed",
+            )
+            sess2.add(rag_trace)
+            seen_ids: set = set()
+            for s in otel_spans:
+                sid = s.get("id", _uuid_mod.uuid4().hex[:12])
+                if sid in seen_ids:
+                    continue
+                seen_ids.add(sid)
+                # Assign rag.* span_types for visibility in OTel stats
+                raw_name = s.get("name", "")
+                span_type = s.get("span_type", "unknown")
+                if raw_name.startswith("rag."):
+                    span_type = raw_name  # e.g. "rag.retrieve", "rag.generate"
+                sess2.add(Span(
+                    id=sid,
+                    trace_id=trace_id,
+                    parent_span_id=s.get("parent_span_id"),
+                    name=raw_name,
+                    span_type=span_type,
+                    start_time=s.get("start_time"),
+                    end_time=s.get("end_time"),
+                    input_data=s.get("input_data", {}),
+                    output_data=s.get("output_data", {}),
+                    tokens_in=s.get("tokens_in", 0),
+                    tokens_out=s.get("tokens_out", 0),
+                    cost=s.get("cost", 0.0),
+                    model=s.get("model", ""),
+                    status=s.get("status", "completed"),
+                    error=s.get("error"),
+                ))
+
+        sess2.commit()
+        query_id = q_row.id
+    finally:
+        sess2.close()
+
+    # Kick off async DeepEval evaluation (non-blocking)
+    if query_id and body.auto_evaluate:
+        _bg_tasks: set = set()
+        async def _auto_eval():
+            await _run_rag_eval_for_query(query_id, cfg_config, response)
+        t = asyncio.create_task(_auto_eval())
+        _bg_tasks.add(t)
+        t.add_done_callback(_bg_tasks.discard)
+
+    return {
+        "query_id": query_id,
+        "trace_id": trace_id,
+        "answer": response.answer,
+        "citations": [
+            {"source": c.source, "chunk_index": c.chunk_index, "total_chunks": c.total_chunks,
+             "page": c.page, "score": c.score, "snippet": c.snippet}
+            for c in response.citations
+        ],
+        "strategy_used": response.strategy_used,
+        "chunks_retrieved": response.chunks_retrieved,
+        "tokens_in": response.tokens_in,
+        "tokens_out": response.tokens_out,
+        "latency_ms": response.latency_ms,
+    }
+
+
+async def _run_rag_eval_for_query(query_id: str, cfg_config, rag_response) -> None:
+    """
+    Background task: run all 5 DeepEval RAG metrics on a stored query.
+
+    Metrics:
+      - answer_relevancy      (no ground truth needed)
+      - faithfulness          (no ground truth needed)
+      - contextual_relevancy  (no ground truth needed)
+      - contextual_precision  (uses answer as ground-truth proxy)
+      - contextual_recall     (uses answer as ground-truth proxy)
+    """
+    import logging as _log
+    _rl = _log.getLogger("rag_eval")
+
+    sess = get_session()
+    try:
+        q_row = sess.query(RagQuery).filter_by(id=query_id).first()
+        if not q_row:
+            return
+        q_row.eval_status = "running"
+        sess.commit()
+    finally:
+        sess.close()
+
+    try:
+        from deepeval.test_case import LLMTestCase
+        from deepeval.metrics import (
+            AnswerRelevancyMetric,
+            FaithfulnessMetric,
+            ContextualRelevancyMetric,
+            ContextualPrecisionMetric,
+            ContextualRecallMetric,
+        )
+        from src.evaluation.integrations import _get_deepeval_model
+
+        judge = _get_deepeval_model()
+        answer = rag_response.answer if hasattr(rag_response, "answer") else ""
+        query_text = rag_response.query if hasattr(rag_response, "query") else ""
+        # Use full snippet text for richer evaluation context
+        ctx = [c.snippet for c in rag_response.citations] if hasattr(rag_response, "citations") else []
+
+        if not query_text:
+            sess_q = get_session()
+            try:
+                r = sess_q.query(RagQuery).filter_by(id=query_id).first()
+                query_text = r.query if r else ""
+            finally:
+                sess_q.close()
+
+        # For Contextual Precision / Recall we need an expected_output.
+        # Without a ground-truth dataset we use the model's own answer as a proxy —
+        # this is the standard approach for live RAG evaluations where ground truth
+        # is unavailable.
+        tc = LLMTestCase(
+            input=query_text,
+            actual_output=answer,
+            expected_output=answer,      # proxy for precision/recall when no ground truth
+            retrieval_context=ctx,
+        )
+
+        metrics_to_run = [
+            ("answer_relevancy",     AnswerRelevancyMetric(    threshold=0.5, model=judge, include_reason=True)),
+            ("faithfulness",         FaithfulnessMetric(       threshold=0.5, model=judge, include_reason=True)),
+            ("contextual_relevancy", ContextualRelevancyMetric(threshold=0.5, model=judge, include_reason=True)),
+            ("contextual_precision", ContextualPrecisionMetric(threshold=0.5, model=judge, include_reason=True)),
+            ("contextual_recall",    ContextualRecallMetric(   threshold=0.5, model=judge, include_reason=True)),
+        ]
+
+        scores: dict = {}
+        for name, metric in metrics_to_run:
+            for attempt in range(2):
+                try:
+                    await metric.a_measure(tc)
+                    scores[name] = {
+                        "score": float(metric.score or 0),
+                        "passed": bool(metric.is_successful()),
+                        "reason": metric.reason or "",
+                    }
+                    _rl.info("RAG eval [%s] %s=%.2f", query_id, name, metric.score or 0)
+                    break
+                except Exception as me:
+                    if attempt == 1:
+                        _rl.warning("RAG eval [%s] metric '%s' failed after 2 attempts: %s", query_id, name, me)
+                        scores[name] = {"score": 0.0, "passed": False, "reason": f"ERROR: {me}"}
+
+        sess2 = get_session()
+        try:
+            q = sess2.query(RagQuery).filter_by(id=query_id).first()
+            if q:
+                q.eval_scores = scores
+                q.eval_status = "done"
+            sess2.commit()
+        finally:
+            sess2.close()
+
+    except Exception as e:
+        _rl.error("RAG eval failed for %s: %s", query_id, e, exc_info=True)
+        sess3 = get_session()
+        try:
+            q = sess3.query(RagQuery).filter_by(id=query_id).first()
+            if q:
+                q.eval_status = "error"
+                q.eval_error = str(e)
+            sess3.commit()
+        finally:
+            sess3.close()
+
+
+def _query_to_dict(r: RagQuery) -> dict:
+    return {
+        "id": r.id,
+        "query": r.query,
+        "answer": r.answer,
+        "citations": r.citations or [],
+        "strategy_used": r.strategy_used,
+        "chunks_retrieved": r.chunks_retrieved,
+        "tokens_in": r.tokens_in,
+        "tokens_out": r.tokens_out,
+        "latency_ms": r.latency_ms,
+        "eval_scores": r.eval_scores,
+        "eval_status": r.eval_status or "pending",
+        "eval_error": r.eval_error,
+        "trace_id": r.trace_id,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+@app.get("/api/rag/configs/{config_id}/history")
+def get_rag_history(config_id: str, limit: int = 200):
+    """Return past queries for a RAG config, oldest first (for chat replay)."""
+    session = get_session()
+    try:
+        rows = (
+            session.query(RagQuery)
+            .filter_by(config_id=config_id)
+            .order_by(RagQuery.created_at.asc())
+            .limit(limit)
+            .all()
+        )
+        return [_query_to_dict(r) for r in rows]
+    finally:
+        session.close()
+
+
+@app.delete("/api/rag/configs/{config_id}/history", status_code=204)
+def clear_rag_history(config_id: str):
+    """Delete all chat history for a RAG pipeline."""
+    session = get_session()
+    try:
+        session.query(RagQuery).filter_by(config_id=config_id).delete()
+        session.commit()
+    finally:
+        session.close()
+
+
+@app.delete("/api/rag/queries/{query_id}", status_code=204)
+def delete_rag_query(query_id: str):
+    """Delete a single RAG query from history."""
+    session = get_session()
+    try:
+        q = session.query(RagQuery).filter_by(id=query_id).first()
+        if q:
+            session.delete(q)
+            session.commit()
+    finally:
+        session.close()
+
+
+@app.get("/api/rag/queries/{query_id}")
+def get_rag_query(query_id: str):
+    """Get a single RAG query with its evaluation scores."""
+    session = get_session()
+    try:
+        q = session.query(RagQuery).filter_by(id=query_id).first()
+        if not q:
+            raise HTTPException(404, "Query not found")
+        return _query_to_dict(q)
+    finally:
+        session.close()
+
+
+@app.get("/api/rag/traces/{trace_id}")
+def get_rag_trace(trace_id: str):
+    """Return OTel spans for a RAG query identified by trace_id."""
+    session = get_session()
+    try:
+        spans = session.query(Span).filter(Span.trace_id == trace_id).order_by(Span.start_time).all()
+        return [
+            {
+                "span_id": s.span_id,
+                "parent_span_id": s.parent_span_id,
+                "name": s.name,
+                "span_type": s.span_type,
+                "start_time": s.start_time.isoformat() if s.start_time else None,
+                "end_time": s.end_time.isoformat() if s.end_time else None,
+                "duration_ms": s.duration_ms,
+                "status": s.status,
+                "model": s.model,
+                "tokens_in": s.tokens_in,
+                "tokens_out": s.tokens_out,
+                "cost": s.cost,
+                "attributes": s.attributes,
+                "error": s.error,
+            }
+            for s in spans
+        ]
+    finally:
+        session.close()
+
+
+@app.post("/api/rag/queries/{query_id}/evaluate")
+async def evaluate_rag_query(query_id: str):
+    """Trigger DeepEval evaluation for a stored query (re-run or first run)."""
+    session = get_session()
+    try:
+        q = session.query(RagQuery).filter_by(id=query_id).first()
+        if not q:
+            raise HTTPException(404, "Query not found")
+        cfg_row = session.query(RagConfigModel).filter_by(id=q.config_id).first()
+        if not cfg_row:
+            raise HTTPException(404, "RAG config not found")
+        cfg_config = _cfg_to_pipeline_config(cfg_row)
+        q_data = _query_to_dict(q)
+    finally:
+        session.close()
+
+    # Build a mock RAGResponse from stored data
+    from types import SimpleNamespace
+    from src.rag.pipeline import Citation
+    mock_resp = SimpleNamespace(
+        query=q_data["query"],
+        answer=q_data["answer"],
+        citations=[
+            Citation(
+                source=c.get("source", ""),
+                chunk_index=c.get("chunk_index", 0),
+                total_chunks=c.get("total_chunks", 1),
+                page=c.get("page"),
+                score=c.get("score", 0.0),
+                snippet=c.get("snippet", ""),
+            )
+            for c in (q_data["citations"] or [])
+        ],
+    )
+    asyncio.create_task(_run_rag_eval_for_query(query_id, cfg_config, mock_resp))
+    return {"status": "evaluating", "query_id": query_id}
+
+
+@app.post("/api/rag/evaluate")
+async def evaluate_rag(body: RagEvalRequest):
+    """Run DeepEval RAG metrics on a set of question-answer samples."""
+    session = get_session()
+    try:
+        cfg_row = session.query(RagConfigModel).filter_by(id=body.config_id).first()
+        if not cfg_row:
+            raise HTTPException(404, "RAG config not found")
+        cfg_config = _cfg_to_pipeline_config(cfg_row)
+    finally:
+        session.close()
+
+    from src.rag.pipeline import get_pipeline
+    from src.rag.evaluation import RAGEvalSample, batch_evaluate
+
+    pipeline = get_pipeline(cfg_config)
+    samples = [
+        RAGEvalSample(
+            query=s["query"],
+            expected_answer=s.get("expected_answer", ""),
+            actual_answer=s.get("actual_answer", ""),
+        )
+        for s in body.samples
+    ]
+    results = await batch_evaluate(pipeline, samples, thresholds=body.thresholds)
+    return [
+        {
+            "query": r.sample.query,
+            "actual_answer": r.sample.actual_answer,
+            "expected_answer": r.sample.expected_answer,
+            "retrieved_contexts": r.sample.retrieved_contexts,
+            "overall_pass": r.overall_pass,
+            "avg_score": r.avg_score,
+            "latency_ms": r.latency_ms,
+            "error": r.error,
+            "metrics": [
+                {
+                    "name": m.name,
+                    "score": m.score,
+                    "passed": m.passed,
+                    "threshold": m.threshold,
+                    "reason": m.reason,
+                }
+                for m in r.metrics
+            ],
+        }
+        for r in results
+    ]
+
+
+@app.get("/api/rag/stats")
+def rag_stats(days: int = 30):
+    """Aggregate stats for all RAG queries: latency, tokens, eval scores."""
+    from datetime import timedelta as _td
+    session = get_session()
+    try:
+        cutoff = datetime.utcnow() - _td(days=days)
+        queries = session.query(RagQuery).filter(RagQuery.created_at >= cutoff).all()
+        if not queries:
+            return {
+                "total_queries": 0, "queries_with_eval": 0, "pending_eval": 0,
+                "avg_latency_ms": 0, "avg_tokens": 0, "avg_scores": {},
+                "strategy_breakdown": {}, "daily": [],
+            }
+
+        total = len(queries)
+        done = [q for q in queries if q.eval_status == "done" and q.eval_scores]
+        pending = sum(1 for q in queries if q.eval_status in ("pending", "running"))
+
+        latencies = [q.latency_ms for q in queries if q.latency_ms]
+        tokens = [(q.tokens_in or 0) + (q.tokens_out or 0) for q in queries]
+
+        # Average per-metric DeepEval scores across all evaluated queries
+        metric_sums: dict = {}
+        metric_counts: dict = {}
+        for q in done:
+            for k, v in q.eval_scores.items():
+                score = v.get("score", 0) if isinstance(v, dict) else 0
+                metric_sums[k] = metric_sums.get(k, 0) + score
+                metric_counts[k] = metric_counts.get(k, 0) + 1
+        avg_scores = {k: round(metric_sums[k] / metric_counts[k], 3) for k in metric_sums}
+
+        # Strategy breakdown
+        strategy_cnt: dict = {}
+        for q in queries:
+            s = q.strategy_used or "similarity"
+            strategy_cnt[s] = strategy_cnt.get(s, 0) + 1
+
+        # Daily buckets (last 30 days)
+        daily: dict = {}
+        for q in queries:
+            day = q.created_at.strftime("%Y-%m-%d") if q.created_at else "unknown"
+            daily.setdefault(day, {"queries": 0, "latency_sum": 0, "tokens": 0})
+            daily[day]["queries"] += 1
+            daily[day]["latency_sum"] += q.latency_ms or 0
+            daily[day]["tokens"] += (q.tokens_in or 0) + (q.tokens_out or 0)
+
+        daily_list = sorted([
+            {"date": d, "queries": v["queries"],
+             "avg_latency": round(v["latency_sum"] / v["queries"], 1) if v["queries"] else 0,
+             "tokens": v["tokens"]}
+            for d, v in daily.items()
+        ], key=lambda x: x["date"])
+
+        return {
+            "total_queries": total,
+            "queries_with_eval": len(done),
+            "pending_eval": pending,
+            "avg_latency_ms": round(sum(latencies) / len(latencies), 1) if latencies else 0,
+            "avg_tokens": round(sum(tokens) / len(tokens)) if tokens else 0,
+            "avg_scores": avg_scores,
+            "strategy_breakdown": strategy_cnt,
+            "daily": daily_list,
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/rag/queries")
+def list_rag_queries(days: int = 30, limit: int = 100):
+    """Return recent RAG queries across all configs (for evaluation page)."""
+    from datetime import timedelta as _td
+    session = get_session()
+    try:
+        cutoff = datetime.utcnow() - _td(days=days)
+        rows = (
+            session.query(RagQuery)
+            .filter(RagQuery.created_at >= cutoff)
+            .order_by(RagQuery.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [_query_to_dict(r) for r in rows]
+    finally:
+        session.close()
 
 
 if __name__ == "__main__":

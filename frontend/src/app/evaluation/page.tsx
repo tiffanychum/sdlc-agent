@@ -155,16 +155,29 @@ function AgentTraceTimeline({ agentTrace }: { agentTrace: any[] }) {
 
 export default function EvaluationPage() {
   const [traces, setTraces] = useState<any[]>([]);
+  const [ragQueries, setRagQueries] = useState<any[]>([]);
+  const [ragStats, setRagStats] = useState<any>(null);
   const [evaluating, setEvaluating] = useState(false);
   const [evalResult, setEvalResult] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [pageTab, setPageTab] = useState<"agent" | "rag">("agent");
   const [activeTab, setActiveTab] = useState<"combined" | "geval" | "deepeval">("combined");
+  const [ragExpandedId, setRagExpandedId] = useState<string | null>(null);
 
   useEffect(() => { load(); }, []);
 
   async function load() {
-    const t = await api.traces.list(100);
-    setTraces(t.filter((tr: any) => tr.agent_response));
+    const [t, rq, rs] = await Promise.allSettled([
+      api.traces.list(100),
+      (api as any).rag.queries(30, 100),
+      (api as any).rag.stats(30),
+    ]);
+    if (t.status === "fulfilled") {
+      // Exclude synthetic RAG traces (agent_used="rag") — those belong in the RAG tab
+      setTraces(t.value.filter((tr: any) => tr.agent_used !== "rag" && tr.user_prompt));
+    }
+    if (rq.status === "fulfilled") setRagQueries(rq.value);
+    if (rs.status === "fulfilled") setRagStats(rs.value);
   }
 
   async function runEval() {
@@ -243,36 +256,219 @@ export default function EvaluationPage() {
     return tc;
   }
 
+  // Known metric labels — covers both old (2-metric) and new (5-metric) evaluations
+  const RAG_METRIC_META: Record<string, string> = {
+    answer_relevancy: "Answer Relevancy",
+    faithfulness: "Faithfulness",
+    contextual_relevancy: "Contextual Relevancy",
+    contextual_precision: "Contextual Precision",
+    contextual_recall: "Contextual Recall",
+  };
+  // For the summary cards we still show all 5 known metrics
+  const RAG_METRIC_KEYS = Object.entries(RAG_METRIC_META).map(([key, label]) => ({ key, label }));
+
+  const ragAvgScores = ragStats?.avg_scores || {};
+  const ragQueryDone = ragQueries.filter((q: any) => q.eval_status === "done" && q.eval_scores);
+
   return (
     <div className="space-y-5 max-w-6xl">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-semibold">Evaluation</h1>
           <p className="text-[13px] text-[var(--text-muted)]">
-            {traces.length} requests. {pendingCount > 0 ? `${pendingCount} pending.` : "All evaluated."}
-            {hasGEval && " G-Eval ✓"}{hasDeepEval && " DeepEval ✓"}
+            {pageTab === "agent"
+              ? `${traces.length} agent requests. ${pendingCount > 0 ? `${pendingCount} pending.` : "All evaluated."}`
+              : `${ragQueries.length} RAG queries. ${ragStats?.queries_with_eval || 0} evaluated.`}
           </p>
         </div>
         <div className="flex items-center gap-3">
-          {evalResult && <span className={`text-xs ${evaluating ? "text-[var(--accent)]" : evalResult.startsWith("Error") ? "text-[var(--error)]" : "text-[var(--success)]"}`}>{evalResult}</span>}
+          {evalResult && <span className={`text-xs ${evaluating ? "text-zinc-500" : evalResult.startsWith("Error") ? "text-[var(--error)]" : "text-[var(--success)]"}`}>{evalResult}</span>}
           <button onClick={load} className="btn-secondary">Refresh</button>
-          <button onClick={runEval} disabled={evaluating} className="btn-primary">
-            {evaluating ? (
-              <span className="flex items-center gap-1.5">
-                <span className="h-3 w-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                Evaluating...
-              </span>
-            ) : `Evaluate (${pendingCount})`}
-          </button>
+          {pageTab === "agent" && (
+            <button onClick={runEval} disabled={evaluating} className="btn-primary">
+              {evaluating ? (
+                <span className="flex items-center gap-1.5">
+                  <span className="h-3 w-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  Evaluating...
+                </span>
+              ) : `Evaluate (${pendingCount})`}
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Evaluation Method Tabs */}
+      {/* Top-level: Agent / RAG page switcher */}
+      <div className="flex gap-1 border-b border-[var(--border)]">
+        {(["agent", "rag"] as const).map(pt => (
+          <button key={pt} onClick={() => setPageTab(pt)}
+            className={`px-4 py-2 text-sm font-medium border-b-2 transition-all ${
+              pageTab === pt ? "border-zinc-900 text-zinc-900" : "border-transparent text-[var(--text-muted)] hover:text-[var(--text)]"
+            }`}>
+            {pt === "agent" ? "Agent Evaluation" : "RAG Evaluation"}
+          </button>
+        ))}
+      </div>
+
+      {/* ── RAG Evaluation Tab ─────────────────────────────────────────────────── */}
+      {pageTab === "rag" && (
+        <div className="space-y-5">
+          {/* RAG eval summary cards */}
+          {ragStats && (
+            <div className="grid grid-cols-5 gap-3">
+              {RAG_METRIC_KEYS.map(m => {
+                const s = ragAvgScores[m.key];
+                const pct = s != null ? Math.round(s * 100) : null;
+                return (
+                  <div key={m.key} className="card text-center">
+                    <div className={`text-xl font-semibold ${pct == null ? "text-zinc-300" : pct >= 70 ? "text-emerald-600" : pct >= 40 ? "text-amber-500" : "text-red-500"}`}>
+                      {pct != null ? `${pct}%` : "—"}
+                    </div>
+                    <div className="text-[10px] text-[var(--text-muted)] mt-1 leading-tight">{m.label}</div>
+                    {pct == null && <div className="text-[9px] text-zinc-300 mt-0.5">no data</div>}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* RAG queries list */}
+          <div className="space-y-2">
+            {ragQueries.length === 0 && (
+              <div className="text-[var(--text-muted)] text-center py-10 text-sm">
+                No RAG queries yet. Ask a question in the RAG chat first.
+              </div>
+            )}
+            {ragQueries.map((q: any) => {
+              const scores: Record<string, any> = q.eval_scores || {};
+              const isExpanded = ragExpandedId === q.id;
+              const avgScore = Object.values(scores).length > 0
+                ? (Object.values(scores) as any[]).reduce((a, v) => a + (v?.score || 0), 0) / Object.values(scores).length
+                : null;
+
+              return (
+                <div key={q.id} className="border border-zinc-100 rounded-xl overflow-hidden">
+                  <button
+                    className="w-full flex items-start gap-3 px-4 py-3 text-left hover:bg-zinc-50 transition-colors"
+                    onClick={() => setRagExpandedId(isExpanded ? null : q.id)}
+                  >
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-zinc-800 truncate">{q.query}</p>
+                      <div className="flex items-center gap-3 mt-1 text-[11px] text-zinc-400">
+                        <span>{q.strategy_used}</span>
+                        <span>{q.chunks_retrieved} chunks</span>
+                        <span>{Math.round(q.latency_ms || 0)}ms</span>
+                        {q.created_at && <span>{new Date(q.created_at).toLocaleString()}</span>}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {q.eval_status === "done" && avgScore != null && (
+                        <span className={`text-sm font-semibold ${avgScore >= 0.7 ? "text-emerald-600" : avgScore >= 0.4 ? "text-amber-500" : "text-red-500"}`}>
+                          {Math.round(avgScore * 100)}%
+                        </span>
+                      )}
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${
+                        q.eval_status === "done" ? "bg-emerald-50 text-emerald-600" :
+                        q.eval_status === "running" ? "bg-blue-50 text-blue-600" :
+                        q.eval_status === "error" ? "bg-red-50 text-red-500" :
+                        "bg-zinc-100 text-zinc-400"
+                      }`}>{q.eval_status}</span>
+                      <span className="text-zinc-300 text-xs">{isExpanded ? "▲" : "▼"}</span>
+                    </div>
+                  </button>
+
+                  {isExpanded && (
+                    <div className="border-t border-zinc-100 bg-zinc-50/50 px-4 py-3 space-y-4">
+                      {/* Answer */}
+                      <div>
+                        <div className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wide mb-1">Answer</div>
+                        <p className="text-xs text-zinc-600 leading-relaxed line-clamp-5">{q.answer}</p>
+                      </div>
+
+                      {/* DeepEval 5-metric scores */}
+                      {q.eval_status === "done" && Object.keys(scores).length > 0 ? (
+                        <div>
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wide">
+                              DeepEval Metrics ({Object.keys(scores).length})
+                            </div>
+                            {Object.keys(scores).length < 5 && (
+                              <span className="text-[9px] text-zinc-300 italic">Re-evaluate to get all 5 metrics</span>
+                            )}
+                          </div>
+                          <div className="grid grid-cols-1 gap-2">
+                            {/* Render whichever metrics exist in eval_scores */}
+                            {Object.entries(scores).map(([key, s]: [string, any]) => {
+                              const label = RAG_METRIC_META[key] || key.replace(/_/g, " ");
+                              const pct = Math.round((s.score || 0) * 100);
+                              const isErr = s.reason?.startsWith("ERROR");
+                              return (
+                                <div key={key} className="space-y-0.5">
+                                  <div className="flex items-center justify-between">
+                                    <span className="text-xs text-zinc-500 capitalize">{label}</span>
+                                    <div className="flex items-center gap-1.5">
+                                      <span className={`text-xs font-mono font-medium ${s.passed ? "text-emerald-600" : isErr ? "text-red-500" : "text-amber-500"}`}>{pct}%</span>
+                                      <span className={`text-[9px] px-1.5 py-0.5 rounded font-medium ${s.passed ? "bg-emerald-50 text-emerald-600" : "bg-amber-50 text-amber-600"}`}>
+                                        {s.passed ? "pass" : "fail"}
+                                      </span>
+                                    </div>
+                                  </div>
+                                  <div className="h-1.5 bg-zinc-200 rounded-full overflow-hidden">
+                                    <div className={`h-full rounded-full ${s.passed ? "bg-emerald-400" : isErr ? "bg-red-300" : "bg-amber-400"}`}
+                                      style={{ width: `${pct}%` }} />
+                                  </div>
+                                  {s.reason && !isErr && (
+                                    <p className="text-[10px] text-zinc-400 leading-relaxed">{s.reason}</p>
+                                  )}
+                                  {isErr && (
+                                    <p className="text-[10px] text-red-400 leading-relaxed">{s.reason}</p>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ) : q.eval_status === "pending" ? (
+                        <div className="text-xs text-zinc-400">Evaluation pending — enable auto-evaluate when querying.</div>
+                      ) : q.eval_status === "running" ? (
+                        <div className="flex items-center gap-2 text-xs text-blue-500">
+                          <span className="h-3 w-3 border-2 border-blue-200 border-t-blue-500 rounded-full animate-spin" />
+                          Evaluating...
+                        </div>
+                      ) : q.eval_status === "error" ? (
+                        <div className="text-xs text-red-500">Evaluation error: {q.eval_error}</div>
+                      ) : null}
+
+                      {/* Citations summary */}
+                      {q.citations && q.citations.length > 0 && (
+                        <div>
+                          <div className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wide mb-1">Sources ({q.citations.length})</div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {q.citations.map((c: any, i: number) => (
+                              <span key={i} className="text-[10px] bg-zinc-100 text-zinc-500 px-2 py-0.5 rounded-full">
+                                [{i + 1}] {(c.source || "").split("/").pop() || c.source} {Math.round((c.score || 0) * 100)}%
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── Agent Evaluation Tab ────────────────────────────────────────────────── */}
+      {pageTab === "agent" && (
+        <>
+      {/* Agent Evaluation Method Tabs */}
       <div className="flex gap-1 border-b border-[var(--border)]">
         {(["combined", "geval", "deepeval"] as const).map(tab => (
           <button key={tab} onClick={() => setActiveTab(tab)}
             className={`px-4 py-2 text-sm font-medium border-b-2 transition-all ${
-              activeTab === tab ? "border-[var(--accent)] text-[var(--accent)]" : "border-transparent text-[var(--text-muted)] hover:text-[var(--text)]"
+              activeTab === tab ? "border-zinc-900 text-zinc-900" : "border-transparent text-[var(--text-muted)] hover:text-[var(--text)]"
             }`}>
             {tab === "combined" ? "Combined View" : tab === "geval" ? "G-Eval (LLM Judge)" : "DeepEval (External)"}
           </button>
@@ -460,9 +656,9 @@ export default function EvaluationPage() {
                   <span className="text-sm truncate">{t.user_prompt}</span>
                 </div>
                 <div className="flex items-center gap-2 text-xs text-[var(--text-muted)] flex-shrink-0 ml-3">
-                  {t.agent_used && <span className="badge bg-[var(--accent-light)] text-[var(--accent)]">{t.agent_used}</span>}
-                  {hasG && <span className="badge bg-blue-50 text-blue-700">G-Eval</span>}
-                  {hasD && <span className="badge bg-purple-50 text-purple-700">DeepEval</span>}
+                  {t.agent_used && <span className="badge bg-zinc-100 text-zinc-600 border border-zinc-200">{t.agent_used}</span>}
+                  {hasG && <span className="badge bg-sky-50 text-sky-700 border border-sky-100">G-Eval</span>}
+                  {hasD && <span className="badge bg-violet-50 text-violet-700 border border-violet-100">DeepEval</span>}
                   <span>{t.total_latency_ms.toFixed(0)}ms</span>
                   <span className="text-[10px]">{isExpanded ? "▲" : "▼"}</span>
                 </div>
@@ -548,7 +744,7 @@ export default function EvaluationPage() {
                             </div>
                             {Object.keys(gReasoning).length > 0 && (
                               <details className="text-[10px]">
-                                <summary className="cursor-pointer text-[var(--accent)] hover:underline">Show G-Eval reasoning</summary>
+                                <summary className="cursor-pointer text-zinc-500 hover:text-zinc-800 hover:underline">Show G-Eval reasoning</summary>
                                 <div className="mt-1 space-y-1">
                                   {Object.entries(gReasoning).map(([k, v]) => (
                                     <div key={k} className="p-1.5 rounded bg-blue-50 border border-blue-100">
@@ -631,6 +827,8 @@ export default function EvaluationPage() {
         })}
         {traces.length === 0 && <div className="text-[var(--text-muted)] text-center py-10">No requests yet. Send messages in Chat first.</div>}
       </div>
+        </>
+      )}
     </div>
   );
 }

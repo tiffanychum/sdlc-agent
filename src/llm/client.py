@@ -62,5 +62,20 @@ def get_rca_llm(temperature: float = 0.0, max_tokens: int | None = None) -> Chat
 
 
 def get_router_llm(temperature: float = 0.0) -> ChatOpenAI:
-    """Lightweight LLM used for request routing and supervisor decisions."""
-    return get_llm(model=config.llm.router_model, temperature=temperature)
+    """Lightweight LLM for routing and supervisor decisions.
+
+    Deliberately bypasses thinking-model detection — routing is a simple
+    single-token decision ("router_decides" / "sequential" etc.) that does
+    not benefit from extended thinking, and sending thinking tokens causes
+    unnecessary provider 500s with some model variants.
+    Max tokens is capped at 256 to keep routing calls fast and cheap.
+    """
+    return ChatOpenAI(
+        api_key=config.llm.api_key,
+        base_url=config.llm.base_url,
+        model=config.llm.router_model,
+        temperature=temperature,
+        max_tokens=256,
+        http_client=httpx.Client(timeout=_HTTP_TIMEOUT),
+        http_async_client=httpx.AsyncClient(timeout=_HTTP_TIMEOUT),
+    )

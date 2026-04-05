@@ -6,8 +6,81 @@ External evaluation tool integrations:
 Both are optional — if API keys are missing, they gracefully no-op.
 """
 
-import os
+import asyncio
+import concurrent.futures
 import json
+import logging
+import os
+import time
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# Maximum attempts for any eval call (1 original + 2 retries).
+_MAX_ATTEMPTS = 3
+_RETRY_DELAY_S = 1.0
+
+# Shared thread pool for DeepEval metric calls.
+# DeepEval.measure() calls asyncio.run() internally, which cannot patch a
+# running uvloop.  Running each metric in a worker thread sidesteps this:
+# each thread has its own default asyncio event loop (not uvloop).
+_DEEPEVAL_THREAD_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="deepeval"
+)
+
+
+def _run_in_thread(fn, timeout: float = 180.0):
+    """Execute fn() in a worker thread so asyncio.run() inside DeepEval works."""
+    future = _DEEPEVAL_THREAD_POOL.submit(fn)
+    return future.result(timeout=timeout)
+
+
+# ── Retry helpers ─────────────────────────────────────────────────
+
+def _retry_sync(fn, attempts: int = _MAX_ATTEMPTS, delay: float = _RETRY_DELAY_S):
+    """
+    Call fn() up to `attempts` times with linear back-off, running each
+    attempt in a dedicated thread to avoid uvloop event-loop conflicts.
+    Raises the last exception if all attempts fail.
+    """
+    last_exc: Exception = RuntimeError("No attempts made")
+    for attempt in range(attempts):
+        try:
+            return _run_in_thread(fn)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                logger.warning(
+                    "DeepEval metric call failed (attempt %d/%d): %s: %s — retrying in %.1fs",
+                    attempt + 1, attempts, type(exc).__name__, exc, delay * (attempt + 1),
+                )
+                time.sleep(delay * (attempt + 1))
+    raise last_exc
+
+
+async def _retry_async(coro_fn, attempts: int = _MAX_ATTEMPTS, delay: float = _RETRY_DELAY_S):
+    """
+    Call coro_fn() up to `attempts` times with linear back-off.
+    Raises the last exception if all attempts fail.
+    """
+    last_exc: Exception = RuntimeError("No attempts made")
+    for attempt in range(attempts):
+        try:
+            return await coro_fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                logger.warning(
+                    "Agentic eval LLM call failed (attempt %d/%d): %s: %s — retrying in %.1fs",
+                    attempt + 1, attempts, type(exc).__name__, exc, delay * (attempt + 1),
+                )
+                await asyncio.sleep(delay * (attempt + 1))
+    raise last_exc
+
+
+def _fmt_error(exc: Exception, attempts: int = _MAX_ATTEMPTS) -> str:
+    """Format a full error string for inclusion in report reasoning fields."""
+    return f"ERROR after {attempts} attempt(s): {type(exc).__name__}: {exc}"
 
 
 # ── Langfuse Integration ────────────────────────────────────────
@@ -44,40 +117,44 @@ def export_trace_to_langfuse(
         trace = client.trace(
             id=trace_id,
             name=f"agent:{agent_used}",
-            input={"prompt": user_prompt[:500]},
-            output={"response": response[:500]},
+            input={"prompt": user_prompt},
+            output={"response": response},
             metadata={"agent": agent_used, "tool_count": len(tool_calls)},
         )
 
         trace.generation(
             name="routing",
             model="router",
-            input=user_prompt[:300],
+            input=user_prompt,
             output=agent_used,
         )
 
         for i, tc in enumerate(tool_calls):
             trace.span(
                 name=f"tool:{tc.get('tool', '?')}",
-                input=json.dumps(tc.get("args", {}))[:300],
+                input=json.dumps(tc.get("args", {})),
                 metadata={"tool": tc.get("tool", ""), "step": i + 1},
             )
 
         trace.generation(
             name="response",
             model=agent_used,
-            input=user_prompt[:300],
-            output=response[:500],
+            input=user_prompt,
+            output=response,
             metadata={"latency_ms": latency_ms},
         )
 
         if eval_scores:
             for name, score in eval_scores.items():
-                trace.score(name=name, value=float(score))
+                if score is not None:
+                    try:
+                        trace.score(name=name, value=float(score))
+                    except (TypeError, ValueError):
+                        pass  # skip non-numeric scores (error strings)
 
         client.flush()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Langfuse export failed: %s: %s", type(exc).__name__, exc)
 
 
 def export_eval_run_to_langfuse(run_summary: dict):
@@ -98,11 +175,16 @@ def export_eval_run_to_langfuse(run_summary: dict):
         for metric_name in ["task_success_rate", "tool_accuracy", "reasoning_quality",
                             "step_efficiency", "faithfulness", "safety_compliance", "routing_accuracy"]:
             if metric_name in run_summary:
-                trace.score(name=metric_name, value=float(run_summary[metric_name]))
+                val = run_summary[metric_name]
+                if val is not None:
+                    try:
+                        trace.score(name=metric_name, value=float(val))
+                    except (TypeError, ValueError):
+                        pass
 
         client.flush()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Langfuse eval run export failed: %s: %s", type(exc).__name__, exc)
 
 
 # ── DeepEval Environment Setup ──────────────────────────────────
@@ -115,6 +197,81 @@ def _ensure_deepeval_env():
         if poe_key and base_url:
             os.environ["OPENAI_API_KEY"] = poe_key
             os.environ["OPENAI_BASE_URL"] = base_url
+
+
+def _strip_json_fences(text: str) -> str:
+    """
+    Strip markdown code-block fences from LLM output before JSON parsing.
+
+    Claude (and some other models) wraps JSON responses in ```json ... ``` blocks
+    even when instructed to return raw JSON.  DeepEval's internal pydantic validators
+    call json.loads() directly on the LLM response and raise ValidationError when
+    they see the fence characters.  This function normalises the output so that
+    DeepEval always receives clean JSON.
+
+    Handles:
+    - ```json\\n{...}\\n```
+    - ```\\n{...}\\n```
+    - Leading/trailing whitespace
+    """
+    import re
+    stripped = text.strip()
+    # Remove opening fence (```json or ``` alone)
+    stripped = re.sub(r"^```(?:json)?\s*\n?", "", stripped, flags=re.IGNORECASE)
+    # Remove closing fence
+    stripped = re.sub(r"\n?```\s*$", "", stripped)
+    return stripped.strip()
+
+
+def _get_deepeval_model():
+    """
+    Return a DeepEvalBaseLLM instance that wraps our configured LLM and
+    strips markdown code-block fences from every response.
+
+    If DeepEval is not installed or the LLM cannot be initialised, returns None
+    so callers can fall back to the default (env-var-based) model.
+    """
+    try:
+        from deepeval.models.base_model import DeepEvalBaseLLM
+        from openai import AsyncOpenAI, OpenAI
+
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("POE_API_KEY", "")
+        base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL", "") or None
+        model_name = os.getenv("DEEPEVAL_MODEL", os.getenv("LLM_MODEL", "gpt-4o-mini"))
+
+        class _CleanJsonLLM(DeepEvalBaseLLM):
+            """Thin wrapper that strips ```json fences so DeepEval JSON parsing succeeds."""
+
+            def load_model(self):
+                return OpenAI(api_key=api_key, base_url=base_url or None)
+
+            def generate(self, prompt: str, schema=None) -> str:  # type: ignore[override]
+                client: OpenAI = self.load_model()
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                )
+                raw = response.choices[0].message.content or ""
+                return _strip_json_fences(raw)
+
+            async def a_generate(self, prompt: str, schema=None) -> str:  # type: ignore[override]
+                client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
+                response = await client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                )
+                raw = response.choices[0].message.content or ""
+                return _strip_json_fences(raw)
+
+            def get_model_name(self) -> str:
+                return model_name
+
+        return _CleanJsonLLM()
+    except Exception as exc:
+        logger.debug("Could not build DeepEval custom LLM wrapper: %s — using default", exc)
+        return None
 
 
 def _extract_tool_calls_from_trace(agent_trace: list[dict]) -> list[dict]:
@@ -171,17 +328,20 @@ def _build_execution_steps_text(agent_trace: list[dict]) -> str:
     return "\n".join(steps) if steps else "No execution steps recorded"
 
 
-# ── DeepEval Standalone Metrics (ToolCorrectness, ArgumentCorrectness) ──
+# ── DeepEval Standalone Metrics ─────────────────────────────────
 
 def run_deepeval_standalone_metrics(
     user_prompt: str,
     agent_response: str,
     agent_trace: list[dict] = None,
     tool_outputs: list[str] = None,
-) -> dict[str, float | str]:
+) -> dict:
     """
     Run DeepEval standalone metrics on an agent response.
-    Returns dict of metric_name -> score/reason.
+
+    Returns dict where each metric has:
+      "<metric>": float score or None (None = evaluation error)
+      "<metric>_reason": human-readable reason or "ERROR: ..." on failure
 
     Standalone metrics:
     - ToolCorrectness: Were the right tools called?
@@ -190,122 +350,151 @@ def run_deepeval_standalone_metrics(
     - Faithfulness: Is the response grounded in tool outputs?
     """
     _ensure_deepeval_env()
-    scores: dict[str, float | str] = {}
+    scores: dict = {}
     tool_outputs = tool_outputs or []
     flat_tools = _extract_tool_calls_from_trace(agent_trace or [])
 
     try:
         from deepeval.test_case import LLMTestCase, ToolCall
 
+        # Custom model that strips markdown fences before DeepEval JSON parsing.
+        eval_model = _get_deepeval_model()
+
         deepeval_tool_calls = []
         for tc in flat_tools:
             args = tc.get("args", {})
-            str_args = {str(k): str(v)[:200] for k, v in args.items()} if isinstance(args, dict) else {}
+            # Pass full argument values — no truncation.
+            str_args = {str(k): str(v) for k, v in args.items()} if isinstance(args, dict) else {}
             deepeval_tool_calls.append(ToolCall(
                 name=str(tc["name"]),
                 description=f"Tool: {tc['name']} (agent: {tc.get('agent', '?')})",
                 input_parameters=str_args,
             ))
 
+        # Build retrieval context from full tool outputs.
+        retrieval_context = [str(o) for o in tool_outputs] if tool_outputs else ["No tool outputs available"]
+
+        def _make_metric(cls, **kwargs):
+            """Instantiate metric with custom model when available."""
+            if eval_model is not None:
+                return cls(model=eval_model, **kwargs)
+            return cls(**kwargs)
+
         # ── Tool Correctness ──
         if deepeval_tool_calls:
             try:
                 from deepeval.metrics import ToolCorrectnessMetric
-                tc_case = LLMTestCase(
-                    input=user_prompt[:500],
-                    actual_output=agent_response[:1000],
-                    tools_called=deepeval_tool_calls,
-                    expected_tools=deepeval_tool_calls,
-                )
-                metric = ToolCorrectnessMetric(threshold=0.5, include_reason=True)
-                metric.measure(tc_case)
-                scores["tool_correctness"] = metric.score or 0.0
+
+                def _run_tool_correctness():
+                    tc_case = LLMTestCase(
+                        input=user_prompt,
+                        actual_output=agent_response,
+                        tools_called=deepeval_tool_calls,
+                        expected_tools=deepeval_tool_calls,
+                    )
+                    metric = _make_metric(ToolCorrectnessMetric, threshold=0.5, include_reason=True)
+                    metric.measure(tc_case)
+                    return metric
+
+                metric = _retry_sync(_run_tool_correctness)
+                scores["tool_correctness"] = metric.score
                 scores["tool_correctness_reason"] = metric.reason or ""
-            except Exception as e:
-                scores["tool_correctness"] = 0.5
-                scores["tool_correctness_reason"] = f"Metric failed: {str(e)[:100]}"
+            except Exception as exc:
+                scores["tool_correctness"] = None
+                scores["tool_correctness_reason"] = _fmt_error(exc)
+                logger.error("ToolCorrectness metric failed: %s", exc)
 
         # ── Argument Correctness ──
         if deepeval_tool_calls:
             try:
                 from deepeval.metrics import ArgumentCorrectnessMetric
-                ac_case = LLMTestCase(
-                    input=user_prompt[:500],
-                    actual_output=agent_response[:1000],
-                    tools_called=deepeval_tool_calls,
-                )
-                metric = ArgumentCorrectnessMetric(threshold=0.5, include_reason=True)
-                metric.measure(ac_case)
-                scores["argument_correctness"] = metric.score or 0.0
+
+                def _run_arg_correctness():
+                    ac_case = LLMTestCase(
+                        input=user_prompt,
+                        actual_output=agent_response,
+                        tools_called=deepeval_tool_calls,
+                    )
+                    metric = _make_metric(ArgumentCorrectnessMetric, threshold=0.5, include_reason=True)
+                    metric.measure(ac_case)
+                    return metric
+
+                metric = _retry_sync(_run_arg_correctness)
+                scores["argument_correctness"] = metric.score
                 scores["argument_correctness_reason"] = metric.reason or ""
-            except Exception as e:
-                scores["argument_correctness"] = 0.5
-                scores["argument_correctness_reason"] = f"Metric failed: {str(e)[:100]}"
+            except Exception as exc:
+                scores["argument_correctness"] = None
+                scores["argument_correctness_reason"] = _fmt_error(exc)
+                logger.error("ArgumentCorrectness metric failed: %s", exc)
 
         # ── Answer Relevancy ──
         try:
             from deepeval.metrics import AnswerRelevancyMetric
-            retrieval_context = [str(o)[:300] for o in tool_outputs[:5]] if tool_outputs else ["No tool outputs available"]
-            rel_case = LLMTestCase(
-                input=user_prompt[:500],
-                actual_output=agent_response[:1000],
-                retrieval_context=retrieval_context,
-            )
-            metric = AnswerRelevancyMetric(threshold=0.5, include_reason=True)
-            metric.measure(rel_case)
-            scores["deepeval_relevancy"] = metric.score or 0.0
+
+            def _run_answer_relevancy():
+                rel_case = LLMTestCase(
+                    input=user_prompt,
+                    actual_output=agent_response,
+                    retrieval_context=retrieval_context,
+                )
+                metric = _make_metric(AnswerRelevancyMetric, threshold=0.5, include_reason=True)
+                metric.measure(rel_case)
+                return metric
+
+            metric = _retry_sync(_run_answer_relevancy)
+            scores["deepeval_relevancy"] = metric.score
             scores["deepeval_relevancy_reason"] = metric.reason or ""
-        except Exception as e:
-            scores["deepeval_relevancy"] = 0.5
-            scores["deepeval_relevancy_reason"] = f"Metric failed: {str(e)[:100]}"
+        except Exception as exc:
+            scores["deepeval_relevancy"] = None
+            scores["deepeval_relevancy_reason"] = _fmt_error(exc)
+            logger.error("AnswerRelevancy metric failed: %s", exc)
 
         # ── Faithfulness ──
         try:
             from deepeval.metrics import FaithfulnessMetric
-            retrieval_context = [str(o)[:300] for o in tool_outputs[:5]] if tool_outputs else ["No tool outputs available"]
-            faith_case = LLMTestCase(
-                input=user_prompt[:500],
-                actual_output=agent_response[:1000],
-                retrieval_context=retrieval_context,
-            )
-            metric = FaithfulnessMetric(threshold=0.5, include_reason=True)
-            metric.measure(faith_case)
-            scores["deepeval_faithfulness"] = metric.score or 0.0
-            scores["deepeval_faithfulness_reason"] = metric.reason or ""
-        except Exception as e:
-            scores["deepeval_faithfulness"] = 0.5
-            scores["deepeval_faithfulness_reason"] = f"Metric failed: {str(e)[:100]}"
 
-    except ImportError:
+            def _run_faithfulness():
+                faith_case = LLMTestCase(
+                    input=user_prompt,
+                    actual_output=agent_response,
+                    retrieval_context=retrieval_context,
+                )
+                metric = _make_metric(FaithfulnessMetric, threshold=0.5, include_reason=True)
+                metric.measure(faith_case)
+                return metric
+
+            metric = _retry_sync(_run_faithfulness)
+            scores["deepeval_faithfulness"] = metric.score
+            scores["deepeval_faithfulness_reason"] = metric.reason or ""
+        except Exception as exc:
+            scores["deepeval_faithfulness"] = None
+            scores["deepeval_faithfulness_reason"] = _fmt_error(exc)
+            logger.error("Faithfulness metric failed: %s", exc)
+
+    except ImportError as exc:
+        err = _fmt_error(exc, attempts=1)
         scores.update({
-            "deepeval_relevancy": 0.5,
-            "deepeval_faithfulness": 0.5,
-            "tool_correctness": 0.5,
-            "argument_correctness": 0.5,
+            "deepeval_relevancy": None,
+            "deepeval_relevancy_reason": f"ERROR: DeepEval not installed — {exc}",
+            "deepeval_faithfulness": None,
+            "deepeval_faithfulness_reason": f"ERROR: DeepEval not installed — {exc}",
+            "tool_correctness": None,
+            "tool_correctness_reason": f"ERROR: DeepEval not installed — {exc}",
+            "argument_correctness": None,
+            "argument_correctness_reason": f"ERROR: DeepEval not installed — {exc}",
         })
-    except Exception:
-        scores.update({
-            "deepeval_relevancy": 0.5,
-            "deepeval_faithfulness": 0.5,
-            "tool_correctness": 0.5,
-            "argument_correctness": 0.5,
-        })
+        logger.error("DeepEval import failed: %s", exc)
 
     return scores
 
 
-# ── Agentic Trace Metrics (LLM-as-Judge, following DeepEval methodology) ──
-#
-# These metrics require full agent trace analysis. DeepEval's native
-# implementations need the @observe decorator at runtime, so for post-hoc
-# evaluation we implement equivalent LLM-as-judge versions following
-# the same scoring methodology.
+# ── Agentic Trace Metrics (LLM-as-Judge) ───────────────────────
 
 async def run_agentic_trace_metrics(
     user_prompt: str,
     agent_response: str,
     agent_trace: list[dict],
-) -> dict[str, float | str]:
+) -> dict:
     """
     Run trace-based agentic metrics using LLM-as-judge.
     Follows DeepEval's methodology for:
@@ -314,27 +503,41 @@ async def run_agentic_trace_metrics(
     - Plan Quality: Was the agent's plan logical and complete?
     - Plan Adherence: Did the agent follow its own plan?
 
-    Returns dict with scores (0-1) and reasoning strings.
+    Scores are None on failure; reason strings begin with "ERROR:" so report
+    layers can distinguish real failures from low-quality outputs.
     """
     from src.llm.client import get_judge_llm
     from src.orchestrator import _extract_text
+    import re
 
     execution_steps = _build_execution_steps_text(agent_trace)
     plan_text = _extract_plan_from_trace(agent_trace)
 
-    results: dict[str, float | str] = {}
+    results: dict = {}
     llm = get_judge_llm()
 
-    async def _eval_task_completion() -> tuple[float, str]:
+    def _parse_score_json(raw: str, field: str = "score") -> tuple[float, str]:
+        """Parse {reasoning, score} JSON from raw LLM output. Raises on failure."""
+        pattern = r'\{[^}]*"' + field + r'"\s*:\s*(\d)[^}]*\}'
+        match = re.search(pattern, raw, re.DOTALL)
+        if not match:
+            raise ValueError(f"Could not find '{field}' in LLM output: {raw[:400]}")
+        data = json.loads(match.group())
+        score = max(1, min(5, data.get(field, 3)))
+        return ((score - 1) / 4, data.get("reasoning", ""))
+
+    async def _eval_task_completion() -> tuple[Optional[float], str]:
+        # Full content — no truncation.
         prompt = f"""You are evaluating whether an AI agent successfully completed the user's task.
 
-USER TASK: {user_prompt[:500]}
+USER TASK:
+{user_prompt}
 
 AGENT EXECUTION TRACE:
-{execution_steps[:1500]}
+{execution_steps}
 
-AGENT FINAL OUTPUT (first 800 chars):
-{agent_response[:800]}
+AGENT FINAL OUTPUT:
+{agent_response}
 
 Evaluate:
 1. What was the user's intended task/goal?
@@ -350,25 +553,20 @@ Rate task completion on a scale of 1-5:
 
 Respond with ONLY JSON: {{"reasoning": "<your analysis>", "score": <1-5>}}"""
         try:
-            resp = await llm.ainvoke([{"role": "user", "content": prompt}])
-            raw = _extract_text(resp.content)
-            import re
-            match = re.search(r'\{[^}]*"score"\s*:\s*(\d)[^}]*\}', raw, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
-                score = max(1, min(5, data.get("score", 3)))
-                return ((score - 1) / 4, data.get("reasoning", ""))
-        except Exception:
-            pass
-        return (0.5, "Evaluation failed")
+            resp = await _retry_async(lambda: llm.ainvoke([{"role": "user", "content": prompt}]))
+            return _parse_score_json(_extract_text(resp.content))
+        except Exception as exc:
+            logger.error("task_completion eval failed: %s", exc)
+            return (None, _fmt_error(exc))
 
-    async def _eval_step_efficiency() -> tuple[float, str]:
+    async def _eval_step_efficiency() -> tuple[Optional[float], str]:
         prompt = f"""You are evaluating the efficiency of an AI agent's execution steps.
 
-USER TASK: {user_prompt[:500]}
+USER TASK:
+{user_prompt}
 
 EXECUTION STEPS:
-{execution_steps[:1500]}
+{execution_steps}
 
 Evaluate:
 1. Were all steps necessary for completing the task?
@@ -385,28 +583,23 @@ Rate step efficiency on a scale of 1-5:
 
 Respond with ONLY JSON: {{"reasoning": "<your analysis>", "score": <1-5>}}"""
         try:
-            resp = await llm.ainvoke([{"role": "user", "content": prompt}])
-            raw = _extract_text(resp.content)
-            import re
-            match = re.search(r'\{[^}]*"score"\s*:\s*(\d)[^}]*\}', raw, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
-                score = max(1, min(5, data.get("score", 3)))
-                return ((score - 1) / 4, data.get("reasoning", ""))
-        except Exception:
-            pass
-        return (0.5, "Evaluation failed")
+            resp = await _retry_async(lambda: llm.ainvoke([{"role": "user", "content": prompt}]))
+            return _parse_score_json(_extract_text(resp.content))
+        except Exception as exc:
+            logger.error("step_efficiency eval failed: %s", exc)
+            return (None, _fmt_error(exc))
 
-    async def _eval_plan_quality() -> tuple[float, str]:
+    async def _eval_plan_quality() -> tuple[Optional[float], str]:
         if not plan_text:
             return (1.0, "No plan detected in trace — metric passes by default (DeepEval convention)")
 
         prompt = f"""You are evaluating the quality of an AI agent's plan.
 
-USER TASK: {user_prompt[:500]}
+USER TASK:
+{user_prompt}
 
 AGENT'S PLAN:
-{plan_text[:1500]}
+{plan_text}
 
 Evaluate:
 1. Is the plan logical and well-structured?
@@ -424,31 +617,26 @@ Rate plan quality on a scale of 1-5:
 
 Respond with ONLY JSON: {{"reasoning": "<your analysis>", "score": <1-5>}}"""
         try:
-            resp = await llm.ainvoke([{"role": "user", "content": prompt}])
-            raw = _extract_text(resp.content)
-            import re
-            match = re.search(r'\{[^}]*"score"\s*:\s*(\d)[^}]*\}', raw, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
-                score = max(1, min(5, data.get("score", 3)))
-                return ((score - 1) / 4, data.get("reasoning", ""))
-        except Exception:
-            pass
-        return (0.5, "Evaluation failed")
+            resp = await _retry_async(lambda: llm.ainvoke([{"role": "user", "content": prompt}]))
+            return _parse_score_json(_extract_text(resp.content))
+        except Exception as exc:
+            logger.error("plan_quality eval failed: %s", exc)
+            return (None, _fmt_error(exc))
 
-    async def _eval_plan_adherence() -> tuple[float, str]:
+    async def _eval_plan_adherence() -> tuple[Optional[float], str]:
         if not plan_text:
             return (1.0, "No plan detected in trace — metric passes by default (DeepEval convention)")
 
         prompt = f"""You are evaluating whether an AI agent followed its own plan during execution.
 
-USER TASK: {user_prompt[:500]}
+USER TASK:
+{user_prompt}
 
 AGENT'S PLAN:
-{plan_text[:1000]}
+{plan_text}
 
 ACTUAL EXECUTION STEPS:
-{execution_steps[:1500]}
+{execution_steps}
 
 Evaluate:
 1. Did the agent follow the plan steps in order?
@@ -465,17 +653,11 @@ Rate plan adherence on a scale of 1-5:
 
 Respond with ONLY JSON: {{"reasoning": "<your analysis>", "score": <1-5>}}"""
         try:
-            resp = await llm.ainvoke([{"role": "user", "content": prompt}])
-            raw = _extract_text(resp.content)
-            import re
-            match = re.search(r'\{[^}]*"score"\s*:\s*(\d)[^}]*\}', raw, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
-                score = max(1, min(5, data.get("score", 3)))
-                return ((score - 1) / 4, data.get("reasoning", ""))
-        except Exception:
-            pass
-        return (0.5, "Evaluation failed")
+            resp = await _retry_async(lambda: llm.ainvoke([{"role": "user", "content": prompt}]))
+            return _parse_score_json(_extract_text(resp.content))
+        except Exception as exc:
+            logger.error("plan_adherence eval failed: %s", exc)
+            return (None, _fmt_error(exc))
 
     tc_score, tc_reason = await _eval_task_completion()
     se_score, se_reason = await _eval_step_efficiency()
@@ -494,71 +676,104 @@ Respond with ONLY JSON: {{"reasoning": "<your analysis>", "score": <1-5>}}"""
     return results
 
 
-# ── Combined DeepEval Runner ────────────────────────────────────
+# ── Legacy entry point ──────────────────────────────────────────
 
 def run_deepeval_metrics(
     user_prompt: str,
     agent_response: str,
     tool_outputs: list[str] = None,
     expected_output: str = None,
-) -> dict[str, float]:
+) -> dict:
     """
     Legacy entry point for basic DeepEval metrics (relevancy + faithfulness).
     Kept for backward compatibility. New code should use run_all_deepeval_metrics().
+
+    Scores are None on failure; _reason keys contain the full error message.
     """
     _ensure_deepeval_env()
     scores = {}
     tool_outputs = tool_outputs or []
 
+    retrieval_context = tool_outputs if tool_outputs else ["No tool outputs available"]
+
     try:
         from deepeval.metrics import AnswerRelevancyMetric, FaithfulnessMetric
         from deepeval.test_case import LLMTestCase
 
-        retrieval_context = tool_outputs[:5] if tool_outputs else ["No tool outputs available"]
+        eval_model = _get_deepeval_model()
 
+        def _make_metric(cls, **kwargs):
+            if eval_model is not None:
+                return cls(model=eval_model, **kwargs)
+            return cls(**kwargs)
+
+        # Full content — no truncation.
         test_case = LLMTestCase(
-            input=user_prompt[:500],
-            actual_output=agent_response[:1000],
+            input=user_prompt,
+            actual_output=agent_response,
             retrieval_context=retrieval_context,
             expected_output=expected_output or "",
         )
 
         try:
-            relevancy = AnswerRelevancyMetric(threshold=0.5)
-            relevancy.measure(test_case)
-            scores["deepeval_relevancy"] = relevancy.score or 0.0
-        except Exception:
-            scores["deepeval_relevancy"] = 0.5
+            def _run_relevancy():
+                m = _make_metric(AnswerRelevancyMetric, threshold=0.5, include_reason=True)
+                m.measure(test_case)
+                return m
+            m = _retry_sync(_run_relevancy)
+            scores["deepeval_relevancy"] = m.score
+            scores["deepeval_relevancy_reason"] = m.reason or ""
+        except Exception as exc:
+            scores["deepeval_relevancy"] = None
+            scores["deepeval_relevancy_reason"] = _fmt_error(exc)
+            logger.error("AnswerRelevancy (legacy) failed: %s", exc)
 
         try:
-            faithfulness = FaithfulnessMetric(threshold=0.5)
-            faithfulness.measure(test_case)
-            scores["deepeval_faithfulness"] = faithfulness.score or 0.0
-        except Exception:
-            scores["deepeval_faithfulness"] = 0.5
+            def _run_faithfulness():
+                m = _make_metric(FaithfulnessMetric, threshold=0.5, include_reason=True)
+                m.measure(test_case)
+                return m
+            m = _retry_sync(_run_faithfulness)
+            scores["deepeval_faithfulness"] = m.score
+            scores["deepeval_faithfulness_reason"] = m.reason or ""
+        except Exception as exc:
+            scores["deepeval_faithfulness"] = None
+            scores["deepeval_faithfulness_reason"] = _fmt_error(exc)
+            logger.error("Faithfulness (legacy) failed: %s", exc)
 
-    except ImportError:
-        scores["deepeval_relevancy"] = 0.5
-        scores["deepeval_faithfulness"] = 0.5
-    except Exception:
-        scores["deepeval_relevancy"] = 0.5
-        scores["deepeval_faithfulness"] = 0.5
+    except ImportError as exc:
+        scores["deepeval_relevancy"] = None
+        scores["deepeval_relevancy_reason"] = f"ERROR: DeepEval not installed — {exc}"
+        scores["deepeval_faithfulness"] = None
+        scores["deepeval_faithfulness_reason"] = f"ERROR: DeepEval not installed — {exc}"
+        logger.error("DeepEval import failed (legacy): %s", exc)
+    except Exception as exc:
+        scores["deepeval_relevancy"] = None
+        scores["deepeval_relevancy_reason"] = _fmt_error(exc, attempts=1)
+        scores["deepeval_faithfulness"] = None
+        scores["deepeval_faithfulness_reason"] = _fmt_error(exc, attempts=1)
+        logger.error("run_deepeval_metrics (legacy) failed: %s", exc)
 
     return scores
 
+
+# ── Combined runner ─────────────────────────────────────────────
 
 async def run_all_deepeval_metrics(
     user_prompt: str,
     agent_response: str,
     agent_trace: list[dict] = None,
     tool_outputs: list[str] = None,
-) -> dict[str, float | str]:
+) -> dict:
     """
     Run ALL DeepEval agentic metrics:
     - Standalone: ToolCorrectness, ArgumentCorrectness, AnswerRelevancy, Faithfulness
     - Trace-based: TaskCompletion, StepEfficiency, PlanQuality, PlanAdherence
+
+    Scores are None on evaluation error; _reason keys surface the full error message.
+    When no agent_trace is provided, trace-based metrics are marked as not evaluated.
     """
-    all_scores: dict[str, float | str] = {}
+    all_scores: dict = {}
     agent_trace = agent_trace or []
 
     standalone = run_deepeval_standalone_metrics(
@@ -578,10 +793,14 @@ async def run_all_deepeval_metrics(
         all_scores.update(trace_scores)
     else:
         all_scores.update({
-            "task_completion": 0.5,
-            "step_efficiency_de": 0.5,
+            "task_completion": None,
+            "task_completion_reason": "No agent trace available — metric skipped",
+            "step_efficiency_de": None,
+            "step_efficiency_de_reason": "No agent trace available — metric skipped",
             "plan_quality": 1.0,
+            "plan_quality_reason": "No plan detected — metric passes by default (DeepEval convention)",
             "plan_adherence": 1.0,
+            "plan_adherence_reason": "No plan detected — metric passes by default (DeepEval convention)",
         })
 
     return all_scores

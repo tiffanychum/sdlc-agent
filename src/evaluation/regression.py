@@ -7,15 +7,21 @@ per-criterion reasoning, checks structural trace assertions, and detects
 cost/latency regressions.
 """
 
+import logging
 import time
 import uuid
 from datetime import datetime
 
 from src.db.database import get_session
+
+logger = logging.getLogger(__name__)
 from src.db.models import EvalRun, RegressionResult, GoldenTestCase
 from src.evaluation.golden import get_active_cases
 from src.config import config
-from src.orchestrator import build_orchestrator_from_team, _extract_text
+from src.orchestrator import (
+    build_orchestrator_from_team, select_strategy_auto,
+    _extract_text, VALID_STRATEGIES,
+)
 from src.tracing.collector import TraceCollector, estimate_cost
 
 
@@ -47,14 +53,60 @@ class RegressionRunner:
 
         baseline_results = _load_baseline_results(baseline_run_id) if baseline_run_id else {}
 
-        orchestrator = await build_orchestrator_from_team(self.team_id, model_override=self.model or None)
+        # ── Per-case strategy resolution ──────────────────────────────────────────
+        # Each case may declare a `strategy` field:
+        #   - None / missing  → use whatever the team DB has (default)
+        #   - "auto"          → meta-router LLM picks the best strategy for this prompt
+        #   - concrete name   → use that strategy regardless of team setting
+        #
+        # We pre-resolve all strategies so we can cache one orchestrator per unique
+        # concrete strategy value (avoids rebuilding the full agent graph every case).
+
+        # Load agent descriptions once for the auto meta-router.
+        agents_config_for_auto = await _load_agents_config(self.team_id)
+
+        case_strategy_map: dict[str, str] = {}   # case.id -> resolved concrete strategy
+        for case in cases:
+            raw = getattr(case, "strategy", None) or None
+            if raw == "auto":
+                try:
+                    resolved = await select_strategy_auto(case.prompt, agents_config_for_auto)
+                except Exception as exc:
+                    logger.warning(
+                        "Auto-strategy resolution failed for case %s (%s: %s); "
+                        "falling back to 'supervisor'",
+                        case.id, type(exc).__name__, exc,
+                    )
+                    resolved = "supervisor"
+            elif raw in VALID_STRATEGIES:
+                resolved = raw
+            else:
+                resolved = "__team_default__"
+            case_strategy_map[case.id] = resolved
+
+        # Build (and cache) one orchestrator per unique resolved strategy.
+        orchestrator_cache: dict[str, object] = {}
+        for case in cases:
+            strat = case_strategy_map[case.id]
+            if strat not in orchestrator_cache:
+                override = strat if strat != "__team_default__" else None
+                orchestrator_cache[strat] = await build_orchestrator_from_team(
+                    self.team_id,
+                    model_override=self.model or None,
+                    strategy_override=override,
+                )
 
         run_id = uuid.uuid4().hex[:12]
         results: list[dict] = []
 
         for case in cases:
+            resolved_strat = case_strategy_map[case.id]
+            orchestrator = orchestrator_cache[resolved_strat]
             result = await self._run_single_case(orchestrator, case, baseline_results.get(case.id))
             result["run_id"] = run_id
+            # Record strategy provenance: what was configured vs what ran.
+            result["expected_strategy"] = getattr(case, "expected_strategy", None) or getattr(case, "strategy", None)
+            result["actual_strategy"] = resolved_strat if resolved_strat != "__team_default__" else None
             results.append(result)
 
         summary = self._build_summary(run_id, results, cases)
@@ -96,40 +148,47 @@ class RegressionRunner:
                 state = await orchestrator.aget_state(config)
                 if not state.next:
                     break
-                resume_val = {"approved": True, "answer": "auto-approved for regression test"}
+
+                # Collect ALL pending interrupts across all tasks (parallel strategy
+                # can produce multiple simultaneous HITL interrupts).
+                pending_interrupts = []
                 if state.tasks:
                     for task in state.tasks:
                         if hasattr(task, "interrupts") and task.interrupts:
-                            iv = task.interrupts[0].value
-                            if isinstance(iv, dict):
-                                htype = iv.get("type", "")
-                                if htype == "plan_review":
-                                    resume_val = {"type": "plan_review", "approved": True,
-                                                  "edited_plan": iv.get("plan", [])}
-                                elif htype == "action_confirmation":
-                                    resume_val = {"type": "action_confirmation", "approved": True}
-                                elif htype == "tool_review":
-                                    resume_val = {"type": "tool_review", "action": "continue"}
-                                elif htype == "clarification":
-                                    question_text = iv.get("question", "").lower()
-                                    # Give a clear "yes" for approval/confirmation gates so
-                                    # plan_execute agents don't stall waiting for explicit approval.
-                                    _approval_keywords = (
-                                        "proceed", "confirm", "approve", "abort",
-                                        "shall i", "should i", "go ahead", "create these",
-                                        "is this correct", "is that correct", "correct repo",
-                                        "correct?", "correct.", "is this", "is that",
-                                        "will i", "i will",
-                                    )
-                                    if any(kw in question_text for kw in _approval_keywords):
-                                        _answer = "Yes, proceed exactly as planned."
-                                    else:
-                                        _answer = "Yes, proceed exactly as planned."
-                                    resume_val = {"type": "clarification", "answer": _answer}
-                            break
-                result = await orchestrator.ainvoke(
-                    LGCommand(resume=resume_val), config=config
-                )
+                            for intr in task.interrupts:
+                                pending_interrupts.append(intr)
+
+                def _auto_approve(iv):
+                    """Return the appropriate auto-approve resume value for one interrupt."""
+                    if not isinstance(iv, dict):
+                        return {"approved": True, "answer": "auto-approved for regression test"}
+                    htype = iv.get("type", "")
+                    if htype == "plan_review":
+                        return {"type": "plan_review", "approved": True,
+                                "edited_plan": iv.get("plan", [])}
+                    if htype == "action_confirmation":
+                        return {"type": "action_confirmation", "approved": True}
+                    if htype == "tool_review":
+                        return {"type": "tool_review", "action": "continue"}
+                    if htype == "clarification":
+                        return {"type": "clarification",
+                                "answer": "Yes, proceed exactly as planned."}
+                    return {"approved": True, "answer": "auto-approved for regression test"}
+
+                if not pending_interrupts:
+                    # No interrupts found but state.next is set — just resume with default
+                    resume_cmd = LGCommand(resume={"approved": True,
+                                                   "answer": "auto-approved for regression test"})
+                elif len(pending_interrupts) == 1:
+                    resume_cmd = LGCommand(resume=_auto_approve(pending_interrupts[0].value))
+                else:
+                    # Multiple parallel interrupts — resume each one with its own approved value.
+                    # LangGraph expects a list whose length matches the number of pending interrupts.
+                    resume_cmd = LGCommand(
+                        resume=[_auto_approve(intr.value) for intr in pending_interrupts]
+                    )
+
+                result = await orchestrator.ainvoke(resume_cmd, config=config)
 
         except Exception as e:
             return self._error_result(case, str(e), time.time() - start)
@@ -496,6 +555,8 @@ Respond with ONLY JSON: {{"reasoning": "<step-by-step analysis>", "score": <1-5>
                     overall_pass=r.get("overall_pass", True),
                     model_used=r.get("model_used", ""),
                     prompt_version=r.get("prompt_version", "v1"),
+                    expected_strategy=r.get("expected_strategy"),
+                    actual_strategy=r.get("actual_strategy"),
                 )
                 session.add(rr)
 
@@ -574,5 +635,18 @@ def _load_baseline_results(run_id: str) -> dict:
             "full_trace": r.full_trace or [],
             "actual_output": r.actual_output or "",
         } for r in rows}
+    finally:
+        session.close()
+
+
+async def _load_agents_config(team_id: str) -> list[dict]:
+    """Load a minimal agents_config list (id, role, description) for the meta-router."""
+    from src.db.database import get_session
+    from src.db.models import Agent
+
+    session = get_session()
+    try:
+        agents = session.query(Agent).filter_by(team_id=team_id).all()
+        return [{"id": a.id, "role": a.role, "description": a.description or ""} for a in agents]
     finally:
         session.close()
