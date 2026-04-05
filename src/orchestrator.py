@@ -13,6 +13,7 @@ Supports four decision strategies:
 import asyncio
 import logging
 import operator
+import re
 from collections import defaultdict
 from typing import Annotated
 from typing_extensions import TypedDict
@@ -294,16 +295,65 @@ def _get_executor(role: str, built_agents: dict, exec_agents=None,
     return _make_agent_executor(role, built_agents)
 
 
+def _build_handoff_context(state: OrchestratorState, current_role: str) -> str | None:
+    """Build a compact handoff summary from agent_trace when prior agents have run.
+
+    Injected as a HumanMessage before the current agent runs so it can focus on
+    remaining work instead of parsing 20+ messages of prior conversation history.
+    Explicitly re-states the original user request so the next agent never loses
+    track of the full goal when scanning only the injected summary.
+    """
+    trace = state.get("agent_trace", [])
+    completed = [
+        e for e in trace
+        if e.get("step") == "execution" and e.get("agent") != current_role
+    ]
+    if not completed:
+        return None
+
+    # Extract the original user request (first HumanMessage in conversation).
+    msgs = _ensure_messages(state.get("messages", []))
+    original_request = next(
+        (m.content for m in msgs if isinstance(m, HumanMessage)), None
+    )
+
+    lines = []
+    for e in completed:
+        agent = e.get("agent", "?")
+        tools = [tc["tool"] for tc in e.get("tool_calls", [])]
+        tool_str = ", ".join(dict.fromkeys(tools)) if tools else "no tools"
+        lines.append(f"  • {agent}: used [{tool_str}]")
+
+    header = ""
+    if original_request:
+        header = f"ORIGINAL REQUEST: {original_request}\n\n"
+
+    return (
+        header
+        + "WORKFLOW CONTEXT — completed by prior agents (do NOT repeat this work):\n"
+        + "\n".join(lines)
+        + f"\n\nYOUR TASK: You are the {current_role}. Focus only on what has NOT been "
+        "done yet and pick up exactly where the previous agent left off."
+    )
+
+
 def _make_agent_executor(role: str, built_agents: dict):
     """Create an executor closure for a given agent role."""
     async def execute(state: OrchestratorState) -> OrchestratorState:
         msgs = _ensure_messages(state["messages"])
-        # Some models (e.g. Claude) reject requests where the conversation ends with
-        # an AIMessage (treats it as "assistant prefill", which is not supported).
-        # This happens in sequential/supervisor flows where a prior agent's response
-        # is the last message. Append a sentinel HumanMessage to keep the API happy.
-        if msgs and isinstance(msgs[-1], AIMessage):
+
+        # Inject a structured handoff context when prior agents have already run.
+        # This gives the current agent a compact summary of what's done, reducing
+        # the need to parse dozens of prior tool messages.
+        handoff = _build_handoff_context(state, role)
+        if handoff:
+            msgs = [*msgs, HumanMessage(content=handoff)]
+        elif msgs and isinstance(msgs[-1], AIMessage):
+            # Some models (e.g. Claude) reject requests where the conversation ends
+            # with an AIMessage (treats it as "assistant prefill"). Append a sentinel
+            # HumanMessage to keep the API happy.
             msgs = [*msgs, HumanMessage(content="Continue with your part of the task.")]
+
         result = await built_agents[role].ainvoke({"messages": msgs})
         out_messages = _ensure_messages(result.get("messages", []))
         tool_calls = []
@@ -438,12 +488,18 @@ def _build_router_graph(agents_config, built_agents, checkpointer=None,
         msgs = _ensure_messages(state["messages"])
         response = await router_llm.ainvoke([SystemMessage(content=router_prompt), *msgs])
         raw = _extract_text(response.content)
-        selected = raw.strip().lower().strip('"\'')
-        if selected not in valid_roles:
+        # Scan every word-token in the response for a valid role name.
+        # This handles formats like "(coder)", "**coder**", "coder." robustly.
+        selected = None
+        for token in re.findall(r'\b\w+\b', raw.lower()):
+            if token in valid_roles:
+                selected = token
+                break
+        if selected is None:
             logger.warning(
-                "Router returned unrecognised role %r; falling back to %r. "
+                "Router returned unrecognised role from %r; falling back to %r. "
                 "Check router prompt and agent config.",
-                selected, default_role,
+                raw.strip()[:80], default_role,
             )
             selected = default_role
         return {
@@ -469,6 +525,64 @@ def _build_router_graph(agents_config, built_agents, checkpointer=None,
     return graph.compile(checkpointer=checkpointer)
 
 
+async def _synthesize_outputs(state: OrchestratorState, mode: str) -> OrchestratorState:
+    """Shared synthesizer node for sequential and supervisor graphs.
+
+    Collects every AIMessage produced by agents, finds the original user request,
+    then calls an LLM to merge everything into one coherent final response.
+    Without this, the caller receives N separate agent messages and the evaluation
+    system scores only the last one — which may be a partial or intermediate result.
+
+    Args:
+        state: Current orchestrator state.
+        mode:  Label for log messages ("sequential" or "supervisor").
+    """
+    msgs = _ensure_messages(state["messages"])
+
+    # The original user task is always the first HumanMessage.
+    user_request = next(
+        (m.content for m in msgs if isinstance(m, HumanMessage)), None
+    )
+    if not user_request:
+        logger.debug("%s synthesizer: no user request found, skipping.", mode)
+        return {}
+
+    # Collect all substantive AI responses (not just the sentinel keep-alive messages).
+    agent_outputs = [
+        m for m in msgs
+        if isinstance(m, AIMessage) and len(_extract_text(m.content).strip()) > 50
+    ]
+    if len(agent_outputs) <= 1:
+        # Only one agent spoke — nothing to synthesize.
+        return {}
+
+    synthesis_system = (
+        f"You are a synthesizer for a {mode} multi-agent workflow. "
+        "Multiple agents have completed their parts of a task sequentially. "
+        "Combine their outputs into ONE final, coherent response that directly "
+        "and completely answers the user's original request. "
+        "Preserve all important details (file paths, code, results, URLs). "
+        "Remove redundant preamble and agent self-introductions. "
+        "Structure the response clearly with headers if it spans multiple topics."
+    )
+    try:
+        llm = get_llm()
+        response = await llm.ainvoke([
+            SystemMessage(content=synthesis_system),
+            *msgs,
+            HumanMessage(content=(
+                f"Original request: {user_request}\n\n"
+                "Produce the single unified final answer now."
+            )),
+        ])
+        logger.info("%s synthesizer: produced unified response (%d chars).",
+                    mode, len(_extract_text(response.content)))
+        return {"messages": [response]}
+    except Exception as exc:
+        logger.warning("%s synthesizer LLM call failed (%s); returning raw outputs.", mode, exc)
+        return {}
+
+
 def _build_sequential_graph(agents_config, built_agents, checkpointer=None,
                             exec_agents=None):
     roles = [ac["role"] for ac in agents_config]
@@ -483,10 +597,16 @@ def _build_sequential_graph(agents_config, built_agents, checkpointer=None,
                                   agent_model=model_map.get(role))
         graph.add_node(role, executor)
 
+    async def _seq_synthesize(state: OrchestratorState) -> OrchestratorState:
+        return await _synthesize_outputs(state, "sequential")
+
+    graph.add_node("_synthesize", _seq_synthesize)
     graph.add_edge(START, roles[0])
     for i in range(len(roles) - 1):
         graph.add_edge(roles[i], roles[i + 1])
-    graph.add_edge(roles[-1], END)
+    # Last agent → synthesizer → END (instead of directly to END)
+    graph.add_edge(roles[-1], "_synthesize")
+    graph.add_edge("_synthesize", END)
     return graph.compile(checkpointer=checkpointer)
 
 
@@ -502,7 +622,41 @@ def _build_parallel_graph(agents_config, built_agents, checkpointer=None,
     graph = StateGraph(OrchestratorState)
 
     async def _merge(state: OrchestratorState) -> OrchestratorState:
-        return {}
+        """Synthesize parallel agent outputs into a single coherent response.
+
+        Without synthesis, each agent's output lands independently in state['messages']
+        and the caller sees two (or more) disconnected reports.  The evaluation system
+        also only scores the last message, which may be an incomplete partial result.
+        """
+        msgs = _ensure_messages(state["messages"])
+        # Extract the original user request (first HumanMessage).
+        user_request = next(
+            (m.content for m in msgs if isinstance(m, HumanMessage)), None
+        )
+        if not user_request:
+            return {}
+
+        synthesis_system = (
+            "Multiple agents have independently completed sub-tasks in parallel. "
+            "Your job is to synthesize their outputs into ONE coherent, well-structured "
+            "report that directly and completely answers the user's original request. "
+            "Combine, deduplicate, and organise the results — do not simply concatenate. "
+            "If agents produced conflicting information, note the discrepancy."
+        )
+        try:
+            llm = get_llm()
+            response = await llm.ainvoke([
+                SystemMessage(content=synthesis_system),
+                *msgs,
+                HumanMessage(content=(
+                    f"Original request: {user_request}\n\n"
+                    "Synthesize all agent outputs above into a single unified response."
+                )),
+            ])
+            return {"messages": [response]}
+        except Exception as exc:
+            logger.warning("Parallel synthesis LLM call failed (%s); returning unsynthesised output.", exc)
+            return {}
 
     graph.add_node("_merge", _merge)
     graph.add_edge("_merge", END)
@@ -523,16 +677,43 @@ def _build_supervisor_graph(agents_config, built_agents, checkpointer=None,
     router_llm = get_router_llm()
     valid_roles = {a["role"] for a in agents_config}
 
-    agent_descs = "\n".join(f'- "{a["role"]}": {a["description"]}' for a in agents_config)
+    def _tool_hint(a: dict) -> str:
+        """Return a parenthetical hint listing the tool groups an agent has access to."""
+        groups = a.get("tool_groups") or []
+        if not groups:
+            return ""
+        group_str = ", ".join(groups)
+        return f" [tools: {group_str}]"
+
+    agent_descs = "\n".join(
+        f'- "{a["role"]}"{_tool_hint(a)}: {a["description"]}' for a in agents_config
+    )
     agent_names = ", ".join(f'"{a["role"]}"' for a in agents_config)
 
-    supervisor_prompt = f"""You are a supervisor. Look at what has been done so far and decide what to do next.
+    supervisor_prompt = f"""You are a supervisor orchestrating a multi-agent workflow.
 
-Agents: {agent_names}
+Agents and their capabilities:
 {agent_descs}
 
-Reply with ONLY "DONE" (if every part of the original request is complete) or ONLY one agent name.
-Check ALL deliverables before saying DONE — e.g. if files need to be written AND tested, both must be finished."""
+Tool routing rules (delegate only to agents that HAVE the right tools):
+- File read/write/edit/implement → "coder" (NOT business_analyst)
+- Code tests → "tester" or "coder"
+- Git/GitHub operations (push, PR, branch) → "devops"
+- Web research → "researcher"
+- Jira ticket management (create/update issues) → "project_manager"
+- Requirements decomposition, Jira lookup only → "business_analyst" (do NOT use for code writing or file operations)
+
+❌ NEVER route coding, implementation, or file-writing tasks to "business_analyst".
+
+Before deciding, briefly answer these two questions internally:
+1. What has been completed so far (based on the conversation above)?
+2. What deliverables from the original request are still missing?
+
+Then reply with EXACTLY ONE of:
+- "DONE" — if ALL deliverables are complete (files written, tests run, etc.)
+- A single agent name — if work remains
+
+Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
 
     async def supervisor_decide(state: OrchestratorState) -> OrchestratorState:
         iterations = state.get("supervisor_iterations", 0)
@@ -553,33 +734,101 @@ Check ALL deliverables before saying DONE — e.g. if files need to be written A
         if msgs and isinstance(msgs[-1], AIMessage):
             msgs = [*msgs, HumanMessage(content="What should be done next? Reply DONE or with the next agent name.")]
         response = await router_llm.ainvoke([SystemMessage(content=supervisor_prompt), *msgs])
-        raw = _extract_text(response.content).strip().lower().strip('"\'')
+        raw_full = _extract_text(response.content).strip()
+        raw = raw_full.lower().strip('"\'')
+
+        # Try exact match first (ideal: model followed the prompt exactly).
+        decision = None
         if raw == "done":
+            decision = "done"
+        elif raw in valid_roles:
+            decision = raw
+        else:
+            # Fallback: scan every word in order and take the FIRST one that is
+            # either "done" or a valid agent role name.  This handles verbose
+            # responses where the model writes a plan like
+            # "Step 1 will be assigned to coder. Step 2 to tester. … done."
+            # → we extract "coder" (first role seen) so the supervisor correctly
+            # delegates to the first agent rather than treating the whole thing as DONE.
+            for token in re.findall(r'\b\w+\b', raw):
+                if token == "done":
+                    decision = "done"
+                    break
+                if token in valid_roles:
+                    decision = token
+                    break
+
+        # Guard: never return DONE if no agents have run yet.
+        # Without this, a confused or overly-brief LLM response on the very first
+        # supervisor call would produce zero agent outputs and an empty final response.
+        completed_executions = [
+            e for e in state.get("agent_trace", []) if e.get("step") == "execution"
+        ]
+        no_agents_ran = len(completed_executions) == 0
+
+        # Pick a fallback role (first alphabetically from valid_roles, or first in
+        # agents_config order) in case the supervisor returns an unrecognisable token.
+        fallback_role = agents_config[0]["role"]
+
+        if decision == "done":
+            if no_agents_ran:
+                logger.warning(
+                    "Supervisor returned DONE before any agent ran; "
+                    "forcing delegation to %r instead.",
+                    fallback_role,
+                )
+                return {
+                    "selected_agent": fallback_role,
+                    "agent_trace": [{"step": "supervisor", "decision": fallback_role,
+                                     "note": "overrode premature DONE"}],
+                    "supervisor_iterations": 1,
+                }
             return {
                 "selected_agent": "__done__",
                 "agent_trace": [{"step": "supervisor", "decision": "done"}],
                 "supervisor_iterations": 1,
             }
-        if raw not in valid_roles:
-            logger.warning(
-                "Supervisor returned unrecognised role %r; treating as DONE. "
-                "Check supervisor prompt and agent config.",
-                raw,
-            )
+        if decision in valid_roles:
             return {
-                "selected_agent": "__done__",
-                "agent_trace": [{"step": "supervisor", "decision": "done_unrecognised_role",
-                                  "raw": raw}],
+                "selected_agent": decision,
+                "agent_trace": [{"step": "supervisor", "decision": decision}],
                 "supervisor_iterations": 1,
             }
+
+        # Unrecognised token — fall back to first agent if nothing has run yet,
+        # otherwise treat as DONE so we don't loop forever.
+        if no_agents_ran:
+            logger.warning(
+                "Supervisor returned unrecognised role %r before any agent ran; "
+                "falling back to %r.",
+                raw, fallback_role,
+            )
+            return {
+                "selected_agent": fallback_role,
+                "agent_trace": [{"step": "supervisor", "decision": fallback_role,
+                                  "note": "fallback from unrecognised token", "raw": raw}],
+                "supervisor_iterations": 1,
+            }
+
+        logger.warning(
+            "Supervisor returned unrecognised role %r; treating as DONE. "
+            "Check supervisor prompt and agent config.",
+            raw,
+        )
         return {
-            "selected_agent": raw,
-            "agent_trace": [{"step": "supervisor", "decision": raw}],
+            "selected_agent": "__done__",
+            "agent_trace": [{"step": "supervisor", "decision": "done_unrecognised_role",
+                              "raw": raw}],
             "supervisor_iterations": 1,
         }
 
+    async def _sup_synthesize(state: OrchestratorState) -> OrchestratorState:
+        return await _synthesize_outputs(state, "supervisor")
+
     graph = StateGraph(OrchestratorState)
     graph.add_node("supervisor", supervisor_decide)
+    graph.add_node("_synthesize", _sup_synthesize)
+    graph.add_edge("_synthesize", END)
 
     for ac in agents_config:
         role = ac["role"]
@@ -593,7 +842,8 @@ Check ALL deliverables before saying DONE — e.g. if files need to be written A
     def supervisor_router(state: OrchestratorState) -> str:
         sel = state.get("selected_agent", "__done__")
         if sel == "__done__" or sel not in valid_roles:
-            return "__end__"
+            # Route through synthesizer instead of directly to END.
+            return "_synthesize"
         return sel
 
     graph.add_conditional_edges("supervisor", supervisor_router)

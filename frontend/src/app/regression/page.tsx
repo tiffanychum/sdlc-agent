@@ -475,7 +475,9 @@ export default function RegressionPage() {
                           {c.strategy === "auto" ? "🤖 auto" : c.strategy}
                         </span>
                       ) : (
-                        <span className="text-[10px] text-[var(--text-muted)]">default</span>
+                        <span className="px-1.5 py-0.5 rounded text-[10px] border border-dashed border-zinc-300 text-zinc-500 font-medium" title="Inherits team active strategy">
+                          {selectedTeam?.decision_strategy || "router_decides"}
+                        </span>
                       )}
                     </div>
                     <div className="text-center">
@@ -717,7 +719,11 @@ export default function RegressionPage() {
                       <span className={`px-1.5 py-0.5 rounded text-[10px] border font-medium ${c.strategy === "auto" ? "bg-orange-50 text-orange-700 border-orange-200" : "bg-zinc-100 text-zinc-600 border-zinc-200"}`}>
                         {c.strategy === "auto" ? "🤖 auto" : c.strategy}
                       </span>
-                    ) : <span className="text-[10px] text-[var(--text-muted)]">default</span>}
+                    ) : (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] border border-dashed border-zinc-300 text-zinc-500 font-medium" title="Inherits team active strategy">
+                        {selectedTeam?.decision_strategy || "router_decides"}
+                      </span>
+                    )}
                   </div>
                   <div className="text-center">
                     <span className={`px-1.5 py-0.5 rounded text-[10px] border ${
@@ -733,7 +739,7 @@ export default function RegressionPage() {
                     </span>
                   </div>
                 </div>
-                {expandedCaseId === c.id && <GoldenCaseExpanded c={c} />}
+                {expandedCaseId === c.id && <GoldenCaseExpanded c={c} activeStrategy={selectedTeam?.decision_strategy || "router_decides"} />}
               </div>
             ))}
           </div>
@@ -783,7 +789,7 @@ export default function RegressionPage() {
 
 // ── Sub-components ───────────────────────────────────────────────────────────
 
-function GoldenCaseExpanded({ c }: { c: any }) {
+function GoldenCaseExpanded({ c, activeStrategy }: { c: any; activeStrategy?: string }) {
   return (
     <div className="px-4 py-3 bg-[var(--bg-hover)] border-b border-[var(--border)] grid grid-cols-2 gap-4 text-xs">
       <div className="space-y-2">
@@ -800,7 +806,11 @@ function GoldenCaseExpanded({ c }: { c: any }) {
                 <span className={`px-1.5 py-0.5 rounded text-[10px] border font-semibold ${c.strategy === "auto" ? "bg-orange-50 text-orange-700 border-orange-200" : "bg-zinc-100 text-zinc-600 border-zinc-200"}`}>
                   {c.strategy === "auto" ? "🤖 auto" : c.strategy}
                 </span>
-              ) : <span className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 text-[10px] border border-gray-200">team default</span>}
+              ) : (
+                <span className="px-1.5 py-0.5 rounded text-[10px] border border-dashed border-zinc-300 text-zinc-500 font-semibold" title="Inherits team active strategy">
+                  {activeStrategy || "router_decides"}
+                </span>
+              )}
               {c.expected_strategy && (
                 <span className="text-[10px] text-[var(--text-muted)]">→ expects <span className="font-semibold text-zinc-700">{c.expected_strategy}</span></span>
               )}

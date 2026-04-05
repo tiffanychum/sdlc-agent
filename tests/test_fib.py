@@ -1,17 +1,19 @@
+"""Tests for the fibonacci function."""
+
 import pytest
 from utils.fib import fibonacci
 
 
 def test_fib_zero():
-    """fibonacci(0) should return 0 — the first Fibonacci number."""
+    """Test that fib(0) returns 0."""
     assert fibonacci(0) == 0
 
 
 def test_fib_one():
-    """fibonacci(1) should return 1 — the second Fibonacci number."""
+    """Test that fib(1) returns 1."""
     assert fibonacci(1) == 1
 
 
 def test_fib_ten():
-    """fibonacci(10) should return 55 — the eleventh Fibonacci number."""
+    """Test that fib(10) returns 55."""
     assert fibonacci(10) == 55
