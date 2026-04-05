@@ -1,119 +1,96 @@
 """
-Retry decorator utilities for handling transient failures.
+utils/retry.py
+--------------
+Provides the `retry` decorator for automatically retrying a function call
+on exception, with configurable maximum attempts and inter-attempt delay.
 
-Provides both synchronous and asynchronous retry decorators with configurable
-max attempts, delay between retries, and exception filtering.
+Typical usage
+-------------
+    from utils.retry import retry
+
+    @retry(n=3, delay=0.5)
+    def fetch_data(url: str) -> dict:
+        ...
+
+    # Or applied programmatically:
+    result = retry(n=5)(some_flaky_function)(arg1, arg2)
 """
 
-import asyncio
-import functools
 import time
-from typing import Callable, Type, TypeVar, Union, Tuple
+import functools
+from typing import Callable, TypeVar, Any
 
-F = TypeVar('F', bound=Callable)
+F = TypeVar("F", bound=Callable[..., Any])
 
 
-def retry(
-    max_attempts: int = 3,
-    delay: float = 0.0,
-    exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = Exception,
-) -> Callable[[F], F]:
+def retry(n: int, delay: float = 0.0) -> Callable[[F], F]:
+    """Return a decorator that retries the wrapped function up to *n* times.
+
+    The wrapped function is called repeatedly until it either:
+    - returns a value successfully (that value is returned to the caller), or
+    - raises an exception on every one of the *n* allowed attempts, in which
+      case the **last** exception is re-raised.
+
+    A ``delay`` of ``0.0`` (the default) means the retry loop is tight with no
+    sleep between attempts.  Any positive value causes ``time.sleep(delay)`` to
+    be called **between** attempts (i.e. after a failure and before the next
+    try), so it is called at most ``n - 1`` times.
+
+    Parameters
+    ----------
+    n : int
+        Maximum number of attempts.  Must be a positive integer (>= 1).
+    delay : float, optional
+        Seconds to wait between consecutive attempts.  Must be >= 0.
+        Defaults to ``0.0``.
+
+    Returns
+    -------
+    Callable
+        A decorator that wraps *any* callable with the retry logic.
+
+    Raises
+    ------
+    ValueError
+        If ``n`` is not a positive integer, or if ``delay`` is negative.
+
+    Examples
+    --------
+    >>> call_count = 0
+    >>> @retry(n=3, delay=0)
+    ... def sometimes_fails():
+    ...     global call_count
+    ...     call_count += 1
+    ...     if call_count < 3:
+    ...         raise RuntimeError("not yet")
+    ...     return "ok"
+    >>> sometimes_fails()
+    'ok'
     """
-    Decorator that retries a function up to max_attempts times on exception.
-
-    Args:
-        max_attempts: Maximum number of attempts (must be >= 1). Default is 3.
-        delay: Delay in seconds between retry attempts. Default is 0.
-        exceptions: Exception type(s) to catch and retry. Default is Exception (all exceptions).
-
-    Returns:
-        Decorated function that will retry on failure.
-
-    Raises:
-        The last exception encountered if all retry attempts fail.
-        ValueError: If max_attempts < 1.
-
-    Example:
-        @retry(max_attempts=5, delay=1.0, exceptions=ConnectionError)
-        def fetch_data():
-            return requests.get("https://api.example.com/data")
-    """
-    if max_attempts < 1:
-        raise ValueError("max_attempts must be at least 1")
+    if not isinstance(n, int) or isinstance(n, bool):
+        raise ValueError(f"n must be a positive integer, got {n!r}")
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n}")
+    if delay < 0:
+        raise ValueError(f"delay must be >= 0, got {delay}")
 
     def decorator(func: F) -> F:
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            last_exception = None
-            
-            for attempt in range(1, max_attempts + 1):
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            last_exception: BaseException | None = None
+            for attempt in range(1, n + 1):
                 try:
                     return func(*args, **kwargs)
-                except exceptions as e:
-                    last_exception = e
-                    if attempt < max_attempts:
-                        if delay > 0:
-                            time.sleep(delay)
-                    # If this was the last attempt, we'll raise below
-            
-            # All attempts exhausted, raise the last exception
-            if last_exception is not None:
-                raise last_exception
-        
+                except Exception as exc:  # noqa: BLE001
+                    last_exception = exc
+                    if attempt < n and delay > 0:
+                        time.sleep(delay)
+            # last_exception is always set here because n >= 1, so the loop
+            # body ran at least once; the only exit path that doesn't return
+            # is when every attempt raised.
+            assert last_exception is not None  # narrow type for mypy
+            raise last_exception
+
         return wrapper  # type: ignore[return-value]
-    
-    return decorator
 
-
-def aretry(
-    max_attempts: int = 3,
-    delay: float = 0.0,
-    exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = Exception,
-) -> Callable[[F], F]:
-    """
-    Async decorator that retries an async function up to max_attempts times on exception.
-
-    Args:
-        max_attempts: Maximum number of attempts (must be >= 1). Default is 3.
-        delay: Delay in seconds between retry attempts. Default is 0.
-        exceptions: Exception type(s) to catch and retry. Default is Exception (all exceptions).
-
-    Returns:
-        Decorated async function that will retry on failure.
-
-    Raises:
-        The last exception encountered if all retry attempts fail.
-        ValueError: If max_attempts < 1.
-
-    Example:
-        @aretry(max_attempts=5, delay=1.0, exceptions=aiohttp.ClientError)
-        async def fetch_data():
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://api.example.com/data") as resp:
-                    return await resp.json()
-    """
-    if max_attempts < 1:
-        raise ValueError("max_attempts must be at least 1")
-
-    def decorator(func: F) -> F:
-        @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            last_exception = None
-            
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    return await func(*args, **kwargs)
-                except exceptions as e:
-                    last_exception = e
-                    if attempt < max_attempts:
-                        if delay > 0:
-                            await asyncio.sleep(delay)
-                    # If this was the last attempt, we'll raise below
-            
-            # All attempts exhausted, raise the last exception
-            if last_exception is not None:
-                raise last_exception
-        
-        return wrapper  # type: ignore[return-value]
-    
     return decorator
