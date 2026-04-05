@@ -7,6 +7,7 @@ const TEAM_STRATEGIES = [
   { v: "sequential", l: "Sequential", d: "Agents run in order" },
   { v: "parallel", l: "Parallel", d: "All agents run at once" },
   { v: "supervisor", l: "Supervisor", d: "Supervisor delegates and reviews" },
+  { v: "auto", l: "Auto", d: "AI picks the best strategy per request" },
 ];
 
 const AGENT_STRATEGIES = [
@@ -140,7 +141,7 @@ export default function StudioPage() {
             ) : (
               <button onClick={() => selectTeam(t.id)}
                 onDoubleClick={() => { setEditingName(t.id); setEditName(t.name); }}
-                className={`px-3 py-1.5 rounded-md text-[13px] transition-all ${team?.id === t.id ? "bg-[var(--accent-light)] text-[var(--accent)] font-medium" : "text-[var(--text-muted)] hover:text-[var(--text)]"}`}>
+                className={`px-3 py-1.5 rounded-md text-[13px] transition-all ${team?.id === t.id ? "bg-zinc-900 text-white font-medium" : "text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-[var(--bg-hover)]"}`}>
                 {t.name}
               </button>
             )}
@@ -169,22 +170,22 @@ export default function StudioPage() {
                 <p className="text-[11px] text-[var(--text-muted)]">Controls which agents run, when, and in what order</p>
               </div>
             </div>
-            <div className="grid grid-cols-4 gap-2">
+            <div className="grid grid-cols-5 gap-2">
               {TEAM_STRATEGIES.map(s => (
                 <button key={s.v} onClick={() => updateStrategy(s.v)}
                   className={`p-3 rounded-lg border text-left transition-all ${
                     team.decision_strategy === s.v
-                      ? "border-[var(--accent)] bg-[var(--accent-light)]"
-                      : "border-[var(--border)] hover:border-[var(--accent)]/50"
+                      ? "border-zinc-900 bg-zinc-900"
+                      : "border-[var(--border)] hover:border-zinc-400"
                   }`}>
-                  <div className={`text-sm font-medium ${team.decision_strategy === s.v ? "text-[var(--accent)]" : ""}`}>{s.l}</div>
-                  <div className="text-[10px] text-[var(--text-muted)] mt-0.5">{s.d}</div>
+                  <div className={`text-sm font-medium ${team.decision_strategy === s.v ? "text-white" : ""}`}>{s.l}</div>
+                  <div className={`text-[10px] mt-0.5 ${team.decision_strategy === s.v ? "text-zinc-400" : "text-[var(--text-muted)]"}`}>{s.d}</div>
                 </button>
               ))}
             </div>
             <div className="mt-2 text-[10px] text-[var(--text-muted)] flex items-center gap-1.5">
               <span className="font-medium">Active:</span>
-              <span className="text-[var(--accent)]">{TEAM_STRATEGIES.find(s => s.v === team.decision_strategy)?.l || team.decision_strategy}</span>
+              <span className="font-medium text-zinc-700">{TEAM_STRATEGIES.find(s => s.v === team.decision_strategy)?.l || team.decision_strategy}</span>
               <span className="mx-1">|</span>
               <span>Each agent below has its own reasoning strategy (ReAct, Plan-Execute, etc.)</span>
             </div>
@@ -206,7 +207,7 @@ export default function StudioPage() {
                   <div className="flex items-start justify-between">
                     <div className="flex items-center gap-2">
                       <span className="font-medium text-sm">{a.name}</span>
-                      <span className="badge bg-[var(--accent-light)] text-[var(--accent)]">{a.role}</span>
+                      <span className="badge bg-zinc-100 text-zinc-600 border border-zinc-200">{a.role}</span>
                     </div>
                     <button onClick={() => removeAgent(a.id)} className="btn-danger !text-[11px] !py-0 !px-1.5">Remove</button>
                   </div>
@@ -241,7 +242,7 @@ export default function StudioPage() {
                   <div className="flex flex-wrap gap-1 mt-2">
                     <span className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide mr-1 self-center">Tools:</span>
                     {a.tool_groups?.map((g: string) => (
-                      <span key={g} className="badge bg-[var(--purple-light)] text-[var(--purple)]">{g}</span>
+                      <span key={g} className="badge bg-zinc-100 text-zinc-500 border border-zinc-200">{g}</span>
                     ))}
                   </div>
 
@@ -286,7 +287,7 @@ export default function StudioPage() {
                   <span className="text-xs text-[var(--text-muted)] self-center">Tool groups:</span>
                   {Object.keys(tools).map(g => (
                     <button key={g} onClick={() => setAgent({ ...agent, tool_groups: agent.tool_groups.includes(g) ? agent.tool_groups.filter(x => x !== g) : [...agent.tool_groups, g] })}
-                      className={`badge border cursor-pointer ${agent.tool_groups.includes(g) ? "bg-[var(--purple-light)] text-[var(--purple)] border-[var(--purple)]/30" : "text-[var(--text-muted)] border-[var(--border)]"}`}>
+                      className={`badge border cursor-pointer transition-all ${agent.tool_groups.includes(g) ? "bg-zinc-900 text-white border-zinc-900" : "text-[var(--text-muted)] border-[var(--border)] hover:border-zinc-400"}`}>
                       {g}
                     </button>
                   ))}
@@ -340,7 +341,7 @@ export default function StudioPage() {
             <div className="grid grid-cols-2 gap-2">
               {Object.entries(tools).map(([group, groupTools]) => (
                 <div key={group} className="p-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg)]">
-                  <div className="text-sm font-medium text-[var(--purple)] mb-1.5">{group}</div>
+                  <div className="text-sm font-medium text-zinc-700 mb-1.5">{group}</div>
                   {(groupTools as any[]).map((t: any) => (
                     <div key={t.name} className="text-[11px] text-[var(--text-muted)] py-0.5">
                       <span className="text-[var(--text)] font-mono">{t.name}</span> {t.description.slice(0, 45)}...

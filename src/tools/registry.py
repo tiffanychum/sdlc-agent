@@ -126,6 +126,83 @@ async def get_jira_tools() -> list[StructuredTool]:
     return [_make_tool(t.name, t.description, t.inputSchema, jira_call) for t in mcp_tools]
 
 
+def get_rag_tools() -> list[StructuredTool]:
+    """Return the RAG search tool that queries all active RAG pipeline configs."""
+    from pydantic import BaseModel, Field as PField
+
+    class RagSearchArgs(BaseModel):
+        query: str = PField(description="The search query to find relevant information from the knowledge base.")
+        config_id: Optional[str] = PField(
+            default=None,
+            description="RAG config ID to query. If omitted, queries the first active config.",
+        )
+
+    async def _rag_search(query: str, config_id: Optional[str] = None) -> str:
+        """Query the RAG knowledge base and return cited context."""
+        try:
+            from src.db.database import get_session
+            from src.db.models import RagConfig as RagConfigModel
+            from src.rag.pipeline import RAGConfig, get_pipeline
+
+            session = get_session()
+            try:
+                if config_id:
+                    cfg_row = session.query(RagConfigModel).filter_by(id=config_id, is_active=True).first()
+                else:
+                    cfg_row = session.query(RagConfigModel).filter_by(is_active=True).first()
+            finally:
+                session.close()
+
+            if not cfg_row:
+                return "No active RAG knowledge base found. Please configure and ingest documents first."
+
+            cfg = RAGConfig(
+                config_id=cfg_row.id,
+                name=cfg_row.name,
+                embedding_model=cfg_row.embedding_model,
+                vector_store=cfg_row.vector_store,
+                llm_model=cfg_row.llm_model,
+                chunk_size=cfg_row.chunk_size,
+                chunk_overlap=cfg_row.chunk_overlap,
+                chunk_strategy=cfg_row.chunk_strategy,
+                retrieval_strategy=cfg_row.retrieval_strategy,
+                top_k=cfg_row.top_k,
+                mmr_lambda=cfg_row.mmr_lambda or 0.5,
+                multi_query_n=cfg_row.multi_query_n or 3,
+                system_prompt=cfg_row.system_prompt,
+            )
+            pipeline = get_pipeline(cfg)
+            if pipeline.chunk_count() == 0:
+                return f"RAG knowledge base '{cfg_row.name}' has no ingested documents yet."
+
+            response = await pipeline.query(query)
+            lines = [f"**Knowledge Base Answer** (from '{cfg_row.name}'):\n", response.answer, ""]
+            if response.citations:
+                lines.append("**Sources:**")
+                seen = set()
+                for i, c in enumerate(response.citations):
+                    key = f"{c.source}:{c.chunk_index}"
+                    if key not in seen:
+                        seen.add(key)
+                        page_info = f", p.{c.page}" if c.page else ""
+                        lines.append(f"[{i+1}] {c.source}{page_info} (relevance: {c.score:.2f})")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"RAG search error: {e}"
+
+    return [StructuredTool.from_function(
+        coroutine=_rag_search,
+        name="rag_search",
+        description=(
+            "Search the internal knowledge base (RAG) for relevant information, documentation, "
+            "code patterns, or any ingested content. Always use this tool before web search "
+            "when looking for project-specific or domain-specific knowledge."
+        ),
+        args_schema=RagSearchArgs,
+        func=lambda **kw: None,
+    )]
+
+
 async def get_all_tools() -> dict[str, list[StructuredTool]]:
     """Returns all tools grouped by MCP server origin."""
     return {
@@ -137,4 +214,5 @@ async def get_all_tools() -> dict[str, list[StructuredTool]]:
         "planner": await get_planner_tools(),
         "github": await get_github_tools(),
         "jira": await get_jira_tools(),
+        "rag": get_rag_tools(),
     }

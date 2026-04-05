@@ -22,13 +22,13 @@ export default function TracesPage() {
         <div className="space-y-1.5 overflow-y-auto pr-1">
           {traces.map(t => (
             <button key={t.id} onClick={() => select(t.id)}
-              className={`w-full text-left p-2.5 rounded-lg text-sm transition-all ${detail?.id === t.id ? "bg-[var(--accent-light)] border border-[var(--accent)]/20" : "bg-[var(--bg-card)] border border-[var(--border)] hover:bg-[var(--bg-hover)]"}`}>
+              className={`w-full text-left p-2.5 rounded-lg text-sm transition-all ${detail?.id === t.id ? "bg-zinc-900 border border-zinc-800" : "bg-[var(--bg-card)] border border-[var(--border)] hover:bg-[var(--bg-hover)]"}`}>
               <div className="flex items-center justify-between">
-                <span className="font-mono text-[10px] text-[var(--text-muted)]">{t.id}</span>
+                <span className={`font-mono text-[10px] ${detail?.id === t.id ? "text-zinc-400" : "text-[var(--text-muted)]"}`}>{t.id}</span>
                 <span className={`badge ${t.status === "completed" ? "bg-[var(--success-light)] text-[var(--success)]" : "bg-[var(--error-light)] text-[var(--error)]"}`}>{t.status}</span>
               </div>
-              <div className="mt-0.5 truncate">{t.user_prompt}</div>
-              <div className="flex gap-3 text-[10px] text-[var(--text-muted)] mt-1">
+              <div className={`mt-0.5 truncate text-sm ${detail?.id === t.id ? "text-white" : ""}`}>{t.user_prompt}</div>
+              <div className={`flex gap-3 text-[10px] mt-1 ${detail?.id === t.id ? "text-zinc-400" : "text-[var(--text-muted)]"}`}>
                 <span>{t.total_latency_ms.toFixed(0)}ms</span>
                 <span>{t.total_tokens} tok</span>
                 <span>${t.total_cost.toFixed(4)}</span>

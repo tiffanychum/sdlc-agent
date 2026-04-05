@@ -121,7 +121,13 @@ if HAS_OTEL:
         def on_end(self, span):
             attrs = dict(span.attributes) if span.attributes else {}
 
-            model = attrs.get("gen_ai.request.model", attrs.get("llm.model", ""))
+            model = attrs.get("gen_ai.request.model", "") or attrs.get("llm.model", "") or ""
+            # When OpenInference doesn't populate gen_ai.request.model, try to
+            # parse it from the span name, e.g. "llm_call:claude-sonnet-4-20250514"
+            if not model and ":" in span.name:
+                prefix, _, candidate = span.name.partition(":")
+                if prefix.lower() in ("llm_call", "llm", "chatmodel", "chat_model"):
+                    model = candidate.strip()
             tokens_in = attrs.get("gen_ai.usage.input_tokens", attrs.get("llm.token_count.prompt", 0))
             tokens_out = attrs.get("gen_ai.usage.output_tokens", attrs.get("llm.token_count.completion", 0))
             cost = estimate_cost(str(model), int(tokens_in), int(tokens_out))

@@ -9,11 +9,20 @@ G-Eval (Liu et al., 2023) has three core innovations:
 Token probability weighting is noted but requires logprobs API support.
 """
 
-import json
-import re
 import asyncio
+import json
+import logging
+import re
+from typing import Optional
+
 from src.llm.client import get_judge_llm
 from src.orchestrator import _extract_text
+
+logger = logging.getLogger(__name__)
+
+# Maximum attempts for any LLM eval call (1 original + 2 retries).
+_MAX_ATTEMPTS = 3
+_RETRY_DELAY_S = 1.0
 
 
 JUDGE_CRITERIA = {
@@ -72,10 +81,35 @@ JUDGE_CRITERIA = {
 _cot_cache: dict[str, str] = {}
 
 
+# ── Retry helper ─────────────────────────────────────────────────
+
+async def _retry_async(coro_fn, attempts: int = _MAX_ATTEMPTS, delay: float = _RETRY_DELAY_S):
+    """
+    Call coro_fn() up to `attempts` times with linear back-off.
+    Raises the last exception if all attempts fail.
+    """
+    last_exc: Exception = RuntimeError("No attempts made")
+    for attempt in range(attempts):
+        try:
+            return await coro_fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                logger.warning(
+                    "Eval LLM call failed (attempt %d/%d): %s: %s — retrying in %.1fs",
+                    attempt + 1, attempts, type(exc).__name__, exc, delay * (attempt + 1),
+                )
+                await asyncio.sleep(delay * (attempt + 1))
+    raise last_exc
+
+
+# ── Phase 1: Auto CoT step generation ────────────────────────────
+
 async def _generate_evaluation_steps(criterion_name: str, criterion: dict) -> str:
     """
     Phase 1 of G-Eval: Auto-generate Chain-of-Thought evaluation steps.
     Cached so steps are only generated once per criterion per session.
+    On failure after retries, falls back to a single generic step and logs the error.
     """
     if criterion_name in _cot_cache:
         return _cot_cache[criterion_name]
@@ -97,15 +131,23 @@ Format: Return ONLY a numbered list of steps, nothing else."""
 
     try:
         llm = get_judge_llm()
-        response = await llm.ainvoke([{"role": "user", "content": prompt}])
-        steps = _extract_text(response.content)
-        _cot_cache[criterion_name] = steps
-        return steps
-    except Exception:
+        steps = await _retry_async(
+            lambda: llm.ainvoke([{"role": "user", "content": prompt}])
+        )
+        result = _extract_text(steps.content)
+        _cot_cache[criterion_name] = result
+        return result
+    except Exception as exc:
+        logger.error(
+            "CoT step generation failed for criterion '%s' after %d attempts: %s: %s",
+            criterion_name, _MAX_ATTEMPTS, type(exc).__name__, exc,
+        )
         fallback = f"1. Assess whether the output meets: {criterion['description']}"
         _cot_cache[criterion_name] = fallback
         return fallback
 
+
+# ── Phase 2: Score a single criterion ────────────────────────────
 
 async def _score_single_criterion(
     criterion_name: str,
@@ -114,21 +156,25 @@ async def _score_single_criterion(
     agent_response: str,
     tool_summary: str,
     output_summary: str,
-) -> tuple[str, float, str]:
+) -> tuple[str, Optional[float], str]:
     """
     Phase 2 of G-Eval: Score a single criterion using the CoT evaluation steps.
-    Returns (criterion_name, normalized_score, reasoning).
+
+    Returns (criterion_name, normalized_score_or_None, reasoning).
+    Score is None when evaluation fails after all retries — callers must handle None.
+    Reasoning starts with "ERROR:" on failure so report layers can flag it.
     """
     eval_steps = await _generate_evaluation_steps(criterion_name, criterion)
     rubric_text = "\n".join(f"  {score}: {desc}" for score, desc in criterion["rubric"].items())
 
+    # Full content is passed — no truncation so the judge sees everything.
     prompt = f"""You are an expert evaluator assessing an AI agent's response.
 
 USER REQUEST:
-{user_prompt[:500]}
+{user_prompt}
 
 AGENT RESPONSE:
-{agent_response[:1000]}
+{agent_response}
 
 TOOLS CALLED:
 {tool_summary or "None"}
@@ -154,22 +200,38 @@ First, reason through each evaluation step above. Then provide your final score.
 Respond in this exact JSON format:
 {{"reasoning": "<your step-by-step reasoning>", "score": <integer 1-5>}}"""
 
-    try:
-        llm = get_judge_llm()
-        response = await llm.ainvoke([{"role": "user", "content": prompt}])
-        raw = _extract_text(response.content)
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            llm = get_judge_llm()
+            response = await llm.ainvoke([{"role": "user", "content": prompt}])
+            raw = _extract_text(response.content)
 
-        match = re.search(r'\{[^}]*"score"\s*:\s*(\d)[^}]*\}', raw, re.DOTALL)
-        if match:
-            data = json.loads(match.group())
-            score = max(1, min(5, data.get("score", 3)))
-            reasoning = data.get("reasoning", "")
-            return (criterion_name, (score - 1) / 4, reasoning)
-    except Exception:
-        pass
+            match = re.search(r'\{[^}]*"score"\s*:\s*(\d)[^}]*\}', raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+                score = max(1, min(5, data.get("score", 3)))
+                reasoning = data.get("reasoning", "")
+                return (criterion_name, (score - 1) / 4, reasoning)
 
-    return (criterion_name, 0.5, "Evaluation failed — default score")
+            # LLM responded but JSON was unparseable — treat as a parse error, retry.
+            raise ValueError(f"Could not parse score JSON from LLM response: {raw[:300]}")
 
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _MAX_ATTEMPTS - 1:
+                logger.warning(
+                    "Criterion '%s' scoring failed (attempt %d/%d): %s: %s — retrying",
+                    criterion_name, attempt + 1, _MAX_ATTEMPTS, type(exc).__name__, exc,
+                )
+                await asyncio.sleep(_RETRY_DELAY_S * (attempt + 1))
+
+    error_msg = f"ERROR after {_MAX_ATTEMPTS} attempts: {type(last_exc).__name__}: {last_exc}"
+    logger.error("Criterion '%s' scoring permanently failed: %s", criterion_name, last_exc)
+    return (criterion_name, None, error_msg)
+
+
+# ── Public: G-Eval scoring entry point ───────────────────────────
 
 async def judge_response(
     user_prompt: str,
@@ -183,25 +245,26 @@ async def judge_response(
 
     Returns:
     {
-        "scores": {"correctness": 0.75, ...},
-        "reasoning": {"correctness": "Step 1: ...", ...},
-        "overall": 0.72
+        "scores":   {"correctness": 0.75, ..., "failed_criterion": null},
+        "reasoning": {"correctness": "Step 1: ...", ..., "failed_criterion": "ERROR: ..."},
+        "overall":  0.72,          # average of non-null scores only
+        "errors":   ["failed_criterion"],  # criteria that could not be evaluated
     }
     """
     criteria = criteria or list(JUDGE_CRITERIA.keys())
     tool_calls = tool_calls or []
     tool_outputs = tool_outputs or []
 
+    # Build full tool summary — no per-call truncation.
     tool_summary = ""
     if tool_calls:
         tool_summary = "\n".join(
-            f"- {tc.get('tool', '?')}({json.dumps(tc.get('args', {}))[:100]})"
-            for tc in tool_calls[:10]
+            f"- {tc.get('tool', '?')}({json.dumps(tc.get('args', {}))})"
+            for tc in tool_calls
         )
 
-    output_summary = ""
-    if tool_outputs:
-        output_summary = "\n".join(o[:200] for o in tool_outputs[:5])
+    # Pass all tool outputs in full.
+    output_summary = "\n---\n".join(str(o) for o in tool_outputs) if tool_outputs else ""
 
     tasks = [
         _score_single_criterion(
@@ -214,12 +277,22 @@ async def judge_response(
 
     results = await asyncio.gather(*tasks)
 
+    scores = {name: score for name, score, _ in results}
+    reasoning = {name: reason for name, _, reason in results}
+    errors = [name for name, score, _ in results if score is None]
+
+    valid_scores = [s for s in scores.values() if s is not None]
+    overall = sum(valid_scores) / len(valid_scores) if valid_scores else None
+
     return {
-        "scores": {name: score for name, score, _ in results},
-        "reasoning": {name: reason for name, _, reason in results},
-        "overall": sum(score for _, score, _ in results) / len(results) if results else 0.5,
+        "scores": scores,
+        "reasoning": reasoning,
+        "overall": overall,
+        "errors": errors,
     }
 
+
+# ── Public: Trajectory evaluation ────────────────────────────────
 
 async def judge_trajectory(
     user_prompt: str,
@@ -229,6 +302,9 @@ async def judge_trajectory(
     """
     Evaluate the full trajectory (sequence of decisions, tool calls, parameters).
     Scores each step individually + overall trajectory quality.
+
+    On failure, returns a result with score=None and "ERROR:" reasoning so callers
+    can surface the real failure rather than treating it as a 0.5 score.
     """
     steps_desc = []
     for i, step in enumerate(trace_steps):
@@ -243,14 +319,16 @@ async def judge_trajectory(
 
     steps_text = "\n".join(steps_desc) if steps_desc else "No steps recorded"
 
+    # Full content — no truncation.
     prompt = f"""You are evaluating an AI agent's decision trajectory.
 
-USER REQUEST: {user_prompt[:500]}
+USER REQUEST: {user_prompt}
 
 AGENT TRAJECTORY:
 {steps_text}
 
-FINAL RESPONSE (first 500 chars): {final_response[:500]}
+FINAL RESPONSE:
+{final_response}
 
 Evaluate by reasoning through each question:
 1. Was each step appropriate and necessary?
@@ -266,26 +344,39 @@ Respond with ONLY a JSON object:
 }}
 Each score is 1-5. Number of step_scores must match number of steps ({len(trace_steps)})."""
 
-    try:
-        llm = get_judge_llm()
-        response = await llm.ainvoke([{"role": "user", "content": prompt}])
-        raw = _extract_text(response.content)
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            llm = get_judge_llm()
+            response = await llm.ainvoke([{"role": "user", "content": prompt}])
+            raw = _extract_text(response.content)
 
-        match = re.search(r'\{[^}]*"trajectory_score"[^}]*\}', raw, re.DOTALL)
-        if match:
-            data = json.loads(match.group())
-            t_score = max(0.0, min(1.0, (data.get("trajectory_score", 3) - 1) / 4))
-            step_scores = [max(0.0, min(1.0, (s - 1) / 4)) for s in data.get("step_scores", [])]
-            return {
-                "step_scores": step_scores,
-                "trajectory_score": t_score,
-                "reasoning": data.get("reasoning", ""),
-            }
-    except Exception:
-        pass
+            match = re.search(r'\{[^}]*"trajectory_score"[^}]*\}', raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+                t_score = max(0.0, min(1.0, (data.get("trajectory_score", 3) - 1) / 4))
+                step_scores = [max(0.0, min(1.0, (s - 1) / 4)) for s in data.get("step_scores", [])]
+                return {
+                    "step_scores": step_scores,
+                    "trajectory_score": t_score,
+                    "reasoning": data.get("reasoning", ""),
+                }
 
+            raise ValueError(f"Could not parse trajectory JSON: {raw[:300]}")
+
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _MAX_ATTEMPTS - 1:
+                logger.warning(
+                    "Trajectory judge failed (attempt %d/%d): %s: %s — retrying",
+                    attempt + 1, _MAX_ATTEMPTS, type(exc).__name__, exc,
+                )
+                await asyncio.sleep(_RETRY_DELAY_S * (attempt + 1))
+
+    error_msg = f"ERROR after {_MAX_ATTEMPTS} attempts: {type(last_exc).__name__}: {last_exc}"
+    logger.error("Trajectory evaluation permanently failed: %s", last_exc)
     return {
-        "step_scores": [0.5] * len(trace_steps),
-        "trajectory_score": 0.5,
-        "reasoning": "Judge evaluation failed — using default score",
+        "step_scores": [None] * len(trace_steps),
+        "trajectory_score": None,
+        "reasoning": error_msg,
     }

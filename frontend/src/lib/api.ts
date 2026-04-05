@@ -113,6 +113,14 @@ export const api = {
   otel: {
     spanStats: (days = 30) => fetchJSON(`/api/otel/spans/stats?days=${days}`),
   },
+  rag: {
+    configs: () => fetchJSON("/api/rag/configs"),
+    stats: (days = 30) => fetchJSON(`/api/rag/stats?days=${days}`),
+    queries: (days = 30, limit = 100) => fetchJSON(`/api/rag/queries?days=${days}&limit=${limit}`),
+    history: (configId: string) => fetchJSON(`/api/rag/configs/${configId}/history`),
+    query: (data: any) => fetchJSON("/api/rag/query", { method: "POST", body: JSON.stringify(data) }),
+    evaluate: (queryId: string) => fetchJSON(`/api/rag/queries/${queryId}/evaluate`, { method: "POST" }),
+  },
   golden: {
     list: () => fetchJSON("/api/golden"),
     create: (data: any) => fetchJSON("/api/golden", { method: "POST", body: JSON.stringify(data) }),

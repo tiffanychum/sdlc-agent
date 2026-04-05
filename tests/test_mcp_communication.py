@@ -358,11 +358,11 @@ class TestCrossServerWorkflows:
         Simulates: Search for a pattern → Read the matching file.
         """
         search_result = await fs_call("search_files", {
-            "pattern": "class AgentConfig",
+            "pattern": "AGENT_DEFINITIONS",
             "path": "src",
             "file_pattern": "*.py",
         })
-        assert "AgentConfig" in search_result[0].text
+        assert "AGENT_DEFINITIONS" in search_result[0].text
 
-        read_result = await fs_call("read_file", {"path": "src/agents/definitions.py"})
-        assert "AgentConfig" in read_result[0].text
+        read_result = await fs_call("read_file", {"path": "src/agents/prompts.py"})
+        assert "AGENT_DEFINITIONS" in read_result[0].text

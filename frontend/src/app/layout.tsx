@@ -9,7 +9,9 @@ const inter = Inter({ subsets: ["latin"] });
 const NAV = [
   { href: "/", label: "Studio" },
   { href: "/chat", label: "Chat" },
+  { href: "/rag", label: "RAG" },
   { href: "/monitoring", label: "Monitoring" },
+  { href: "/regression", label: "Regression" },
   { href: "/evaluation", label: "Evaluation" },
 ];
 
@@ -19,31 +21,40 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body className={`${inter.className} min-h-screen flex`}>
-        <aside className="w-52 border-r border-[var(--border)] bg-[var(--bg-sidebar)] flex flex-col fixed h-screen">
-          <div className="px-5 py-4 border-b border-[var(--border)]">
-            <div className="text-sm font-semibold text-[var(--text)] tracking-tight">SDLC Agent</div>
+        <aside className="w-52 border-r border-[var(--border)] bg-white flex flex-col fixed h-screen">
+          {/* Logo */}
+          <div className="px-5 py-5 border-b border-[var(--border)]">
+            <div className="text-[13px] font-semibold text-[var(--text)] tracking-tight">SDLC Agent</div>
             <div className="text-[11px] text-[var(--text-muted)] mt-0.5">Multi-Agent Platform</div>
           </div>
-          <nav className="flex-1 p-2.5 space-y-0.5">
+
+          {/* Nav links */}
+          <nav className="flex-1 p-3 space-y-px">
             {NAV.map((item) => {
               const active = pathname === item.href;
               return (
-                <Link key={item.href} href={item.href}
-                  className={`block px-3 py-[7px] rounded-md text-[13px] transition-all ${
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  className={`flex items-center px-3 py-2 rounded-lg text-[13px] font-medium transition-all ${
                     active
-                      ? "bg-[var(--accent-light)] text-[var(--accent)] font-medium"
+                      ? "bg-[var(--text)] text-white"
                       : "text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-[var(--bg-hover)]"
-                  }`}>
+                  }`}
+                >
                   {item.label}
                 </Link>
               );
             })}
           </nav>
+
+          {/* Footer */}
           <div className="p-4 border-t border-[var(--border)] text-[11px] text-[var(--text-muted)]">
-            LangGraph + MCP
+            LangGraph · MCP
           </div>
         </aside>
-        <main className="ml-52 flex-1 p-7 min-h-screen">{children}</main>
+
+        <main className="ml-52 flex-1 p-7 min-h-screen bg-[var(--bg)]">{children}</main>
       </body>
     </html>
   );

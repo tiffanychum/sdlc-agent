@@ -48,6 +48,8 @@ def sync_golden_to_db():
                 existing.complexity = c.get("complexity", "quick")
                 existing.version = c.get("version", "1.0")
                 existing.reference_output = c.get("reference_output", "")
+                existing.strategy = c.get("strategy", None)
+                existing.expected_strategy = c.get("expected_strategy", None)
                 existing.is_active = True
             else:
                 session.add(GoldenTestCase(
@@ -66,6 +68,8 @@ def sync_golden_to_db():
                     complexity=c.get("complexity", "quick"),
                     version=c.get("version", "1.0"),
                     reference_output=c.get("reference_output", ""),
+                    strategy=c.get("strategy", None),
+                    expected_strategy=c.get("expected_strategy", None),
                     is_active=True,
                 ))
         session.commit()
