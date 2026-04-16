@@ -1,102 +1,95 @@
 """
-Retry decorator utility for handling function retries with configurable parameters.
+Retry decorator utility for handling transient failures.
 
-This module provides a flexible retry decorator that can retry function calls
-on exceptions with customizable retry count and delay between attempts.
+This module provides a simple retry decorator that can be used to automatically
+retry function calls that fail due to exceptions, with configurable maximum
+attempts and optional delays between retries.
+
+Example usage:
+    @retry(max_attempts=3, delay=1.0)
+    def unreliable_api_call():
+        # Function that might fail
+        response = requests.get("https://api.example.com/data")
+        response.raise_for_status()
+        return response.json()
 """
 
-import functools
-import logging
 import time
-from typing import Any, Callable, Optional, Type, Union, Tuple
-
-logger = logging.getLogger(__name__)
+import functools
+from typing import Callable, Any, Optional, Type, Union, Tuple
 
 
 def retry(
-    max_retries: int = 3,
-    delay: float = 0.0,
+    max_attempts: int = 3,
+    delay: Optional[float] = None,
     exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = Exception,
-    backoff_factor: float = 1.0,
-    logger_name: Optional[str] = None
+    backoff_factor: float = 1.0
 ) -> Callable:
     """
-    Decorator that retries a function call on specified exceptions.
+    Decorator that retries a function up to max_attempts times on specified exceptions.
     
     Args:
-        max_retries: Maximum number of retry attempts (default: 3)
-        delay: Initial delay between retries in seconds (default: 0.0)
-        exceptions: Exception type(s) to catch and retry on (default: Exception)
-        backoff_factor: Multiplier for delay on each retry (default: 1.0)
-        logger_name: Custom logger name for retry messages (default: None)
+        max_attempts (int): Maximum number of attempts (including the first call).
+                           Must be >= 1. Default is 3.
+        delay (Optional[float]): Fixed delay in seconds between retries.
+                               If None, no delay is applied. Default is None.
+        exceptions (Union[Type[Exception], Tuple[Type[Exception], ...]]): 
+                   Exception type(s) to catch and retry on. Default is Exception.
+        backoff_factor (float): Multiplier for delay on each retry.
+                              Only used if delay is specified. Default is 1.0.
     
     Returns:
-        Decorated function that implements retry logic
+        Callable: The decorated function with retry logic.
         
     Raises:
-        ValueError: If max_retries is negative
+        ValueError: If max_attempts < 1 or delay < 0 or backoff_factor <= 0.
+        The last exception encountered: If all retry attempts are exhausted.
         
     Example:
-        @retry(max_retries=3, delay=1.0)
-        def unstable_function():
-            # Function that might fail
-            pass
+        @retry(max_attempts=3, delay=1.0)
+        def flaky_function():
+            # This will be retried up to 3 times with 1 second delay
+            if random.random() < 0.7:
+                raise ConnectionError("Network error")
+            return "Success"
             
-        @retry(max_retries=5, delay=0.5, exceptions=(ConnectionError, TimeoutError))
-        def network_call():
-            # Function that might have network issues
-            pass
+        @retry(max_attempts=5, delay=0.5, exceptions=(requests.RequestException,))
+        def api_call():
+            # Only retries on requests.RequestException and its subclasses
+            return requests.get("https://api.example.com").json()
     """
-    if max_retries < 0:
-        raise ValueError("max_retries must be non-negative")
-    
-    if not isinstance(exceptions, tuple):
-        exceptions = (exceptions,)
+    # Validate parameters
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+    if delay is not None and delay < 0:
+        raise ValueError("delay must be >= 0")
+    if backoff_factor <= 0:
+        raise ValueError("backoff_factor must be > 0")
     
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            current_logger = logging.getLogger(logger_name or func.__module__)
+        def wrapper(*args, **kwargs) -> Any:
             last_exception = None
             current_delay = delay
             
-            for attempt in range(max_retries + 1):
+            for attempt in range(max_attempts):
                 try:
-                    result = func(*args, **kwargs)
-                    if attempt > 0:
-                        current_logger.info(
-                            f"Function {func.__name__} succeeded on attempt {attempt + 1}"
-                        )
-                    return result
-                    
+                    return func(*args, **kwargs)
                 except exceptions as e:
                     last_exception = e
                     
-                    if attempt == max_retries:
-                        current_logger.error(
-                            f"Function {func.__name__} failed after {max_retries + 1} attempts. "
-                            f"Last exception: {type(e).__name__}: {e}"
-                        )
-                        raise e
+                    # If this was the last attempt, re-raise the exception
+                    if attempt == max_attempts - 1:
+                        raise
                     
-                    current_logger.warning(
-                        f"Function {func.__name__} failed on attempt {attempt + 1}/{max_retries + 1}. "
-                        f"Exception: {type(e).__name__}: {e}. Retrying in {current_delay}s..."
-                    )
-                    
-                    if current_delay > 0:
+                    # Apply delay if specified (but not after the last failed attempt)
+                    if current_delay is not None and current_delay > 0:
                         time.sleep(current_delay)
+                        # Apply backoff factor for next delay
                         current_delay *= backoff_factor
-                        
-                except Exception as e:
-                    # Re-raise exceptions that are not in the retry list
-                    current_logger.error(
-                        f"Function {func.__name__} failed with non-retryable exception: "
-                        f"{type(e).__name__}: {e}"
-                    )
-                    raise e
             
-            # This should never be reached, but just in case
+            # This should never be reached due to the raise in the except block,
+            # but included for completeness
             if last_exception:
                 raise last_exception
                 
@@ -104,62 +97,54 @@ def retry(
     return decorator
 
 
-def retry_with_condition(
-    condition: Callable[[Exception], bool],
-    max_retries: int = 3,
-    delay: float = 0.0,
-    backoff_factor: float = 1.0
+def retry_with_exponential_backoff(
+    max_attempts: int = 3,
+    initial_delay: float = 1.0,
+    max_delay: float = 60.0,
+    backoff_factor: float = 2.0,
+    exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = Exception
 ) -> Callable:
     """
-    Advanced retry decorator that retries based on a condition function.
+    Convenience decorator for exponential backoff retry pattern.
+    
+    This is a specialized version of the retry decorator that implements
+    exponential backoff with a maximum delay cap.
     
     Args:
-        condition: Function that takes an exception and returns True if retry should occur
-        max_retries: Maximum number of retry attempts (default: 3)
-        delay: Initial delay between retries in seconds (default: 0.0)
-        backoff_factor: Multiplier for delay on each retry (default: 1.0)
-    
+        max_attempts (int): Maximum number of attempts. Default is 3.
+        initial_delay (float): Initial delay in seconds. Default is 1.0.
+        max_delay (float): Maximum delay cap in seconds. Default is 60.0.
+        backoff_factor (float): Exponential backoff multiplier. Default is 2.0.
+        exceptions: Exception type(s) to catch and retry on. Default is Exception.
+        
     Returns:
-        Decorated function that implements conditional retry logic
+        Callable: The decorated function with exponential backoff retry logic.
         
     Example:
-        def should_retry(exc):
-            return isinstance(exc, ConnectionError) and "timeout" in str(exc).lower()
-            
-        @retry_with_condition(should_retry, max_retries=5, delay=1.0)
-        def network_operation():
-            # Function that might timeout
-            pass
+        @retry_with_exponential_backoff(max_attempts=5, initial_delay=0.5)
+        def database_operation():
+            # Retries with delays: 0.5s, 1.0s, 2.0s, 4.0s
+            return db.execute_query()
     """
-    if max_retries < 0:
-        raise ValueError("max_retries must be non-negative")
-    
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            current_delay = delay
+        def wrapper(*args, **kwargs) -> Any:
             last_exception = None
+            current_delay = initial_delay
             
-            for attempt in range(max_retries + 1):
+            for attempt in range(max_attempts):
                 try:
                     return func(*args, **kwargs)
-                    
-                except Exception as e:
+                except exceptions as e:
                     last_exception = e
                     
-                    if attempt == max_retries or not condition(e):
-                        raise e
+                    if attempt == max_attempts - 1:
+                        raise
                     
-                    logger.warning(
-                        f"Retrying {func.__name__} (attempt {attempt + 1}/{max_retries + 1}) "
-                        f"after {type(e).__name__}: {e}"
-                    )
-                    
-                    if current_delay > 0:
-                        time.sleep(current_delay)
-                        current_delay *= backoff_factor
+                    # Sleep with current delay, then calculate next delay
+                    time.sleep(current_delay)
+                    current_delay = min(current_delay * backoff_factor, max_delay)
             
-            # This should never be reached
             if last_exception:
                 raise last_exception
                 
