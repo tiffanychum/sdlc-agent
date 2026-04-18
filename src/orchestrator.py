@@ -927,17 +927,36 @@ Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
             "implement", "build", "create", "develop", "write", "code",
             "fullstack", "full stack", "app", "service", "api",
         ))
-        needs_jira = any(kw in text for kw in ("jira", "epic", "story", "ticket", "project"))
-        needs_planning = any(kw in text for kw in (
-            "plan", "architect", "design", "analyze", "analyse", "audit"
+        needs_jira = any(kw in text for kw in (
+            "jira", "epic", "story", "ticket ", "tickets", "acceptance criteria",
         ))
+        # Only treat "project" as a Jira signal when it clearly refers to Jira work,
+        # not when Coder is asked to "create a project at /tmp/foo/" (scratch app).
+        if ("jira project" in text or "project in jira" in text):
+            needs_jira = True
+        needs_planning = any(kw in text for kw in (
+            "architect", "audit",
+        )) or (
+            # "plan", "design", "analyze" are only planner signals when used explicitly
+            # as a verb by the user — not when they appear inside normal sentences like
+            # "design a REST API" (that is a coder task).
+            any(
+                kw in text for kw in (
+                    "create a plan", "make a plan", "draft a plan", "devise a plan",
+                    "analyse the ", "analyze the ",
+                )
+            )
+        )
         needs_testing = any(kw in text for kw in ("test", "pytest", "unittest", "verify"))
         needs_git = any(kw in text for kw in (
-            "github", "git", "push", "commit", "repo", "repository", "pr", "pull request"
-        ))
+            "github", "push", "commit", "pull request", "open a pr", "open pr",
+        )) or (" git " in f" {text} " or text.endswith(" git") or text.startswith("git "))
+        # Research = web search / external lookup — NOT local performance tests.
+        # Dropped "performance", "latency", "find" because build-task prompts often
+        # mention them innocuously ("performance test with 10 concurrent requests").
         needs_research = any(kw in text for kw in (
-            "research", "search", "find", "look up", "investigate", "latency",
-            "performance", "playbook", "anomaly", "attribution",
+            "research ", "search the web", "look up", "investigate ",
+            "playbook", "best practices", "industry practice", "prior art",
         ))
         needs_qa = any(kw in text for kw in (
             "qa", "quality assurance", "e2e", "end-to-end", "end2end",
@@ -981,12 +1000,14 @@ Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
             steps.append("planner")
         if needs_jira:
             steps.append("project_manager")
-        if is_build_task and not needs_research:
-            steps.append("coder")
+        # Researcher always runs BEFORE coder when external research is needed.
         if needs_research:
             steps.append("researcher")
-        if needs_testing and is_build_task and not needs_qa:
-            steps.append("coder")  # coder now handles unit tests inline
+        # Coder runs for any build/implementation task — regardless of whether
+        # research was needed first. (The previous logic incorrectly skipped
+        # coder whenever researcher ran, which broke build-after-research flows.)
+        if is_build_task:
+            steps.append("coder")
         if needs_qa:
             steps.append("qa")
         if needs_git:
@@ -1248,8 +1269,17 @@ async def build_orchestrator():
 
 
 def get_graph_config(thread_id: str, callbacks=None) -> dict:
-    """Build the LangGraph config dict with thread_id for checkpointing and optional callbacks."""
-    config: dict = {"configurable": {"thread_id": thread_id}}
+    """Build the LangGraph config dict with thread_id for checkpointing and optional callbacks.
+
+    Multi-agent supervisor flows can exceed LangGraph's default recursion_limit
+    of 25 super-steps (e.g. supervisor → coder → supervisor → qa → supervisor →
+    DONE plus inner ReAct cycles), silently terminating before qa runs. Bump
+    the limit to 100 so the pipeline can complete.
+    """
+    config: dict = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": 100,
+    }
     if callbacks:
         config["callbacks"] = callbacks
     return config
