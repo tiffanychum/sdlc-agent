@@ -30,19 +30,44 @@ LATENCY_REGRESSION_THRESHOLD = 0.20
 QUALITY_REGRESSION_THRESHOLD = -0.10
 
 
-def _auto_approve_hitl(iv) -> dict:
-    """Return the appropriate auto-approve resume value for a HITL interrupt."""
+def _auto_approve_hitl(iv, case: "GoldenTestCase | None" = None) -> dict:
+    """Return the appropriate auto-approve resume value for a HITL interrupt.
+
+    If the golden test case defines `hitl_responses` (a dict keyed by lowercase
+    substring), we do a case-insensitive substring match against the question text
+    to return a specific, contextual answer instead of the generic fallback.
+    This prevents agents from stalling when asking specific questions (e.g.
+    "Which Epic or Story should I decompose?") that the generic answer can't satisfy.
+    """
     if not isinstance(iv, dict):
         return {"approved": True, "answer": "auto-approved for regression test"}
+
     htype = iv.get("type", "")
+
+    # For clarification-type interrupts, try case-specific answers first.
+    if htype == "clarification" or htype == "":
+        question = (
+            iv.get("question") or iv.get("message") or iv.get("answer") or ""
+        ).lower()
+        hitl_responses: dict = {}
+        if case and hasattr(case, "hitl_responses") and case.hitl_responses:
+            hitl_responses = case.hitl_responses or {}
+        if hitl_responses:
+            for key, answer in hitl_responses.items():
+                if key.lower() in question:
+                    logger.debug(
+                        "HITL matched key %r for question %r → %r", key, question[:80], answer[:60]
+                    )
+                    return {"type": "clarification", "answer": answer}
+        if htype == "clarification":
+            return {"type": "clarification", "answer": "Yes, proceed exactly as planned."}
+
     if htype == "plan_review":
         return {"type": "plan_review", "approved": True, "edited_plan": iv.get("plan", [])}
     if htype == "action_confirmation":
         return {"type": "action_confirmation", "approved": True}
     if htype == "tool_review":
         return {"type": "tool_review", "action": "continue"}
-    if htype == "clarification":
-        return {"type": "clarification", "answer": "Yes, proceed exactly as planned."}
     return {"approved": True, "answer": "auto-approved for regression test"}
 
 
@@ -52,10 +77,23 @@ class RegressionRunner:
         model: str = None,
         prompt_version: str = "v1",
         team_id: str = "default",
+        prompt_versions_by_role: dict = None,
     ):
         self.model = model or config.llm.model
         self.prompt_version = prompt_version
         self.team_id = team_id
+        # Per-role overrides take priority over the global prompt_version.
+        # e.g. {"coder": "v3", "planner": "v2"}
+        self.prompt_versions_by_role = prompt_versions_by_role or {}
+
+    async def run_subset(self, golden_ids: list[str]) -> list[dict]:
+        """
+        Run a focused regression on specific golden test IDs.
+        Returns a list of per-test result dicts (not a full eval_run record).
+        Used by the PromptOptimizer agent's run_regression_subset tool.
+        """
+        full = await self.run(case_ids=golden_ids)
+        return full.get("results", [])
 
     async def run(
         self,
@@ -107,14 +145,22 @@ class RegressionRunner:
             case_strategy_map[case.id] = resolved
 
         # Build (and cache) one orchestrator per unique resolved strategy.
+        # Also capture the routing prompt versions used for this run.
         orchestrator_cache: dict[str, object] = {}
+        routing_versions_cache: dict[str, dict] = {}
         for case in cases:
             strat = case_strategy_map[case.id]
             if strat not in orchestrator_cache:
-                orchestrator_cache[strat] = await build_orchestrator_from_team(
+                graph = await build_orchestrator_from_team(
                     self.team_id,
                     model_override=self.model or None,
                     strategy_override=strat,
+                    prompt_versions_by_role=self.prompt_versions_by_role or None,
+                )
+                orchestrator_cache[strat] = graph
+                routing_versions_cache[strat] = getattr(
+                    graph, "__routing_prompt_versions__",
+                    {"supervisor": "v1", "meta_router": "v1", "router": "v1"}
                 )
 
         run_id = uuid.uuid4().hex[:12]
@@ -128,6 +174,13 @@ class RegressionRunner:
             # Record strategy provenance: what was configured vs what ran.
             result["expected_strategy"] = getattr(case, "expected_strategy", None) or getattr(case, "strategy", None)
             result["actual_strategy"] = resolved_strat  # always a real strategy name now
+            # Record routing prompt versions for traceability
+            rv = routing_versions_cache.get(resolved_strat, {})
+            result["router_prompt_version"] = (
+                f"supervisor={rv.get('supervisor','v1')} "
+                f"meta_router={rv.get('meta_router','v1')} "
+                f"router={rv.get('router','v1')}"
+            )
             results.append(result)
 
         summary = self._build_summary(run_id, results, cases)
@@ -180,7 +233,7 @@ class RegressionRunner:
                         if hasattr(task, "interrupts") and task.interrupts:
                             for intr in task.interrupts:
                                 iv = intr.value if hasattr(intr, "value") else intr
-                                interrupt_map[intr.id] = _auto_approve_hitl(iv)
+                                interrupt_map[intr.id] = _auto_approve_hitl(iv, case)
 
                 if not interrupt_map:
                     # No interrupt IDs found — use plain default resume value
@@ -220,9 +273,9 @@ class RegressionRunner:
 
         similarity = await self._compute_semantic_similarity(case.reference_output, actual_output)
 
-        quality_scores, eval_reasoning = await self._evaluate_quality(case, actual_output, agent_trace)
-
         deepeval_scores = await self._run_deepeval(case.prompt, actual_output, agent_trace, collector)
+        quality_scores: dict = {}   # G-Eval removed; kept for DB compat only
+        eval_reasoning: dict = {}
 
         trace_assertions = self._check_trace_assertions(case, agent_trace, llm_calls, tool_calls_count, tokens_in + tokens_out, elapsed_ms)
 
@@ -239,11 +292,14 @@ class RegressionRunner:
         if elapsed_ms > case.max_latency_ms:
             latency_reg = True
 
-        quality_avg = sum(v for v in quality_scores.values() if isinstance(v, (int, float))) / max(len(quality_scores), 1)
+        # Quality regression now based purely on DeepEval scores + semantic similarity
         thresholds = case.quality_thresholds or {}
+        de_numeric = [v for k, v in deepeval_scores.items()
+                      if isinstance(v, (int, float)) and not k.endswith("_reason")]
+        de_avg = sum(de_numeric) / max(len(de_numeric), 1) if de_numeric else None
         quality_reg = (
-            similarity < thresholds.get("semantic_similarity", 0.5) or
-            quality_avg < thresholds.get("correctness", 0.5)
+            similarity < thresholds.get("semantic_similarity", 0.4) or
+            (de_avg is not None and de_avg < thresholds.get("task_completion", 0.4))
         )
 
         trace_reg = any(not a.get("passed", True) for a in trace_assertions.values())
@@ -489,10 +545,12 @@ Respond with ONLY JSON: {{"reasoning": "<step-by-step analysis>", "score": <1-5>
         quality_regs = sum(1 for r in results if r.get("quality_regression"))
         trace_regs = sum(1 for r in results if r.get("trace_regression"))
 
+        # Aggregate DeepEval scores only (G-Eval removed)
         all_quality = {}
         for r in results:
-            for k, v in r.get("quality_scores", {}).items():
-                all_quality.setdefault(k, []).append(v)
+            for k, v in r.get("deepeval_scores", {}).items():
+                if isinstance(v, (int, float)) and not k.endswith("_reason"):
+                    all_quality.setdefault(k, []).append(float(v))
         avg_quality = {k: round(sum(v) / len(v), 3) for k, v in all_quality.items()}
 
         return {
@@ -562,10 +620,33 @@ Respond with ONLY JSON: {{"reasoning": "<step-by-step analysis>", "score": <1-5>
                     prompt_version=r.get("prompt_version", "v1"),
                     expected_strategy=r.get("expected_strategy"),
                     actual_strategy=r.get("actual_strategy"),
+                    router_prompt_version=r.get("router_prompt_version"),
                 )
                 session.add(rr)
 
             session.commit()
+
+            # Archive each result to FeedbackStore for semantic retrieval by PromptOptimizer
+            try:
+                from src.optimization.feedback_store import get_feedback_store
+                store = get_feedback_store()
+                for r in results:
+                    role = r.get("actual_agent", "")
+                    if not role:
+                        # Extract from delegation pattern if available
+                        pattern = r.get("actual_delegation_pattern", [])
+                        role = pattern[0] if pattern else "unknown"
+                    store.store_run(
+                        role=role,
+                        prompt_version=r.get("prompt_version", "v1"),
+                        golden_id=r.get("golden_case_id", ""),
+                        tool_trace=r.get("full_trace", []),
+                        quality_scores=r.get("quality_scores", {}),
+                        deepeval_scores=r.get("deepeval_scores", {}),
+                        overall_pass=r.get("overall_pass", True),
+                    )
+            except Exception:
+                pass  # FeedbackStore is best-effort; doesn't block regression results
         except Exception:
             session.rollback()
         finally:

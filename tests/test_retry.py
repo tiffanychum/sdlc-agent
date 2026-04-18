@@ -1,390 +1,271 @@
-"""
-Tests for the retry decorator utility.
-
-This module contains comprehensive tests for the retry() decorator and
-retry_with_exponential_backoff() decorator, covering happy path, edge cases,
-error conditions, and timing behavior.
-"""
-
+"""Tests for the retry decorator utility."""
 import pytest
-import time
-from unittest.mock import Mock, patch
-from utils.retry import retry, retry_with_exponential_backoff
+from unittest.mock import patch
+
+from utils.retry import retry
 
 
 class TestRetryDecorator:
-    """Test cases for the basic retry() decorator."""
-    
-    def test_successful_function_no_retries_needed(self):
-        """Test that successful functions execute normally without retries."""
-        mock_func = Mock(return_value="success")
-        
-        @retry(max_attempts=3)
-        def test_func():
-            return mock_func()
-        
-        result = test_func()
-        
-        assert result == "success"
-        assert mock_func.call_count == 1
-    
-    def test_function_succeeds_after_retries(self):
-        """Test that function succeeds after some failures."""
+    """Test cases for the retry() decorator."""
+
+    def test_successful_execution_no_retry_needed(self):
+        """Function succeeds on first attempt - no retry triggered."""
         call_count = 0
-        
-        @retry(max_attempts=3)
-        def flaky_func():
+
+        @retry(max_retries=3)
+        def always_succeeds():
+            nonlocal call_count
+            call_count += 1
+            return "success"
+
+        result = always_succeeds()
+        assert result == "success"
+        assert call_count == 1
+
+    def test_fails_then_succeeds_within_retry_limit(self):
+        """Function fails initially but succeeds within retry limit."""
+        call_count = 0
+
+        @retry(max_retries=3)
+        def fails_twice_then_succeeds():
             nonlocal call_count
             call_count += 1
             if call_count < 3:
-                raise ConnectionError("Network error")
+                raise ValueError("Temporary failure")
             return "success"
-        
-        result = flaky_func()
-        
+
+        result = fails_twice_then_succeeds()
         assert result == "success"
         assert call_count == 3
-    
-    def test_max_attempts_exhausted_raises_last_exception(self):
-        """Test that last exception is raised when all attempts fail."""
-        @retry(max_attempts=2)
-        def always_fails():
-            raise ValueError("Always fails")
-        
-        with pytest.raises(ValueError, match="Always fails"):
-            always_fails()
-    
-    def test_retry_with_delay(self):
-        """Test that delay is applied between retries."""
-        call_times = []
-        
-        @retry(max_attempts=3, delay=0.1)
-        def timed_func():
-            call_times.append(time.time())
-            if len(call_times) < 3:
-                raise RuntimeError("Fail")
-            return "success"
-        
-        start_time = time.time()
-        result = timed_func()
-        total_time = time.time() - start_time
-        
-        assert result == "success"
-        assert len(call_times) == 3
-        # Should have at least 2 delays of 0.1 seconds each
-        assert total_time >= 0.2
-        # Check delays between calls
-        assert call_times[1] - call_times[0] >= 0.1
-        assert call_times[2] - call_times[1] >= 0.1
-    
-    def test_retry_with_backoff_factor(self):
-        """Test that backoff factor increases delay on each retry."""
-        call_times = []
-        
-        @retry(max_attempts=4, delay=0.1, backoff_factor=2.0)
-        def backoff_func():
-            call_times.append(time.time())
-            if len(call_times) < 4:
-                raise RuntimeError("Fail")
-            return "success"
-        
-        result = backoff_func()
-        
-        assert result == "success"
-        assert len(call_times) == 4
-        # Delays should be: 0.1, 0.2, 0.4
-        delay1 = call_times[1] - call_times[0]
-        delay2 = call_times[2] - call_times[1]
-        delay3 = call_times[3] - call_times[2]
-        
-        assert 0.09 <= delay1 <= 0.15  # ~0.1s with tolerance
-        assert 0.18 <= delay2 <= 0.25  # ~0.2s with tolerance
-        assert 0.35 <= delay3 <= 0.45  # ~0.4s with tolerance
-    
-    def test_specific_exception_types(self):
-        """Test retry only catches specified exception types."""
-        @retry(max_attempts=3, exceptions=ValueError)
-        def specific_exception_func():
-            raise TypeError("Wrong exception type")
-        
-        # Should not retry TypeError, should raise immediately
-        with pytest.raises(TypeError, match="Wrong exception type"):
-            specific_exception_func()
-    
-    def test_multiple_exception_types(self):
-        """Test retry catches multiple specified exception types."""
+
+    def test_exhausts_all_retries_raises_exception(self):
+        """Function exhausts all retries and raises the last exception."""
         call_count = 0
-        
-        @retry(max_attempts=3, exceptions=(ValueError, ConnectionError))
-        def multi_exception_func():
+
+        @retry(max_retries=2)
+        def always_fails():
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("Persistent failure")
+
+        with pytest.raises(RuntimeError, match="Persistent failure"):
+            always_fails()
+
+        # Initial attempt + 2 retries = 3 total calls
+        assert call_count == 3
+
+    def test_delay_between_retries(self):
+        """Verify delay is applied between retry attempts."""
+        call_count = 0
+
+        @retry(max_retries=2, delay=0.5)
+        def fails_then_succeeds():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise ValueError("Fail once")
+            return "success"
+
+        with patch('utils.retry.time.sleep') as mock_sleep:
+            result = fails_then_succeeds()
+            assert result == "success"
+            mock_sleep.assert_called_once_with(0.5)
+
+    def test_no_delay_when_zero(self):
+        """No sleep called when delay is 0."""
+        call_count = 0
+
+        @retry(max_retries=2, delay=0.0)
+        def fails_once():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise ValueError("Fail")
+            return "success"
+
+        with patch('utils.retry.time.sleep') as mock_sleep:
+            fails_once()
+            mock_sleep.assert_not_called()
+
+    def test_max_retries_zero(self):
+        """With max_retries=0, function runs once and raises on failure."""
+        call_count = 0
+
+        @retry(max_retries=0)
+        def fails():
+            nonlocal call_count
+            call_count += 1
+            raise ValueError("Immediate failure")
+
+        with pytest.raises(ValueError, match="Immediate failure"):
+            fails()
+
+        assert call_count == 1
+
+    def test_max_retries_zero_success(self):
+        """With max_retries=0, successful function works normally."""
+        @retry(max_retries=0)
+        def succeeds():
+            return "ok"
+
+        assert succeeds() == "ok"
+
+    def test_max_retries_one(self):
+        """With max_retries=1, function gets one retry after initial failure."""
+        call_count = 0
+
+        @retry(max_retries=1)
+        def fails_once():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ValueError("First attempt fails")
+            return "success"
+
+        result = fails_once()
+        assert result == "success"
+        assert call_count == 2
+
+    def test_specific_exception_types_caught(self):
+        """Only specified exception types trigger retry."""
+        call_count = 0
+
+        @retry(max_retries=3, exceptions=(ValueError,))
+        def raises_type_error():
+            nonlocal call_count
+            call_count += 1
+            raise TypeError("Not caught")
+
+        with pytest.raises(TypeError):
+            raises_type_error()
+
+        # No retry for TypeError - only 1 call
+        assert call_count == 1
+
+    def test_specific_exception_types_retried(self):
+        """Specified exception types do trigger retry."""
+        call_count = 0
+
+        @retry(max_retries=3, exceptions=(ValueError,))
+        def raises_value_error_then_succeeds():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise ValueError("Caught and retried")
+            return "success"
+
+        result = raises_value_error_then_succeeds()
+        assert result == "success"
+        assert call_count == 2
+
+    def test_multiple_exception_types(self):
+        """Multiple exception types can be specified."""
+        call_count = 0
+
+        @retry(max_retries=3, exceptions=(ValueError, TypeError))
+        def alternating_errors():
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise ValueError("First error")
             elif call_count == 2:
-                raise ConnectionError("Second error")
+                raise TypeError("Second error")
             return "success"
-        
-        result = multi_exception_func()
-        
+
+        result = alternating_errors()
         assert result == "success"
         assert call_count == 3
-    
-    def test_function_with_arguments(self):
-        """Test retry works with functions that have arguments."""
-        call_count = 0
-        
-        @retry(max_attempts=2)
-        def func_with_args(x, y, z=None):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise RuntimeError("Fail once")
-            return f"{x}-{y}-{z}"
-        
-        result = func_with_args("a", "b", z="c")
-        
-        assert result == "a-b-c"
-        assert call_count == 2
-    
+
     def test_preserves_function_metadata(self):
-        """Test that decorator preserves original function metadata."""
-        @retry(max_attempts=2)
-        def documented_func():
-            """This is a test function."""
-            return "test"
-        
-        assert documented_func.__name__ == "documented_func"
-        assert documented_func.__doc__ == "This is a test function."
+        """Decorator preserves original function metadata."""
+        @retry(max_retries=3)
+        def documented_function():
+            """This is the docstring."""
+            pass
 
+        assert documented_function.__name__ == "documented_function"
+        assert documented_function.__doc__ == "This is the docstring."
 
-class TestRetryParameterValidation:
-    """Test parameter validation for retry decorator."""
-    
-    def test_invalid_max_attempts_zero(self):
-        """Test that max_attempts=0 raises ValueError."""
-        with pytest.raises(ValueError, match="max_attempts must be >= 1"):
-            @retry(max_attempts=0)
-            def test_func():
+    def test_passes_positional_arguments(self):
+        """Positional arguments are passed correctly to decorated function."""
+        @retry(max_retries=3)
+        def add(a, b):
+            return a + b
+
+        assert add(1, 2) == 3
+        assert add(10, 20) == 30
+
+    def test_passes_keyword_arguments(self):
+        """Keyword arguments are passed correctly to decorated function."""
+        @retry(max_retries=3)
+        def greet(name, greeting="Hello"):
+            return f"{greeting}, {name}!"
+
+        assert greet("World") == "Hello, World!"
+        assert greet("World", greeting="Hi") == "Hi, World!"
+        assert greet(name="Alice", greeting="Hey") == "Hey, Alice!"
+
+    def test_passes_mixed_arguments(self):
+        """Mixed positional and keyword arguments work correctly."""
+        @retry(max_retries=3)
+        def calculate(a, b, c=0, d=0):
+            return a + b + c + d
+
+        assert calculate(1, 2) == 3
+        assert calculate(1, 2, c=3) == 6
+        assert calculate(1, 2, 3, d=4) == 10
+
+    def test_negative_max_retries_raises_error(self):
+        """Negative max_retries raises ValueError."""
+        with pytest.raises(ValueError, match="max_retries must be non-negative"):
+            @retry(max_retries=-1)
+            def func():
                 pass
-    
-    def test_invalid_max_attempts_negative(self):
-        """Test that negative max_attempts raises ValueError."""
-        with pytest.raises(ValueError, match="max_attempts must be >= 1"):
-            @retry(max_attempts=-1)
-            def test_func():
+
+    def test_negative_delay_raises_error(self):
+        """Negative delay raises ValueError."""
+        with pytest.raises(ValueError, match="delay must be non-negative"):
+            @retry(max_retries=3, delay=-1.0)
+            def func():
                 pass
-    
-    def test_invalid_delay_negative(self):
-        """Test that negative delay raises ValueError."""
-        with pytest.raises(ValueError, match="delay must be >= 0"):
-            @retry(max_attempts=2, delay=-1.0)
-            def test_func():
-                pass
-    
-    def test_invalid_backoff_factor_zero(self):
-        """Test that backoff_factor=0 raises ValueError."""
-        with pytest.raises(ValueError, match="backoff_factor must be > 0"):
-            @retry(max_attempts=2, backoff_factor=0)
-            def test_func():
-                pass
-    
-    def test_invalid_backoff_factor_negative(self):
-        """Test that negative backoff_factor raises ValueError."""
-        with pytest.raises(ValueError, match="backoff_factor must be > 0"):
-            @retry(max_attempts=2, backoff_factor=-1.0)
-            def test_func():
-                pass
-    
-    def test_valid_delay_zero(self):
-        """Test that delay=0 is valid (no delay)."""
-        call_count = 0
-        
-        @retry(max_attempts=2, delay=0.0)
-        def zero_delay_func():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise RuntimeError("Fail once")
-            return "success"
-        
-        result = zero_delay_func()
-        assert result == "success"
-        assert call_count == 2
 
+    def test_exception_message_preserved(self):
+        """The original exception message is preserved when re-raised."""
+        @retry(max_retries=1)
+        def fails_with_message():
+            raise ValueError("Specific error message 12345")
 
-class TestRetryEdgeCases:
-    """Test edge cases and boundary conditions."""
-    
-    def test_max_attempts_one(self):
-        """Test retry with max_attempts=1 (no retries)."""
-        @retry(max_attempts=1)
-        def single_attempt_func():
-            raise RuntimeError("Always fails")
-        
-        with pytest.raises(RuntimeError, match="Always fails"):
-            single_attempt_func()
-    
-    def test_no_delay_specified(self):
-        """Test retry without delay (delay=None)."""
-        call_count = 0
-        
-        @retry(max_attempts=3, delay=None)
-        def no_delay_func():
-            nonlocal call_count
-            call_count += 1
-            if call_count < 3:
-                raise RuntimeError("Fail")
-            return "success"
-        
-        start_time = time.time()
-        result = no_delay_func()
-        total_time = time.time() - start_time
-        
-        assert result == "success"
-        assert call_count == 3
-        # Should complete quickly without delays
-        assert total_time < 0.1
-    
-    def test_exception_not_in_retry_list(self):
-        """Test that exceptions not in the retry list are not caught."""
-        @retry(max_attempts=3, exceptions=ValueError)
-        def wrong_exception_func():
-            raise KeyError("Not retried")
-        
-        with pytest.raises(KeyError, match="Not retried"):
-            wrong_exception_func()
+        with pytest.raises(ValueError) as exc_info:
+            fails_with_message()
 
+        assert "Specific error message 12345" in str(exc_info.value)
 
-class TestRetryWithExponentialBackoff:
-    """Test cases for retry_with_exponential_backoff decorator."""
-    
-    def test_exponential_backoff_timing(self):
-        """Test that exponential backoff increases delays correctly."""
-        call_times = []
-        
-        @retry_with_exponential_backoff(
-            max_attempts=4, 
-            initial_delay=0.1, 
-            backoff_factor=2.0
-        )
-        def backoff_func():
-            call_times.append(time.time())
-            if len(call_times) < 4:
-                raise RuntimeError("Fail")
-            return "success"
-        
-        result = backoff_func()
-        
-        assert result == "success"
-        assert len(call_times) == 4
-        
-        # Check exponential backoff: 0.1, 0.2, 0.4
-        delay1 = call_times[1] - call_times[0]
-        delay2 = call_times[2] - call_times[1]
-        delay3 = call_times[3] - call_times[2]
-        
-        assert 0.09 <= delay1 <= 0.15  # ~0.1s
-        assert 0.18 <= delay2 <= 0.25  # ~0.2s
-        assert 0.35 <= delay3 <= 0.45  # ~0.4s
-    
-    def test_max_delay_cap(self):
-        """Test that max_delay caps the exponential growth."""
-        call_times = []
-        
-        @retry_with_exponential_backoff(
-            max_attempts=5,
-            initial_delay=0.1,
-            max_delay=0.2,
-            backoff_factor=3.0
-        )
-        def capped_delay_func():
-            call_times.append(time.time())
-            if len(call_times) < 5:
-                raise RuntimeError("Fail")
-            return "success"
-        
-        result = capped_delay_func()
-        
-        assert result == "success"
-        assert len(call_times) == 5
-        
-        # Delays should be: 0.1, 0.2 (capped), 0.2 (capped), 0.2 (capped)
-        delay1 = call_times[1] - call_times[0]
-        delay2 = call_times[2] - call_times[1]
-        delay3 = call_times[3] - call_times[2]
-        delay4 = call_times[4] - call_times[3]
-        
-        assert 0.09 <= delay1 <= 0.15  # ~0.1s
-        assert 0.18 <= delay2 <= 0.25  # ~0.2s (capped)
-        assert 0.18 <= delay3 <= 0.25  # ~0.2s (capped)
-        assert 0.18 <= delay4 <= 0.25  # ~0.2s (capped)
-    
-    def test_exponential_backoff_with_specific_exceptions(self):
-        """Test exponential backoff with specific exception types."""
-        call_count = 0
-        
-        @retry_with_exponential_backoff(
-            max_attempts=3,
-            initial_delay=0.05,
-            exceptions=ConnectionError
-        )
-        def specific_exception_backoff():
-            nonlocal call_count
-            call_count += 1
-            if call_count < 3:
-                raise ConnectionError("Network issue")
-            return "connected"
-        
-        result = specific_exception_backoff()
-        
-        assert result == "connected"
-        assert call_count == 3
+    def test_exception_type_preserved(self):
+        """The original exception type is preserved when re-raised."""
+        class CustomError(Exception):
+            pass
 
+        @retry(max_retries=1, exceptions=(CustomError,))
+        def raises_custom():
+            raise CustomError("Custom!")
 
-class TestRetryIntegration:
-    """Integration tests combining multiple features."""
-    
-    def test_nested_decorators(self):
-        """Test retry decorator works with other decorators."""
-        def logging_decorator(func):
-            def wrapper(*args, **kwargs):
-                print(f"Calling {func.__name__}")
-                return func(*args, **kwargs)
-            return wrapper
-        
-        call_count = 0
-        
-        @logging_decorator
-        @retry(max_attempts=2)
-        def nested_func():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise RuntimeError("Fail once")
-            return "success"
-        
-        result = nested_func()
-        
-        assert result == "success"
-        assert call_count == 2
-    
-    @patch('time.sleep')
-    def test_retry_with_mocked_sleep(self, mock_sleep):
-        """Test retry behavior with mocked sleep for faster testing."""
-        call_count = 0
-        
-        @retry(max_attempts=3, delay=1.0)
-        def mock_sleep_func():
-            nonlocal call_count
-            call_count += 1
-            if call_count < 3:
-                raise RuntimeError("Fail")
-            return "success"
-        
-        result = mock_sleep_func()
-        
-        assert result == "success"
-        assert call_count == 3
-        assert mock_sleep.call_count == 2  # 2 delays between 3 attempts
-        mock_sleep.assert_called_with(1.0)
+        with pytest.raises(CustomError):
+            raises_custom()
+
+    def test_return_value_types(self):
+        """Various return value types are handled correctly."""
+        @retry(max_retries=1)
+        def return_none():
+            return None
+
+        @retry(max_retries=1)
+        def return_list():
+            return [1, 2, 3]
+
+        @retry(max_retries=1)
+        def return_dict():
+            return {"key": "value"}
+
+        assert return_none() is None
+        assert return_list() == [1, 2, 3]
+        assert return_dict() == {"key": "value"}

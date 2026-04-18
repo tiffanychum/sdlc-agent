@@ -221,6 +221,7 @@ export default function ChatPage() {
   const [queryActive, setQueryActive] = useState(false);
   const [inputLocked, setInputLocked] = useState(false);
   const [statusText, setStatusText] = useState("Working...");
+  const [resolvedStrategy, setResolvedStrategy] = useState<string | null>(null);
 
   // Trace state
   const [liveSpans, setLiveSpans] = useState<LiveSpan[]>([]);
@@ -322,6 +323,7 @@ export default function ChatPage() {
     setThinkingCollapsed(false);
     setPendingHITL(null); setElapsedFinal(0); setActiveTrace(null);
     setSelectedMsgIndex(null);
+    setResolvedStrategy(null);
     agentRef.current = null;
   }, []);
 
@@ -332,6 +334,11 @@ export default function ChatPage() {
     switch (type) {
       case "thread_id":
         setThreadId(data.thread_id);
+        break;
+
+      case "strategy_selected":
+        setResolvedStrategy(data.strategy);
+        setStatusText(`Strategy: ${data.strategy} (auto-selected)`);
         break;
 
       case "agent_start":
@@ -781,6 +788,14 @@ export default function ChatPage() {
             <span className="text-[10px] text-[var(--accent)] font-medium">msg #{selectedMsgIndex + 1}</span>
           )}
         </div>
+
+        {/* Auto-resolved strategy badge */}
+        {resolvedStrategy && (
+          <div className="flex items-center gap-1.5 mb-3 px-2 py-1.5 rounded-lg bg-blue-50 border border-blue-200 text-[11px] text-blue-700">
+            <span className="h-1.5 w-1.5 rounded-full bg-blue-500 flex-shrink-0" />
+            <span><span className="font-medium">Auto →</span> {resolvedStrategy}</span>
+          </div>
+        )}
 
         {/* Trajectory pills */}
         {trajectory.length > 0 && (

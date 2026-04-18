@@ -1,19 +1,26 @@
 """
-MCP Server for agent memory and note-taking.
+MCP Server for agent memory and note-taking (FastMCP).
 
 Provides persistent key-value storage for agents to remember context
 across conversations, store plans, and track task progress.
 Essential for Plan-and-Execute and self-reflection strategies.
+
+Transports:
+  stdio (default):  python -m src.mcp_servers.memory_server
+  HTTP:             MCP_TRANSPORT=http MCP_PORT=8005 python -m src.mcp_servers.memory_server
 """
 
 import json
+import logging
 import os
-from datetime import datetime
 from dataclasses import dataclass, field
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from datetime import datetime
+from typing import Optional
 
+from fastmcp import FastMCP
+from mcp.types import TextContent
+
+logger = logging.getLogger(__name__)
 
 MEMORY_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "data", "agent_memory.json")
 
@@ -26,9 +33,14 @@ class MemoryState:
         self.tool_calls.append({"tool": tool, "args": args, "result": result[:500], "success": success})
 
 
-server = Server("memory-mcp-server")
+mcp = FastMCP(
+    "memory-mcp-server",
+    instructions="Persistent key-value memory for agents. Stores notes, plans, and context across sessions.",
+)
 state = MemoryState()
 
+
+# ── Storage helpers ───────────────────────────────────────────────
 
 def _load_memory() -> dict:
     if os.path.exists(MEMORY_FILE):
@@ -37,145 +49,59 @@ def _load_memory() -> dict:
     return {"notes": {}, "plans": {}, "context": {}}
 
 
-def _save_memory(data: dict):
+def _save_memory(data: dict) -> None:
     os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
     with open(MEMORY_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
-    return [
-        Tool(
-            name="memory_store",
-            description="Store a key-value pair in persistent memory. Use to save plans, notes, or context for later retrieval.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string", "description": "Memory key (e.g., 'current_plan', 'user_preference')"},
-                    "value": {"type": "string", "description": "Content to remember"},
-                    "category": {"type": "string", "description": "Category: notes, plans, or context", "default": "notes"},
-                },
-                "required": ["key", "value"],
-            },
-        ),
-        Tool(
-            name="memory_retrieve",
-            description="Retrieve a value from persistent memory by key.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string", "description": "Memory key to retrieve"},
-                    "category": {"type": "string", "description": "Category to search in", "default": "notes"},
-                },
-                "required": ["key"],
-            },
-        ),
-        Tool(
-            name="memory_list",
-            description="List all stored memory keys, optionally filtered by category.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "category": {"type": "string", "description": "Filter by category (notes, plans, context). Empty = all."},
-                },
-            },
-        ),
-        Tool(
-            name="memory_delete",
-            description="Delete a key from memory.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string", "description": "Key to delete"},
-                    "category": {"type": "string", "description": "Category", "default": "notes"},
-                },
-                "required": ["key"],
-            },
-        ),
-        Tool(
-            name="create_plan",
-            description="Create a structured task plan with numbered steps. Use for complex multi-step tasks before execution.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Plan name"},
-                    "steps": {"type": "array", "items": {"type": "string"}, "description": "Ordered list of steps to execute"},
-                },
-                "required": ["name", "steps"],
-            },
-        ),
-        Tool(
-            name="update_plan_step",
-            description="Mark a plan step as completed, in-progress, or failed.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "plan_name": {"type": "string", "description": "Name of the plan"},
-                    "step_index": {"type": "integer", "description": "Step index (0-based)"},
-                    "status": {"type": "string", "description": "New status: pending, in_progress, done, failed"},
-                },
-                "required": ["plan_name", "step_index", "status"],
-            },
-        ),
-    ]
+# ── Tool implementations ──────────────────────────────────────────
 
+@mcp.tool()
+async def memory_store(key: str, value: str, category: str = "notes") -> str:
+    """Store a key-value pair in persistent memory.
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    try:
-        result = await _dispatch(name, arguments)
-        state.record(name, arguments, result, success=True)
-        return [TextContent(type="text", text=result)]
-    except Exception as e:
-        error_msg = f"Error in {name}: {str(e)}"
-        state.record(name, arguments, error_msg, success=False)
-        return [TextContent(type="text", text=error_msg)]
+    Use to save plans, notes, or context for later retrieval.
 
-
-async def _dispatch(name: str, args: dict) -> str:
-    match name:
-        case "memory_store":
-            return _store(args)
-        case "memory_retrieve":
-            return _retrieve(args)
-        case "memory_list":
-            return _list(args)
-        case "memory_delete":
-            return _delete(args)
-        case "create_plan":
-            return _create_plan(args)
-        case "update_plan_step":
-            return _update_plan_step(args)
-        case _:
-            raise ValueError(f"Unknown tool: {name}")
-
-
-def _store(args: dict) -> str:
+    Args:
+        key: Memory key (e.g. 'current_plan', 'user_preference').
+        value: Content to remember.
+        category: Storage category: 'notes', 'plans', or 'context' (default: 'notes').
+    """
     mem = _load_memory()
-    cat = args.get("category", "notes")
-    mem.setdefault(cat, {})[args["key"]] = {
-        "value": args["value"],
+    mem.setdefault(category, {})[key] = {
+        "value": value,
         "updated_at": datetime.now().isoformat(),
     }
     _save_memory(mem)
-    return f"Stored '{args['key']}' in {cat}"
+    return f"Stored '{key}' in {category}"
 
 
-def _retrieve(args: dict) -> str:
+@mcp.tool()
+async def memory_retrieve(key: str, category: str = "notes") -> str:
+    """Retrieve a value from persistent memory by key.
+
+    Args:
+        key: Memory key to retrieve.
+        category: Category to search in (default: 'notes').
+    """
     mem = _load_memory()
-    cat = args.get("category", "notes")
-    entry = mem.get(cat, {}).get(args["key"])
+    entry = mem.get(category, {}).get(key)
     if not entry:
-        return f"Key '{args['key']}' not found in {cat}"
-    return f"[{cat}/{args['key']}] {entry['value']} (updated: {entry.get('updated_at', '?')})"
+        return f"Key '{key}' not found in {category}"
+    return f"[{category}/{key}] {entry['value']} (updated: {entry.get('updated_at', '?')})"
 
 
-def _list(args: dict) -> str:
+@mcp.tool()
+async def memory_list(category: str = "") -> str:
+    """List all stored memory keys, optionally filtered by category.
+
+    Args:
+        category: Filter by category ('notes', 'plans', 'context'). Empty = all.
+    """
     mem = _load_memory()
-    cat = args.get("category", "")
     results = []
-    categories = [cat] if cat else list(mem.keys())
+    categories = [category] if category else list(mem.keys())
     for c in categories:
         for key, entry in mem.get(c, {}).items():
             val_preview = str(entry.get("value", ""))[:80]
@@ -183,46 +109,95 @@ def _list(args: dict) -> str:
     return "\n".join(results) if results else "Memory is empty"
 
 
-def _delete(args: dict) -> str:
+@mcp.tool()
+async def memory_delete(key: str, category: str = "notes") -> str:
+    """Delete a key from memory.
+
+    Args:
+        key: Key to delete.
+        category: Category (default: 'notes').
+    """
     mem = _load_memory()
-    cat = args.get("category", "notes")
-    if args["key"] in mem.get(cat, {}):
-        del mem[cat][args["key"]]
+    if key in mem.get(category, {}):
+        del mem[category][key]
         _save_memory(mem)
-        return f"Deleted '{args['key']}' from {cat}"
-    return f"Key '{args['key']}' not found"
+        return f"Deleted '{key}' from {category}"
+    return f"Key '{key}' not found"
 
 
-def _create_plan(args: dict) -> str:
+@mcp.tool()
+async def create_plan(name: str, steps: list) -> str:
+    """Create a structured task plan with numbered steps.
+
+    Use for complex multi-step tasks before execution.
+
+    Args:
+        name: Plan name.
+        steps: Ordered list of steps to execute.
+    """
     mem = _load_memory()
     plan = {
-        "steps": [{"description": s, "status": "pending"} for s in args["steps"]],
+        "steps": [{"description": s, "status": "pending"} for s in steps],
         "created_at": datetime.now().isoformat(),
     }
-    mem.setdefault("plans", {})[args["name"]] = plan
+    mem.setdefault("plans", {})[name] = plan
     _save_memory(mem)
-    formatted = "\n".join(f"  {i+1}. [{s['status']}] {s['description']}" for i, s in enumerate(plan["steps"]))
-    return f"Plan '{args['name']}' created:\n{formatted}"
+    formatted = "\n".join(
+        f"  {i + 1}. [{s['status']}] {s['description']}"
+        for i, s in enumerate(plan["steps"])
+    )
+    return f"Plan '{name}' created:\n{formatted}"
 
 
-def _update_plan_step(args: dict) -> str:
+@mcp.tool()
+async def update_plan_step(plan_name: str, step_index: int, status: str) -> str:
+    """Mark a plan step as completed, in-progress, or failed.
+
+    Args:
+        plan_name: Name of the plan.
+        step_index: Step index (0-based).
+        status: New status: 'pending', 'in_progress', 'done', or 'failed'.
+    """
     mem = _load_memory()
-    plan = mem.get("plans", {}).get(args["plan_name"])
+    plan = mem.get("plans", {}).get(plan_name)
     if not plan:
-        return f"Plan '{args['plan_name']}' not found"
-    idx = args["step_index"]
-    if idx < 0 or idx >= len(plan["steps"]):
-        return f"Step index {idx} out of range"
-    plan["steps"][idx]["status"] = args["status"]
+        return f"Plan '{plan_name}' not found"
+    if step_index < 0 or step_index >= len(plan["steps"]):
+        return f"Step index {step_index} out of range"
+    plan["steps"][step_index]["status"] = status
     _save_memory(mem)
-    formatted = "\n".join(f"  {i+1}. [{s['status']}] {s['description']}" for i, s in enumerate(plan["steps"]))
-    return f"Plan '{args['plan_name']}' updated:\n{formatted}"
+    formatted = "\n".join(
+        f"  {i + 1}. [{s['status']}] {s['description']}"
+        for i, s in enumerate(plan["steps"])
+    )
+    return f"Plan '{plan_name}' updated:\n{formatted}"
 
 
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+# ── Backward-compatible shims ─────────────────────────────────────
+
+async def list_tools():
+    tools = await mcp.list_tools()
+    return [t.to_mcp_tool() for t in tools]
+
+
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    try:
+        result = await mcp.call_tool(name, arguments)
+        text = result.content[0].text if result.content else "Done"
+        state.record(name, arguments, text, success=True)
+        return list(result.content)
+    except Exception as e:
+        error_msg = f"Error in {name}: {str(e)}"
+        state.record(name, arguments, error_msg, success=False)
+        return [TextContent(type="text", text=error_msg)]
+
+
+# ── Entry point ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport == "http":
+        import asyncio
+        asyncio.run(mcp.run_http_async(host="0.0.0.0", port=int(os.getenv("MCP_PORT", "8005"))))
+    else:
+        mcp.run()

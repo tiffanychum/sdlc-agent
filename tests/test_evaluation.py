@@ -188,7 +188,8 @@ class TestEvalScenarios:
             assert s.prompt, "Scenario missing prompt"
             valid_agents = {
                 "coder", "tester", "devops", "researcher",
-                "reviewer", "planner", "project_manager", "business_analyst",
+                "reviewer", "planner", "project_manager", "data_analyst",
+                "prompt_optimizer",
             }
             assert s.expected_agent in valid_agents, \
                 f"Invalid expected_agent: {s.expected_agent} (must be one of {sorted(valid_agents)})"

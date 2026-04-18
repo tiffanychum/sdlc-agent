@@ -1,5 +1,5 @@
 "use client";
-import React, { useEffect, useState, useCallback, useMemo } from "react";
+import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { api } from "@/lib/api";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -40,6 +40,38 @@ export default function MonitoringPage() {
   const [otelStats, setOtelStats] = useState<any>(null);
   const [evalRuns, setEvalRuns] = useState<any[]>([]);
   const [ragStats, setRagStats] = useState<any>(null);
+  const [perfReport, setPerfReport] = useState<any>(null);
+  const [perfDays, setPerfDays] = useState(7);
+  // Regression insights
+  const [regressionInsights, setRegressionInsights] = useState<any>(null);
+  // A/B compare
+  const [allEvalRuns, setAllEvalRuns] = useState<any[]>([]);
+  const [abRunA, setAbRunA] = useState("");
+  const [abRunB, setAbRunB] = useState("");
+  const [abResult, setAbResult] = useState<any>(null);
+  const [abLoading, setAbLoading] = useState(false);
+  // Prompt Versions
+  const [promptVersions, setPromptVersions] = useState<any>(null);
+  const [selectedRole, setSelectedRole] = useState<string>("coder");
+  const [promptDiff, setPromptDiff] = useState<any>(null);
+  const [diffOld, setDiffOld] = useState("v1");
+  const [diffNew, setDiffNew] = useState("v2");
+  const [optimizeLoading, setOptimizeLoading] = useState(false);
+  const [optimizeResult, setOptimizeResult] = useState<any>(null);
+  // Optimizer setup modal state
+  const [showOptimizeSetup, setShowOptimizeSetup] = useState(false);
+  const [optimizeRole, setOptimizeRole] = useState("coder");
+  const [optimizeVersion, setOptimizeVersion] = useState("latest");
+  const [optimizeMetric, setOptimizeMetric] = useState("step_efficiency");
+  const [optimizeThreshold, setOptimizeThreshold] = useState("0.7");
+  // Live trajectory from SSE stream
+  const [optimizeTrajectory, setOptimizeTrajectory] = useState<Array<{type: string; text: string; ts: number}>>([]);
+  const trajectoryEndRef = useRef<HTMLDivElement>(null);
+  // Prompt A/B comparison
+  const [promptAbVersionA, setPromptAbVersionA] = useState("v1");
+  const [promptAbVersionB, setPromptAbVersionB] = useState("v2");
+  const [promptAbResult, setPromptAbResult] = useState<any>(null);
+  const [promptAbLoading, setPromptAbLoading] = useState(false);
 
   useEffect(() => {
     api.teams.list().then(t => { setTeams(t); if (t.length) setTeamId(t[0].id); });
@@ -53,7 +85,162 @@ export default function MonitoringPage() {
     try { const r = await (api as any).rag.stats(30); setRagStats(r); } catch { /* ignore */ }
   }, []);
 
+  const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+  const loadPerfReport = useCallback(async (days: number) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/traces/performance-report?days=${days}`);
+      const data = await res.json();
+      setPerfReport(data);
+    } catch { /* ignore */ }
+  }, [API_BASE]);
+
+  const loadRegressionInsights = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/traces/performance-report/regression-insights?days=90`);
+      const data = await res.json();
+      setRegressionInsights(data);
+    } catch { /* ignore */ }
+  }, [API_BASE]);
+
+  const loadAllEvalRuns = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/eval/runs`);
+      const data = await res.json();
+      setAllEvalRuns(data);
+      if (data.length >= 2) {
+        setAbRunA(data[1]?.id || "");
+        setAbRunB(data[0]?.id || "");
+      }
+    } catch { /* ignore */ }
+  }, [API_BASE]);
+
+  const runAbCompare = useCallback(async () => {
+    if (!abRunA || !abRunB) return;
+    setAbLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/traces/performance-report/ab-compare?run_a=${abRunA}&run_b=${abRunB}`);
+      setAbResult(await res.json());
+    } catch { /* ignore */ }
+    finally { setAbLoading(false); }
+  }, [abRunA, abRunB, API_BASE]);
+
+  const loadPromptVersions = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/prompts/versions`);
+      const data = await res.json();
+      setPromptVersions(data);
+    } catch { /* ignore */ }
+  }, [API_BASE]);
+
+  const loadPromptDiff = useCallback(async (role: string, vOld: string, vNew: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/prompts/diff?role=${role}&version_old=${vOld}&version_new=${vNew}`);
+      setPromptDiff(await res.json());
+    } catch { /* ignore */ }
+  }, [API_BASE]);
+
+  const runOptimize = useCallback(async (
+    role: string,
+    version: string,
+    metric: string,
+    threshold: string,
+  ) => {
+    setOptimizeLoading(true);
+    setOptimizeResult(null);
+    setOptimizeTrajectory([]);
+
+    const addEvent = (type: string, text: string) =>
+      setOptimizeTrajectory(prev => [...prev, { type, text, ts: Date.now() }]);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/prompts/optimize/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          role, version: version || undefined,
+          metric, threshold: parseFloat(threshold) || 0.7,
+          model: "claude-sonnet-4.6",
+        }),
+      });
+      if (!res.body) throw new Error("No SSE body");
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let finalResponse = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split("\n\n");
+        buf = parts.pop() || "";
+        for (const part of parts) {
+          if (!part.trim()) continue;
+          const lines = part.split("\n");
+          let eventType = ""; let dataStr = "";
+          for (const line of lines) {
+            if (line.startsWith("event: ")) eventType = line.slice(7);
+            else if (line.startsWith("data: ")) dataStr = line.slice(6);
+          }
+          if (!eventType || !dataStr) continue;
+          try {
+            const d = JSON.parse(dataStr);
+            if (eventType === "optimize_start") {
+              addEvent("start", `▶ Starting optimization — role: ${d.role} | metric: ${d.metric} | version: ${d.version} | model: ${d.model}`);
+            } else if (eventType === "agent_start") {
+              addEvent("agent", `🤖 Agent: ${d.agent}`);
+            } else if (eventType === "tool_start") {
+              const args = Object.entries(d.args || {}).map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(", ");
+              addEvent("tool", `  ⚙ ${d.tool}(${args})`);
+            } else if (eventType === "tool_end") {
+              addEvent("tool_result", `  ↳ ${d.output_preview}`);
+            } else if (eventType === "version_registering") {
+              addEvent("version", `  📝 Registering new version for ${d.role}: ${d.rationale}`);
+            } else if (eventType === "version_registered") {
+              addEvent("version_done", `  ✅ Registered ${d.role} @ ${d.version}`);
+            } else if (eventType === "regression_result") {
+              addEvent("regression", `  📊 Regression: ${d.tool_output}`);
+            } else if (eventType === "thinking") {
+              addEvent("thinking", d.delta);
+              finalResponse += d.delta;
+            } else if (eventType === "done") {
+              addEvent("done", `✓ Optimization complete — ${d.role} / ${d.metric}`);
+            } else if (eventType === "error") {
+              addEvent("error", `✗ Error: ${d.message}`);
+            }
+          } catch { /* skip malformed */ }
+        }
+      }
+      setOptimizeResult({ status: "completed", response: finalResponse });
+      await loadPromptVersions();
+    } catch (e: any) {
+      setOptimizeResult({ status: "error", error: e.message });
+    } finally {
+      setOptimizeLoading(false);
+    }
+  }, [API_BASE, loadPromptVersions]);
+
+  const runPromptAbCompare = useCallback(async (role: string, va: string, vb: string) => {
+    setPromptAbLoading(true);
+    setPromptAbResult(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/prompts/ab-compare?role=${role}&version_a=${va}&version_b=${vb}`);
+      setPromptAbResult(await res.json());
+    } catch { /* ignore */ }
+    finally { setPromptAbLoading(false); }
+  }, [API_BASE]);
+
+  // perf_analysis and prompt_versions tabs moved to Regression page
+
   useEffect(() => { if (teamId) loadAll(); }, [teamId, loadAll]);
+
+  // Auto-scroll trajectory to bottom when new events arrive
+  useEffect(() => {
+    if (trajectoryEndRef.current) {
+      trajectoryEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [optimizeTrajectory]);
 
   const selectedTeam = teams.find(t => t.id === teamId);
   const totalRuns = stats?.total_runs || traces.length || 0;
@@ -172,7 +359,7 @@ export default function MonitoringPage() {
         </div>
       </div>
 
-      {/* Tabs */}
+      {/* Tabs — Performance Analysis & Prompt Versions moved to Regression page */}
       <div className="flex gap-1 border-b border-[var(--border)]">
         {([
           { id: "overview" as const, label: "Overview" },

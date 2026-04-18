@@ -129,14 +129,23 @@ export const api = {
     sync: () => fetchJSON("/api/golden/sync", { method: "POST" }),
   },
   regression: {
-    run: (params: { team_id?: string; case_ids?: string[]; model?: string; prompt_version?: string; baseline_run_id?: string }) =>
+    run: (params: { team_id?: string; case_ids?: string[]; model?: string; prompt_version?: string; prompt_versions_by_role?: Record<string, string>; baseline_run_id?: string }) =>
       fetchJSON("/api/regression/run", { method: "POST", body: JSON.stringify(params) }),
     runs: () => fetchJSON("/api/regression/runs"),
     results: (runId: string) => fetchJSON(`/api/regression/results/${runId}`),
     caseDetail: (runId: string, caseId: string) => fetchJSON(`/api/regression/results/${runId}/${caseId}`),
-    diff: (runA: string, runB: string, caseId: string) => fetchJSON(`/api/regression/diff/${runA}/${runB}/${caseId}`),
-    rca: (runId: string, caseId: string, baselineRunId?: string) =>
-      fetchJSON("/api/regression/rca", { method: "POST", body: JSON.stringify({ run_id: runId, case_id: caseId, baseline_run_id: baselineRunId }) }),
+    abOptions: (golden_id: string) => fetchJSON(`/api/regression/ab/options?golden_id=${encodeURIComponent(golden_id)}`),
+    ab: (params: { golden_id: string; run_id_a?: string; run_id_b?: string; model_a?: string; model_b?: string; version_a?: string; version_b?: string }) => {
+      const q = new URLSearchParams();
+      q.set("golden_id", params.golden_id);
+      if (params.run_id_a) q.set("run_id_a", params.run_id_a);
+      if (params.run_id_b) q.set("run_id_b", params.run_id_b);
+      if (params.model_a) q.set("model_a", params.model_a);
+      if (params.model_b) q.set("model_b", params.model_b);
+      if (params.version_a) q.set("version_a", params.version_a);
+      if (params.version_b) q.set("version_b", params.version_b);
+      return fetchJSON(`/api/regression/ab?${q}`);
+    },
   },
   models: {
     list: () => fetchJSON("/api/models"),
@@ -150,5 +159,11 @@ export const api = {
     update: (id: string, data: any) => fetchJSON(`/api/prompt-versions/${id}`, { method: "PUT", body: JSON.stringify(data) }),
     delete: (id: string) => fetchJSON(`/api/prompt-versions/${id}`, { method: "DELETE" }),
     current: () => fetchJSON("/api/prompt-versions/current"),
+  },
+  prompts: {
+    versions: (role?: string) => fetchJSON(`/api/prompts/versions${role ? `?role=${encodeURIComponent(role)}` : ""}`),
+    text: (role: string, version: string) => fetchJSON(`/api/prompts/text?role=${encodeURIComponent(role)}&version=${encodeURIComponent(version)}`),
+    diff: (role: string, vOld: string, vNew: string) => fetchJSON(`/api/prompts/diff?role=${encodeURIComponent(role)}&version_old=${encodeURIComponent(vOld)}&version_new=${encodeURIComponent(vNew)}`),
+    abCompare: (role: string, va: string, vb: string) => fetchJSON(`/api/prompts/ab-compare?role=${encodeURIComponent(role)}&version_a=${encodeURIComponent(va)}&version_b=${encodeURIComponent(vb)}`),
   },
 };

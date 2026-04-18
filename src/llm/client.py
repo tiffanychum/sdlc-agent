@@ -10,11 +10,8 @@ from src.config import config
 
 # Models that require extended thinking to be enabled via extra_body.
 # These models reject requests without thinking.budget_tokens >= 1024.
-_THINKING_MODELS = {
-    "claude-sonnet-4.6",
-    "claude-opus-4.5",
-    "claude-opus-4.6",
-}
+# Only Poe-compatible model IDs that have been verified to accept the thinking header.
+_THINKING_MODELS: set[str] = set()
 
 _THINKING_BUDGET_TOKENS = 5000
 

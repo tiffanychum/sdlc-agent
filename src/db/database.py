@@ -84,6 +84,7 @@ def _migrate(engine):
                 ("mmr_lambda", "0.5"),
                 ("multi_query_n", "3"),
                 ("system_prompt", "NULL"),
+                ("reranker", "'none'"),
             ]:
                 if col not in cols:
                     conn.execute(text(f"ALTER TABLE rag_configs ADD COLUMN {col} TEXT DEFAULT {default}"))
@@ -100,6 +101,13 @@ def _migrate(engine):
             ]:
                 if col not in cols:
                     conn.execute(text(f"ALTER TABLE rag_queries ADD COLUMN {col} TEXT DEFAULT {default}"))
+            conn.commit()
+
+    if "agents" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("agents")}
+        with engine.connect() as conn:
+            if "prompt_version" not in cols:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN prompt_version TEXT DEFAULT 'v1'"))
             conn.commit()
 
 
@@ -236,12 +244,26 @@ def update_agent_data():
     finally:
         session.close()
 
+    # Seed PromptRegistry with v1 and v2 prompts (idempotent)
+    try:
+        from src.prompts.registry import get_registry
+        from src.agents.prompts import AGENT_DEFINITIONS
+        reg = get_registry()
+        inserted_v1 = reg.seed_from_definitions(AGENT_DEFINITIONS)
+        cot_roles = ["coder", "planner", "tester", "researcher"]
+        inserted_v2 = reg.seed_cot_v2(cot_roles)
+        if inserted_v1 or inserted_v2:
+            pass  # silently seeded
+    except Exception:
+        pass  # best-effort; doesn't block startup
+
 
 def _migrate_tool_mappings(session):
-    """Fix legacy tool-group names (e.g. PM/BA agents that had 'planner' instead of 'jira')."""
+    """Fix legacy tool-group names and enforce current canonical tool group assignments."""
     from src.db.models import AgentToolMapping
 
-    for agent_id in ("project_manager", "business_analyst"):
+    # PM: rename legacy 'planner' tool group → 'jira'
+    for agent_id in ("project_manager",):
         mappings = session.query(AgentToolMapping).filter_by(agent_id=agent_id).all()
         existing_groups = {m.tool_group for m in mappings}
         if "planner" in existing_groups and "jira" not in existing_groups:
@@ -249,3 +271,12 @@ def _migrate_tool_mappings(session):
                 if m.tool_group == "planner":
                     session.delete(m)
             session.add(AgentToolMapping(agent_id=agent_id, tool_group="jira"))
+
+    # Planner: downgrade 'filesystem' → 'filesystem_read' (read-only enforcement)
+    planner_mappings = session.query(AgentToolMapping).filter_by(agent_id="planner").all()
+    planner_groups = {m.tool_group for m in planner_mappings}
+    if "filesystem" in planner_groups and "filesystem_read" not in planner_groups:
+        for m in planner_mappings:
+            if m.tool_group == "filesystem":
+                session.delete(m)
+        session.add(AgentToolMapping(agent_id="planner", tool_group="filesystem_read"))

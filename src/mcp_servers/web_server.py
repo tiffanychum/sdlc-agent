@@ -1,17 +1,25 @@
 """
-MCP Server for web operations.
+MCP Server for web operations (FastMCP).
 
 Enables agents to fetch documentation, search the web, and read
 online resources. Essential for researching APIs, finding solutions,
 and staying up-to-date with libraries.
+
+Transports:
+  stdio (default):  python -m src.mcp_servers.web_server
+  HTTP:             MCP_TRANSPORT=http MCP_PORT=8004 python -m src.mcp_servers.web_server
 """
 
+import logging
+import os
 import re
 from dataclasses import dataclass, field
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+
 import httpx
+from fastmcp import FastMCP
+from mcp.types import TextContent
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -20,17 +28,20 @@ class WebState:
 
     def record(self, tool: str, args: dict, result: str, success: bool) -> None:
         self.tool_calls.append({
-            "tool": tool, "args": args,
-            "result": result[:500], "success": success,
+            "tool": tool, "args": args, "result": result[:500], "success": success,
         })
 
 
-server = Server("web-mcp-server")
+mcp = FastMCP(
+    "web-mcp-server",
+    instructions="Fetch URLs, search the web, and check URL reachability.",
+)
 state = WebState()
 
 
+# ── Helpers ───────────────────────────────────────────────────────
+
 def _html_to_text(html: str) -> str:
-    """Basic HTML to text conversion for readability."""
     text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
     text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
     text = re.sub(r'<[^>]+>', ' ', text)
@@ -38,112 +49,79 @@ def _html_to_text(html: str) -> str:
     return text[:10000]
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
-    return [
-        Tool(
-            name="fetch_url",
-            description=(
-                "Fetch the content of a URL and return it as readable text. "
-                "Use for reading documentation, API references, blog posts, or any web page."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "Full URL to fetch"},
-                    "raw": {
-                        "type": "boolean",
-                        "description": "Return raw HTML instead of extracted text",
-                        "default": False,
-                    },
-                },
-                "required": ["url"],
-            },
-        ),
-        Tool(
-            name="web_search",
-            description=(
-                "Search the web for information. Returns titles, URLs, and snippets. "
-                "Use for finding documentation, solutions to errors, or library references."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "num_results": {
-                        "type": "integer",
-                        "description": "Number of results to return",
-                        "default": 5,
-                    },
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="check_url",
-            description="Check if a URL is reachable and return its HTTP status code and headers.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "URL to check"},
-                },
-                "required": ["url"],
-            },
-        ),
-    ]
+# ── Tool implementations ──────────────────────────────────────────
 
+@mcp.tool()
+async def fetch_url(url: str, raw: bool = False) -> str:
+    """Fetch the content of a URL and return it as readable text.
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    try:
-        result = await _dispatch(name, arguments)
-        state.record(name, arguments, result, success=True)
-        return [TextContent(type="text", text=result)]
-    except Exception as e:
-        error_msg = f"Error in {name}: {str(e)}"
-        state.record(name, arguments, error_msg, success=False)
-        return [TextContent(type="text", text=error_msg)]
+    Use for reading documentation, API references, blog posts, or any web page.
 
-
-async def _dispatch(name: str, args: dict) -> str:
-    match name:
-        case "fetch_url":
-            return await _fetch_url(args)
-        case "web_search":
-            return await _web_search(args)
-        case "check_url":
-            return await _check_url(args)
-        case _:
-            raise ValueError(f"Unknown tool: {name}")
-
-
-async def _fetch_url(args: dict) -> str:
-    url = args["url"]
+    Args:
+        url: Full URL to fetch.
+        raw: Return raw HTML instead of extracted text (default: False).
+    """
     async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-        resp = await client.get(url, headers={"User-Agent": "SDLC-Agent/0.1"})
-        resp.raise_for_status()
+        try:
+            resp = await client.get(url, headers={"User-Agent": "SDLC-Agent/0.1"})
+        except httpx.TimeoutException:
+            return (
+                f"URL: {url}\n"
+                "⚠️  FETCH FAILED — request timed out after 15 s.\n"
+                "Recovery: use web_search to find similar content by topic instead."
+            )
+        except httpx.RequestError as exc:
+            return (
+                f"URL: {url}\n"
+                f"⚠️  FETCH FAILED — network error: {exc}.\n"
+                "Recovery: use web_search to find alternative sources."
+            )
+
+    if resp.status_code in (301, 302, 307, 308):
+        location = resp.headers.get("location", "")
+        return f"URL: {url}\nRedirect → {location}\nFetch the redirect target directly."
+
+    if resp.status_code == 403:
+        return (
+            f"URL: {url}\n"
+            "⚠️  FETCH FAILED — 403 Forbidden (geo-block or auth required).\n"
+            "Recovery: use web_search to find this information from accessible sources."
+        )
+
+    if resp.status_code == 404:
+        return (
+            f"URL: {url}\n"
+            "⚠️  FETCH FAILED — 404 Not Found. The page no longer exists.\n"
+            "Recovery: use web_search to find updated or alternative sources on the same topic."
+        )
+
+    if resp.status_code >= 400:
+        return (
+            f"URL: {url}\n"
+            f"⚠️  FETCH FAILED — HTTP {resp.status_code}.\n"
+            "Recovery: use web_search to find this information from another source."
+        )
 
     content_type = resp.headers.get("content-type", "")
     if "json" in content_type:
         return f"URL: {url}\nContent-Type: {content_type}\n\n{resp.text[:10000]}"
-
-    if args.get("raw"):
+    if raw:
         return f"URL: {url}\n\n{resp.text[:10000]}"
 
     text = _html_to_text(resp.text)
     return f"URL: {url}\nContent-Type: {content_type}\n\n{text}"
 
 
-async def _web_search(args: dict) -> str:
-    """
-    Web search implementation. Uses a simple approach for demo.
-    In production, integrate with Google Custom Search API, Brave Search API,
-    or SerpAPI for real results.
-    """
-    query = args["query"]
-    num = args.get("num_results", 5)
+@mcp.tool()
+async def web_search(query: str, num_results: int = 5) -> str:
+    """Search the web for information. Returns titles, URLs, and snippets.
 
-    # For demo: use DuckDuckGo Lite (no API key needed)
+    Use for finding documentation, solutions to errors, or library references.
+
+    Args:
+        query: Search query.
+        num_results: Number of results to return (default: 5).
+    """
     async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
         resp = await client.get(
             "https://lite.duckduckgo.com/lite/",
@@ -152,16 +130,20 @@ async def _web_search(args: dict) -> str:
         )
 
     text = _html_to_text(resp.text)
-    lines = [line.strip() for line in text.split(".") if len(line.strip()) > 20][:num * 2]
+    lines = [line.strip() for line in text.split(".") if len(line.strip()) > 20][:num_results * 2]
 
     if not lines:
         return f"Search results for: {query}\n\nNo results found. Try a different query."
+    return f"Search results for: {query}\n\n" + "\n".join(f"- {line}" for line in lines[:num_results])
 
-    return f"Search results for: {query}\n\n" + "\n".join(f"- {line.strip()}" for line in lines[:num])
 
+@mcp.tool()
+async def check_url(url: str) -> str:
+    """Check if a URL is reachable and return its HTTP status code and headers.
 
-async def _check_url(args: dict) -> str:
-    url = args["url"]
+    Args:
+        url: URL to check.
+    """
     async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
         resp = await client.head(url, headers={"User-Agent": "SDLC-Agent/0.1"})
 
@@ -169,11 +151,31 @@ async def _check_url(args: dict) -> str:
     return f"URL: {url}\nStatus: {resp.status_code}\nHeaders:\n{headers_str}"
 
 
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+# ── Backward-compatible shims ─────────────────────────────────────
 
+async def list_tools():
+    tools = await mcp.list_tools()
+    return [t.to_mcp_tool() for t in tools]
+
+
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    try:
+        result = await mcp.call_tool(name, arguments)
+        text = result.content[0].text if result.content else "Done"
+        state.record(name, arguments, text, success=True)
+        return list(result.content)
+    except Exception as e:
+        error_msg = f"Error in {name}: {str(e)}"
+        state.record(name, arguments, error_msg, success=False)
+        return [TextContent(type="text", text=error_msg)]
+
+
+# ── Entry point ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport == "http":
+        import asyncio
+        asyncio.run(mcp.run_http_async(host="0.0.0.0", port=int(os.getenv("MCP_PORT", "8004"))))
+    else:
+        mcp.run()

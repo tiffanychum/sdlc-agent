@@ -23,9 +23,9 @@ Key capabilities:
 ## Architecture
 
 ```
-                        User Request
-                             │
-                             ▼
+                         User Request
+                              │
+                              ▼
                   ┌─────────────────────┐
                   │  Meta-Router (LLM)  │  Selects strategy + target agent(s)
                   └──────────┬──────────┘

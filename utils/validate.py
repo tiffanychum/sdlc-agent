@@ -30,6 +30,7 @@ def validate_email(email: str) -> bool:
     # - @ symbol (required)
     # - Domain: alphanumeric, dots, hyphens
     # - TLD: at least 2 characters
-    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    # Domain part must not start or end with a dot or hyphen
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$'
     
     return bool(re.match(pattern, email))
