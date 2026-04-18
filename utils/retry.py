@@ -1,7 +1,7 @@
 """Retry decorator utility for handling transient failures."""
 import functools
 import time
-from typing import Callable, Tuple, Type, TypeVar
+from typing import Callable, Optional, Tuple, Type, TypeVar
 
 # Use typing_extensions for Python < 3.10 compatibility, or typing for 3.10+
 try:
@@ -53,7 +53,7 @@ def retry(
     def decorator(func: Callable[P, R]) -> Callable[P, R]:
         @functools.wraps(func)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-            last_exception: BaseException | None = None
+            last_exception: Optional[BaseException] = None
 
             for attempt in range(max_retries + 1):  # +1 for initial attempt
                 try:

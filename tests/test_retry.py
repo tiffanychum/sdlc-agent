@@ -1,5 +1,4 @@
 """Tests for the retry decorator utility."""
-import time
 import pytest
 from unittest.mock import Mock, patch
 from utils.retry import retry
@@ -71,22 +70,22 @@ def test_retry_with_zero_retries():
     assert mock_func.call_count == 1
 
 
-def test_retry_with_delay():
+@patch('utils.retry.time.sleep')
+def test_retry_with_delay(mock_sleep):
     """Test that delay is applied between retries."""
     mock_func = Mock(side_effect=[Exception("fail"), "success"])
-    
+
     @retry(max_retries=2, delay=0.1)
     def test_func():
         return mock_func()
-    
-    start_time = time.time()
+
     result = test_func()
-    end_time = time.time()
-    
+
     assert result == "success"
     assert mock_func.call_count == 2
-    # Should have at least one delay of 0.1 seconds
-    assert end_time - start_time >= 0.1
+    # Should have called sleep exactly once (after the first failure)
+    assert mock_sleep.call_count == 1
+    mock_sleep.assert_called_with(0.1)
 
 
 def test_retry_specific_exceptions():
@@ -178,22 +177,21 @@ def test_retry_negative_delay_raises_error():
             pass
 
 
-def test_retry_no_delay_between_attempts():
+@patch('utils.retry.time.sleep')
+def test_retry_no_delay_between_attempts(mock_sleep):
     """Test that no delay is applied when delay=0."""
     mock_func = Mock(side_effect=[Exception("fail"), "success"])
-    
+
     @retry(max_retries=2, delay=0.0)
     def test_func():
         return mock_func()
-    
-    start_time = time.time()
+
     result = test_func()
-    end_time = time.time()
-    
+
     assert result == "success"
     assert mock_func.call_count == 2
-    # Should complete quickly with no delay
-    assert end_time - start_time < 0.05
+    # time.sleep should never be called when delay=0
+    assert mock_sleep.call_count == 0
 
 
 def test_retry_default_parameters():
@@ -232,7 +230,7 @@ def test_retry_with_return_values():
         assert result == expected_value
 
 
-@patch('time.sleep')
+@patch('utils.retry.time.sleep')
 def test_retry_delay_timing(mock_sleep):
     """Test that time.sleep is called with correct delay values."""
     mock_func = Mock(side_effect=[Exception("fail1"), Exception("fail2"), "success"])
