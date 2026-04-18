@@ -221,6 +221,53 @@ class PromptRegistry:
 
     # ── Seeding ───────────────────────────────────────────────────────────────
 
+    def sync_from_definitions(self, agent_definitions: list[dict]) -> list[tuple[str, str]]:
+        """
+        For each role in AGENT_DEFINITIONS, compare the CURRENT code-level prompt to the
+        latest ACTIVE version in the registry. If they differ, register a new version so
+        `get_prompt(role, "latest")` always serves the current code.
+
+        Returns a list of (role, new_version) for versions that were newly registered.
+        """
+        from src.db.models import PromptVersionEntry
+        session = self._session()
+        bumps: list[tuple[str, str]] = []
+        try:
+            for defn in agent_definitions:
+                role = defn.get("role") or defn.get("id")
+                current_prompt = (defn.get("prompt") or "").strip()
+                if not role or not current_prompt:
+                    continue
+                latest = (
+                    session.query(PromptVersionEntry)
+                    .filter_by(role=role, is_active=True)
+                    .order_by(PromptVersionEntry.created_at.desc())
+                    .first()
+                )
+                if latest and (latest.prompt_text or "").strip() == current_prompt:
+                    continue  # already in sync
+                bumps.append((role, "pending"))
+            session.close()
+        except Exception:
+            session.close()
+            return bumps
+
+        # Register new versions outside the read session
+        for i, (role, _) in enumerate(bumps):
+            current_prompt = next(
+                (d.get("prompt", "") for d in agent_definitions if (d.get("role") or d.get("id")) == role),
+                "",
+            )
+            new_ver = self.register(
+                role=role,
+                prompt_text=current_prompt,
+                rationale="Auto-sync from AGENT_DEFINITIONS (code prompt drifted from DB).",
+                created_by="sync",
+                cot_enhanced=False,
+            )
+            bumps[i] = (role, new_ver)
+        return bumps
+
     def seed_from_definitions(self, agent_definitions: list[dict]) -> int:
         """Idempotently seed v1 prompts from AGENT_DEFINITIONS. Returns count inserted."""
         from src.db.models import PromptVersionEntry
@@ -336,6 +383,41 @@ class PromptRegistry:
         finally:
             session.close()
         return inserted
+
+    def sync_routing_prompts(
+        self,
+        supervisor_prompt: str,
+        meta_router_prompt: str,
+        router_prompt: str,
+    ) -> list[tuple[str, str]]:
+        """
+        Drift detection for the three orchestration roles (supervisor / meta_router / router).
+        If the current code-level prompt differs from the latest active DB version, register
+        a new version so `get_prompt(role, "latest")` always serves the current code.
+        """
+        pairs = {
+            "supervisor": supervisor_prompt,
+            "meta_router": meta_router_prompt,
+            "router": router_prompt,
+        }
+        bumps: list[tuple[str, str]] = []
+        for role, current_prompt in pairs.items():
+            current_prompt = (current_prompt or "").strip()
+            if not current_prompt:
+                continue
+            latest_text = self.get_prompt(role, "latest") or ""
+            if latest_text.strip() == current_prompt:
+                continue
+            new_ver = self.register(
+                role=role,
+                prompt_text=current_prompt,
+                rationale="Auto-sync routing prompt: code drifted from DB.",
+                created_by="sync",
+                cot_enhanced=False,
+                notes="routing_prompt",
+            )
+            bumps.append((role, new_ver))
+        return bumps
 
     def get_routing_prompt_versions(self) -> dict[str, str]:
         """Return the latest active version label for each routing role."""

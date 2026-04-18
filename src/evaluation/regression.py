@@ -7,10 +7,12 @@ per-criterion reasoning, checks structural trace assertions, and detects
 cost/latency regressions.
 """
 
+import asyncio
 import logging
 import time
 import uuid
 from datetime import datetime
+from typing import AsyncIterator, Callable, Awaitable
 
 from src.db.database import get_session
 
@@ -193,6 +195,326 @@ class RegressionRunner:
             "num_cases": len(cases),
             "summary": summary,
             "results": results,
+        }
+
+    # ── Streaming variant ─────────────────────────────────────────────────────
+
+    async def run_streaming(
+        self,
+        emit: Callable[[str, dict], Awaitable[None]],
+        case_ids: list[str] = None,
+        baseline_run_id: str = None,
+        max_parallel: int = 3,
+    ) -> None:
+        """
+        Like `run()` but streams trajectory events via `emit(event_type, data)`.
+
+        Cases run in parallel (up to `max_parallel` concurrently).
+        Each event is tagged with `case_id` so the consumer can demultiplex.
+        The final `run_done` event contains the full summary + results.
+        """
+        cases = get_active_cases(case_ids)
+        if not cases:
+            await emit("error", {"message": "No golden test cases found"})
+            return
+
+        baseline_results = _load_baseline_results(baseline_run_id) if baseline_run_id else {}
+
+        # Resolve strategies (same logic as run())
+        team_active_strategy = _get_team_strategy(self.team_id)
+        agents_config_for_auto = await _load_agents_config(self.team_id)
+        case_strategy_map: dict[str, str] = {}
+        for case in cases:
+            raw = getattr(case, "strategy", None) or None
+            effective = raw if raw else team_active_strategy
+            if effective == "auto":
+                try:
+                    resolved = await select_strategy_auto(case.prompt, agents_config_for_auto)
+                except Exception:
+                    resolved = "supervisor"
+            elif effective in VALID_STRATEGIES:
+                resolved = effective
+            else:
+                resolved = "router_decides"
+            case_strategy_map[case.id] = resolved
+
+        # Build orchestrators per strategy
+        orchestrator_cache: dict[str, object] = {}
+        routing_versions_cache: dict[str, dict] = {}
+        for case in cases:
+            strat = case_strategy_map[case.id]
+            if strat not in orchestrator_cache:
+                graph = await build_orchestrator_from_team(
+                    self.team_id,
+                    model_override=self.model or None,
+                    strategy_override=strat,
+                    prompt_versions_by_role=self.prompt_versions_by_role or None,
+                )
+                orchestrator_cache[strat] = graph
+                routing_versions_cache[strat] = getattr(
+                    graph, "__routing_prompt_versions__",
+                    {"supervisor": "v1", "meta_router": "v1", "router": "v1"},
+                )
+
+        run_id = uuid.uuid4().hex[:12]
+        await emit("run_start", {"run_id": run_id, "num_cases": len(cases)})
+
+        sem = asyncio.Semaphore(max_parallel)
+        results: list[dict] = []
+        results_lock = asyncio.Lock()
+
+        async def _run_one(case: GoldenTestCase, index: int):
+            async with sem:
+                await emit("case_start", {
+                    "case_id": case.id,
+                    "case_label": case.name,
+                    "index": index,
+                    "total": len(cases),
+                    "prompt": case.prompt,
+                })
+                orchestrator = orchestrator_cache[case_strategy_map[case.id]]
+                result = await self._run_single_case_streaming(
+                    orchestrator, case, baseline_results.get(case.id), emit
+                )
+                result["run_id"] = run_id
+                result["expected_strategy"] = getattr(case, "expected_strategy", None) or getattr(case, "strategy", None)
+                result["actual_strategy"] = case_strategy_map[case.id]
+                rv = routing_versions_cache.get(case_strategy_map[case.id], {})
+                result["router_prompt_version"] = (
+                    f"supervisor={rv.get('supervisor','v1')} "
+                    f"meta_router={rv.get('meta_router','v1')} "
+                    f"router={rv.get('router','v1')}"
+                )
+                async with results_lock:
+                    results.append(result)
+                await emit("case_done", {
+                    "case_id": case.id,
+                    "passed": result.get("overall_pass", False),
+                    "verdict": "pass" if result.get("overall_pass", False) else "fail",
+                    "latency_ms": result.get("actual_latency_ms", 0),
+                    "trajectory": result.get("actual_delegation_pattern", []),
+                    "actual_output": result.get("actual_output", ""),
+                    "trace_assertions": result.get("trace_assertions", {}),
+                    "deepeval_scores": result.get("deepeval_scores", {}),
+                    "semantic_similarity": result.get("semantic_similarity", 0),
+                    "actual_cost": result.get("actual_cost", 0),
+                    "error": result.get("error"),
+                })
+
+        await asyncio.gather(*[_run_one(case, i) for i, case in enumerate(cases)])
+
+        summary = self._build_summary(run_id, results, cases)
+        self._persist(run_id, results, summary)
+
+        await emit("run_done", {
+            "run_id": run_id,
+            "model": self.model,
+            "prompt_version": self.prompt_version,
+            "num_cases": len(cases),
+            "summary": summary,
+        })
+
+    async def _run_single_case_streaming(
+        self,
+        orchestrator,
+        case: GoldenTestCase,
+        baseline: dict = None,
+        emit: Callable[[str, dict], Awaitable[None]] = None,
+    ) -> dict:
+        """
+        Like `_run_single_case` but emits trajectory events during execution.
+        Falls back to plain ainvoke when emit is None.
+        """
+        from src.tracing.callbacks import TracingCallbackHandler
+        from src.orchestrator import get_graph_config
+        from langgraph.types import Command as LGCommand
+
+        collector = TraceCollector(team_id=self.team_id, user_prompt=case.prompt)
+        tracing_cb = TracingCallbackHandler(collector)
+        thread_id = f"regression-{uuid.uuid4().hex[:8]}"
+        cfg = get_graph_config(thread_id, callbacks=[tracing_cb])
+        start = time.time()
+
+        async def _emit(evt: str, data: dict):
+            if emit:
+                await emit(evt, {"case_id": case.id, **data})
+
+        current_agent: list[str] = [""]
+
+        try:
+            stream = orchestrator.astream_events(
+                {"messages": [{"role": "user", "content": case.prompt}],
+                 "selected_agent": "", "agent_trace": []},
+                config=cfg,
+                version="v2",
+            )
+            async for event in stream:
+                kind = event.get("event", "")
+                tags = event.get("tags", [])
+                name = event.get("name", "")
+
+                # Track which LangGraph node is active
+                lg_node = next((t.replace("graph_node:", "") for t in tags if t.startswith("graph_node:")), None)
+
+                if kind == "on_chain_start" and lg_node and lg_node not in ("supervisor_decide", "__start__", "LangGraph"):
+                    current_agent[0] = lg_node
+                    await _emit("agent_start", {"agent": lg_node})
+
+                elif kind == "on_chain_end" and lg_node and lg_node not in ("supervisor_decide", "__start__", "LangGraph"):
+                    ended = lg_node
+                    current_agent[0] = ""
+                    await _emit("agent_end", {"agent": ended})
+
+                elif kind == "on_tool_start":
+                    tool_name = name or event.get("data", {}).get("input", {}).get("name", "")
+                    safe_input = {}
+                    try:
+                        raw_in = event.get("data", {}).get("input", {})
+                        safe_input = {k: str(v)[:200] for k, v in raw_in.items()} if isinstance(raw_in, dict) else {}
+                    except Exception:
+                        pass
+                    await _emit("tool_start", {"agent": current_agent[0], "tool": tool_name, "args": safe_input})
+
+                elif kind == "on_tool_end":
+                    tool_name = name or ""
+                    out_preview = ""
+                    try:
+                        out = event.get("data", {}).get("output", "")
+                        out_preview = str(out)[:300]
+                    except Exception:
+                        pass
+                    await _emit("tool_end", {"agent": current_agent[0], "tool": tool_name, "output_preview": out_preview})
+
+                elif kind == "on_chat_model_stream":
+                    try:
+                        chunk = event.get("data", {}).get("chunk", {})
+                        content = chunk.content if hasattr(chunk, "content") else ""
+                        if isinstance(content, list):
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    token = block.get("text", "")
+                                    if token:
+                                        await _emit("llm_token", {"agent": current_agent[0], "token": token})
+                        elif isinstance(content, str) and content:
+                            await _emit("llm_token", {"agent": current_agent[0], "token": content})
+                    except Exception:
+                        pass
+
+            # Handle HITL interrupts after first stream completes
+            result = None
+            for _ in range(15):
+                state = await orchestrator.aget_state(cfg)
+                if not state.next:
+                    break
+                interrupt_map: dict = {}
+                if state.tasks:
+                    for task in state.tasks:
+                        if hasattr(task, "interrupts") and task.interrupts:
+                            for intr in task.interrupts:
+                                iv = intr.value if hasattr(intr, "value") else intr
+                                interrupt_map[intr.id] = _auto_approve_hitl(iv, case)
+                if not interrupt_map:
+                    resume_cmd = LGCommand(resume={"approved": True, "answer": "auto-approved for regression test"})
+                elif len(interrupt_map) == 1:
+                    resume_cmd = LGCommand(resume=next(iter(interrupt_map.values())))
+                else:
+                    resume_cmd = LGCommand(resume=interrupt_map)
+                result = await orchestrator.ainvoke(resume_cmd, config=cfg)
+
+            if result is None:
+                # Get final state if stream completed without interrupt
+                state = await orchestrator.aget_state(cfg)
+                msgs = state.values.get("messages", []) if state.values else []
+                agent_trace_val = state.values.get("agent_trace", []) if state.values else []
+                result = {"messages": msgs, "agent_trace": agent_trace_val}
+
+        except Exception as e:
+            return self._error_result(case, str(e), time.time() - start)
+
+        elapsed_ms = (time.time() - start) * 1000
+
+        agent_trace = result.get("agent_trace", [])
+        messages = result.get("messages", [])
+        last_msg = messages[-1] if messages else None
+        actual_output = _extract_text(last_msg.content if hasattr(last_msg, "content") else str(last_msg)) if last_msg else ""
+
+        actual_agent, actual_tools, delegation_pattern = _parse_trace(agent_trace)
+        llm_calls, tool_calls_count = _count_calls(agent_trace, messages)
+        tokens_in, tokens_out, model_used = _extract_token_meta(messages)
+        total_cost = estimate_cost(model_used or self.model, tokens_in, tokens_out)
+
+        collector.save()
+
+        span_data = [s.copy() for s in collector.spans]
+        for s in span_data:
+            for k in ("start_time", "end_time"):
+                if isinstance(s.get(k), datetime):
+                    s[k] = s[k].isoformat()
+
+        similarity = await self._compute_semantic_similarity(case.reference_output, actual_output)
+        deepeval_scores = await self._run_deepeval(case.prompt, actual_output, agent_trace, collector)
+        quality_scores: dict = {}
+        eval_reasoning: dict = {}
+
+        trace_assertions = self._check_trace_assertions(case, agent_trace, llm_calls, tool_calls_count, tokens_in + tokens_out, elapsed_ms)
+
+        cost_reg = False
+        latency_reg = False
+        if baseline:
+            if baseline.get("actual_cost", 0) > 0:
+                cost_reg = (total_cost - baseline["actual_cost"]) / baseline["actual_cost"] > COST_REGRESSION_THRESHOLD
+            if baseline.get("actual_latency_ms", 0) > 0:
+                latency_reg = (elapsed_ms - baseline["actual_latency_ms"]) / baseline["actual_latency_ms"] > LATENCY_REGRESSION_THRESHOLD
+
+        if tokens_in + tokens_out > case.max_tokens:
+            cost_reg = True
+        if elapsed_ms > case.max_latency_ms:
+            latency_reg = True
+
+        thresholds = case.quality_thresholds or {}
+        de_numeric = [v for k, v in deepeval_scores.items()
+                      if isinstance(v, (int, float)) and not k.endswith("_reason")]
+        de_avg = sum(de_numeric) / max(len(de_numeric), 1) if de_numeric else None
+        quality_reg = (
+            similarity < thresholds.get("semantic_similarity", 0.4) or
+            (de_avg is not None and de_avg < thresholds.get("task_completion", 0.4))
+        )
+        trace_reg = any(not a.get("passed", True) for a in trace_assertions.values())
+        overall_pass = not (cost_reg or latency_reg or quality_reg or trace_reg)
+
+        return {
+            "golden_case_id": case.id,
+            "golden_case_name": case.name,
+            "prompt": case.prompt,
+            "reference_output": case.reference_output,
+            "actual_output": actual_output,
+            "actual_agent": actual_agent,
+            "actual_tools": actual_tools,
+            "actual_delegation_pattern": delegation_pattern,
+            "full_trace": agent_trace,
+            "span_data": span_data,
+            "actual_llm_calls": llm_calls,
+            "actual_tool_calls": tool_calls_count,
+            "actual_tokens_in": tokens_in,
+            "actual_tokens_out": tokens_out,
+            "actual_latency_ms": round(elapsed_ms, 1),
+            "actual_cost": round(total_cost, 6),
+            "semantic_similarity": round(similarity, 3),
+            "quality_scores": quality_scores,
+            "deepeval_scores": deepeval_scores,
+            "eval_reasoning": eval_reasoning,
+            "trace_assertions": trace_assertions,
+            "cost_regression": cost_reg,
+            "latency_regression": latency_reg,
+            "quality_regression": quality_reg,
+            "trace_regression": trace_reg,
+            "overall_pass": overall_pass,
+            "model_used": model_used or self.model,
+            "prompt_version": self.prompt_version,
+            "expected_agent": case.expected_agent,
+            "expected_tools": case.expected_tools or [],
+            "quality_thresholds": case.quality_thresholds or {},
+            "complexity": case.complexity,
         }
 
     async def _run_single_case(

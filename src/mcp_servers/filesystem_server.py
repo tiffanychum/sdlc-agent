@@ -198,6 +198,9 @@ async def list_directory(path: str = "", recursive: bool = False) -> str:
         recursive: List recursively (default False).
     """
     dirpath = _safe_path(path)
+    if not dirpath.exists():
+        # Path doesn't exist yet — treat it as an empty new directory rather than crashing.
+        return f"(empty — '{path}' does not exist yet; use write_file to create files there)"
     if not dirpath.is_dir():
         raise NotADirectoryError(f"Not a directory: {path or '.'}")
 

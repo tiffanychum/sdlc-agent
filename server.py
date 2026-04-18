@@ -309,6 +309,7 @@ def get_team(team_id: str):
             "tool_groups": tools, "skills": skills,
             "model": getattr(a, "model", "") or "",
             "decision_strategy": getattr(a, "decision_strategy", "react") or "react",
+            "prompt_version": getattr(a, "prompt_version", None) or "v1",
         })
     result = {
         "id": team.id, "name": team.name, "description": team.description,
@@ -1073,6 +1074,57 @@ async def prompt_versions(role: str = None):
         }
     except Exception as e:
         return {"error": str(e), "roles": {}}
+
+
+@app.get("/api/prompts/routing")
+async def get_routing_prompts():
+    """Return current routing prompt versions and text for supervisor, meta_router, and router."""
+    try:
+        from src.prompts.registry import get_registry
+        reg = get_registry()
+        routing_roles = ("supervisor", "meta_router", "router")
+        result = {}
+        for role in routing_roles:
+            versions = reg.list_versions(role)
+            latest_ver = reg.latest_version(role) if versions else None
+            text_val = reg.get_prompt(role, "latest") if latest_ver else None
+            result[role] = {
+                "versions": versions,
+                "active_version": latest_ver,
+                "text": text_val or "",
+            }
+        return {"routing": result}
+    except Exception as e:
+        return {"error": str(e), "routing": {}}
+
+
+@app.put("/api/prompts/routing/{role}")
+async def set_routing_prompt_version(role: str, data: dict):
+    """Set the active version for a routing prompt role (supervisor/meta_router/router)."""
+    try:
+        from src.prompts.registry import get_registry
+        reg = get_registry()
+        version = data.get("version")
+        if not version:
+            raise HTTPException(400, "version is required")
+        if role not in ("supervisor", "meta_router", "router"):
+            raise HTTPException(400, f"Unknown routing role: {role}")
+        # Deactivate all versions for this role and activate the selected one
+        from src.db.models import PromptVersionEntry
+        from src.db.database import get_session
+        session = get_session()
+        try:
+            entries = session.query(PromptVersionEntry).filter_by(role=role).all()
+            for e in entries:
+                e.is_active = (e.version == version)
+            session.commit()
+        finally:
+            session.close()
+        return {"status": "updated", "role": role, "version": version}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 @app.get("/api/prompts/text")
@@ -2155,17 +2207,115 @@ def _sync_db_to_json():
 @app.post("/api/regression/run")
 async def run_regression(request: RegressionRunRequest):
     from src.evaluation.regression import RegressionRunner
+
+    # If no per-role prompt versions are explicitly provided, fall back to
+    # whatever versions are currently set on each agent in Studio (DB).
+    # This ensures regression tests use the same prompt versions as the UI.
+    effective_versions = request.prompt_versions_by_role
+    if not effective_versions:
+        session = get_session()
+        try:
+            agents = session.query(Agent).filter_by(team_id=request.team_id or "default").all()
+            studio_versions = {
+                a.role: (getattr(a, "prompt_version", None) or "v1")
+                for a in agents
+                if (getattr(a, "prompt_version", None) or "v1") != "v1"
+            }
+            if studio_versions:
+                effective_versions = studio_versions
+        finally:
+            session.close()
+
     runner = RegressionRunner(
         model=request.model,
         prompt_version=request.prompt_version,
         team_id=request.team_id,
-        prompt_versions_by_role=request.prompt_versions_by_role,
+        prompt_versions_by_role=effective_versions,
     )
     result = await runner.run(
         case_ids=request.case_ids,
         baseline_run_id=request.baseline_run_id,
     )
     return result
+
+
+@app.post("/api/regression/run/stream")
+async def run_regression_stream(request: RegressionRunRequest):
+    """SSE endpoint that streams live trajectory events as each test case executes.
+
+    Events (all tagged with case_id):
+      run_start   — { run_id, num_cases }
+      case_start  — { case_id, case_label, index, total, prompt }
+      agent_start — { case_id, agent }
+      tool_start  — { case_id, agent, tool, args }
+      tool_end    — { case_id, agent, tool, output_preview }
+      agent_end   — { case_id, agent }
+      case_done   — { case_id, passed, verdict, latency_ms, trajectory,
+                      actual_output, trace_assertions, deepeval_scores,
+                      semantic_similarity, actual_cost, error? }
+      run_done    — { run_id, model, num_cases, summary }
+      error       — { message }
+    """
+    import asyncio
+    from src.evaluation.regression import RegressionRunner
+
+    effective_versions = request.prompt_versions_by_role
+    if not effective_versions:
+        session = get_session()
+        try:
+            agents = session.query(Agent).filter_by(team_id=request.team_id or "default").all()
+            studio_versions = {
+                a.role: (getattr(a, "prompt_version", None) or "v1")
+                for a in agents
+                if (getattr(a, "prompt_version", None) or "v1") != "v1"
+            }
+            if studio_versions:
+                effective_versions = studio_versions
+        finally:
+            session.close()
+
+    runner = RegressionRunner(
+        model=request.model,
+        prompt_version=request.prompt_version,
+        team_id=request.team_id,
+        prompt_versions_by_role=effective_versions,
+    )
+
+    # Use an asyncio Queue to bridge the async generator from run_streaming
+    # with the SSE StreamingResponse generator.
+    queue: asyncio.Queue = asyncio.Queue()
+    SENTINEL = object()
+
+    async def _producer():
+        async def emit(event_type: str, data: dict):
+            await queue.put((event_type, data))
+
+        try:
+            await runner.run_streaming(emit=emit, case_ids=request.case_ids,
+                                       baseline_run_id=request.baseline_run_id)
+        except Exception as e:
+            await queue.put(("error", {"message": str(e)[:500]}))
+        finally:
+            await queue.put(SENTINEL)
+
+    async def event_generator():
+        task = asyncio.create_task(_producer())
+        try:
+            while True:
+                item = await queue.get()
+                if item is SENTINEL:
+                    break
+                evt_type, data = item
+                yield _sse_event(evt_type, data)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/regression/runs")

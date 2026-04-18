@@ -237,6 +237,7 @@ def update_agent_data():
                     session.delete(m)
 
         _migrate_tool_mappings(session)
+        _seed_skill_assignments(session)
         session.commit()
     except Exception:
         session.rollback()
@@ -250,12 +251,36 @@ def update_agent_data():
         from src.agents.prompts import AGENT_DEFINITIONS
         reg = get_registry()
         inserted_v1 = reg.seed_from_definitions(AGENT_DEFINITIONS)
-        cot_roles = ["coder", "planner", "tester", "researcher"]
+        cot_roles = ["coder", "planner", "qa", "researcher"]
         inserted_v2 = reg.seed_cot_v2(cot_roles)
-        if inserted_v1 or inserted_v2:
-            pass  # silently seeded
+        # Drift detection: register a new version for any role whose code prompt
+        # has changed since the last registered version (e.g. after tester removal,
+        # the Coder/DevOps prompts changed but the DB still held the stale v1).
+        synced = reg.sync_from_definitions(AGENT_DEFINITIONS)
+        if inserted_v1 or inserted_v2 or synced:
+            pass  # silently seeded / synced
     except Exception:
         pass  # best-effort; doesn't block startup
+
+
+def _seed_skill_assignments(session):
+    """Idempotently ensure each agent in SKILL_ASSIGNMENTS has the expected skills.
+
+    Unlike seed_defaults() which only runs once, this runs on every startup so new
+    agents (e.g. qa) get their skills even when the DB was initialized before they existed.
+    """
+    from src.db.models import AgentSkillMapping, Agent, Skill
+    from src.agents.prompts import SKILL_ASSIGNMENTS
+
+    for agent_id, skill_ids in SKILL_ASSIGNMENTS:
+        agent = session.query(Agent).filter_by(id=agent_id).first()
+        if agent is None:
+            continue
+        existing = {m.skill_id for m in session.query(AgentSkillMapping).filter_by(agent_id=agent_id).all()}
+        for sid in skill_ids:
+            skill = session.query(Skill).filter_by(id=sid).first()
+            if skill and sid not in existing:
+                session.add(AgentSkillMapping(agent_id=agent_id, skill_id=sid))
 
 
 def _migrate_tool_mappings(session):

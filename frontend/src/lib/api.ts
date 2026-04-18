@@ -131,6 +131,11 @@ export const api = {
   regression: {
     run: (params: { team_id?: string; case_ids?: string[]; model?: string; prompt_version?: string; prompt_versions_by_role?: Record<string, string>; baseline_run_id?: string }) =>
       fetchJSON("/api/regression/run", { method: "POST", body: JSON.stringify(params) }),
+    stream: (
+      params: { team_id?: string; case_ids?: string[]; model?: string; prompt_version?: string; prompt_versions_by_role?: Record<string, string>; baseline_run_id?: string },
+      onEvent: SSECallback,
+      signal?: AbortSignal,
+    ) => consumeSSE("/api/regression/run/stream", params, onEvent, signal),
     runs: () => fetchJSON("/api/regression/runs"),
     results: (runId: string) => fetchJSON(`/api/regression/results/${runId}`),
     caseDetail: (runId: string, caseId: string) => fetchJSON(`/api/regression/results/${runId}/${caseId}`),

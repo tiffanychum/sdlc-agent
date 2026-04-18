@@ -15,6 +15,12 @@ interface SpanInfo {
 }
 interface TraceInfo { trace_id: string; total_latency_ms: number; total_tokens: number; total_cost: number; spans: SpanInfo[] }
 
+/** A single agent's thinking block within a multi-agent turn. */
+interface ThinkingSegment {
+  agent: string;   // role name, e.g. "planner", "coder", "supervisor"
+  text: string;
+}
+
 interface Message {
   role: "user" | "assistant" | "hitl";
   content: string;
@@ -22,6 +28,7 @@ interface Message {
   toolCalls?: ToolCall[];
   trace?: TraceInfo;
   hitl?: HITLData;
+  /** JSON-serialised ThinkingSegment[] for new messages; plain string for legacy. */
   thinkingContent?: string;
 }
 
@@ -232,14 +239,14 @@ export default function ChatPage() {
   const [liveCost, setLiveCost] = useState(0);
   const [liveStartTime, setLiveStartTime] = useState(0);
   const [elapsedFinal, setElapsedFinal] = useState(0);
-  const [thinkingText, setThinkingText] = useState("");
+  const [thinkingSegments, setThinkingSegments] = useState<ThinkingSegment[]>([]);
   const [thinkingCollapsed, setThinkingCollapsed] = useState(false);
   const [pendingHITL, setPendingHITL] = useState<HITLData | null>(null);
   const [activeTrace, setActiveTrace] = useState<TraceInfo | null>(null);
 
   // Ref mirrors for stale-closure-safe reads inside the SSE callback
   const agentRef = useRef<string | null>(null);
-  const thinkingTextRef = useRef("");
+  const thinkingSegmentsRef = useRef<ThinkingSegment[]>([]);
 
   const endRef = useRef<HTMLDivElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
@@ -319,7 +326,7 @@ export default function ChatPage() {
   const resetLiveState = useCallback(() => {
     setLiveSpans([]); setTrajectory([]); setActiveAgent(null); setActiveTool(null);
     setLiveTokens(0); setLiveCost(0);
-    setThinkingText(""); thinkingTextRef.current = "";
+    setThinkingSegments([]); thinkingSegmentsRef.current = [];
     setThinkingCollapsed(false);
     setPendingHITL(null); setElapsedFinal(0); setActiveTrace(null);
     setSelectedMsgIndex(null);
@@ -349,6 +356,12 @@ export default function ChatPage() {
           agent: data.agent, action: "thinking",
           status: "active", timestamp: Date.now(),
         }]);
+        // Start a fresh thinking segment for this agent
+        thinkingSegmentsRef.current = [
+          ...thinkingSegmentsRef.current,
+          { agent: data.agent, text: "" },
+        ];
+        setThinkingSegments([...thinkingSegmentsRef.current]);
         break;
 
       case "agent_end":
@@ -377,10 +390,19 @@ export default function ChatPage() {
         ));
         break;
 
-      case "llm_token":
-        thinkingTextRef.current += data.token;
-        setThinkingText(thinkingTextRef.current);
+      case "llm_token": {
+        const tokenAgent = data.agent || agentRef.current || "unknown";
+        const segs = thinkingSegmentsRef.current;
+        const last = segs[segs.length - 1];
+        if (last && last.agent === tokenAgent) {
+          last.text += data.token;
+        } else {
+          // New agent mid-stream (e.g. supervisor interleaved) — open a new segment
+          segs.push({ agent: tokenAgent, text: data.token });
+        }
+        setThinkingSegments([...segs]);
         break;
+      }
 
       case "trace_span": {
         const spanEvent = data.event;
@@ -398,8 +420,7 @@ export default function ChatPage() {
       }
 
       case "hitl_request": {
-        // Read from ref to avoid stale closure
-        const capturedThinkingHITL = thinkingTextRef.current;
+        const capturedSegsHITL = thinkingSegmentsRef.current.filter(s => s.text.trim());
         setInputLocked(false);
         setStatusText("Waiting for your input...");
         setPendingHITL(data as HITLData);
@@ -409,24 +430,23 @@ export default function ChatPage() {
         }]);
         setMessages(prev => [
           ...prev,
-          ...(capturedThinkingHITL ? [{
+          ...(capturedSegsHITL.length > 0 ? [{
             role: "assistant" as const,
             content: "",
-            thinkingContent: capturedThinkingHITL,
+            thinkingContent: JSON.stringify(capturedSegsHITL),
           }] : []),
           {
             role: "hitl" as const, content: data.message || "Agent needs your input",
             hitl: data as HITLData,
           },
         ]);
-        thinkingTextRef.current = "";
-        setThinkingText("");
+        thinkingSegmentsRef.current = [];
+        setThinkingSegments([]);
         break;
       }
 
       case "response": {
-        // Read from ref to avoid stale closure
-        const capturedThinking = thinkingTextRef.current;
+        const capturedSegs = thinkingSegmentsRef.current.filter(s => s.text.trim());
         setMessages(prev => {
           const next = [...prev, {
             role: "assistant" as const,
@@ -434,22 +454,23 @@ export default function ChatPage() {
             agent: data.agent_used,
             toolCalls: data.tool_calls,
             trace: data.trace,
-            thinkingContent: capturedThinking || undefined,
+            thinkingContent: capturedSegs.length > 0
+              ? JSON.stringify(capturedSegs)
+              : undefined,
           }];
-          // Auto-select this new message so its trace shows immediately
           setSelectedMsgIndex(next.length - 1);
           return next;
         });
         setActiveTrace(data.trace || null);
-        thinkingTextRef.current = "";
-        setThinkingText("");
+        thinkingSegmentsRef.current = [];
+        setThinkingSegments([]);
         break;
       }
 
       case "error":
         setMessages(prev => [...prev, { role: "assistant", content: `Error: ${data.message}` }]);
-        thinkingTextRef.current = "";
-        setThinkingText("");
+        thinkingSegmentsRef.current = [];
+        setThinkingSegments([]);
         break;
 
       case "done":
@@ -510,8 +531,8 @@ export default function ChatPage() {
   function stopProcessing() {
     abortRef.current?.abort();
     setQueryActive(false); setInputLocked(false);
-    thinkingTextRef.current = "";
-    setThinkingText(""); setStatusText("Working...");
+    thinkingSegmentsRef.current = [];
+    setThinkingSegments([]); setStatusText("Working...");
   }
 
   async function send() {
@@ -543,7 +564,7 @@ export default function ChatPage() {
   async function resumeHITL(response: Record<string, any>) {
     if (!threadId) return;
     setPendingHITL(null); setInputLocked(true);
-    setStatusText("Resuming after your input..."); thinkingTextRef.current = ""; setThinkingText("");
+    setStatusText("Resuming after your input..."); thinkingSegmentsRef.current = []; setThinkingSegments([]);
     userNearBottom.current = true;
     abortRef.current = new AbortController();
     try {
@@ -724,42 +745,46 @@ export default function ChatPage() {
             </div>
           ))}
 
-          {/* Live thinking box — stays visible during streaming */}
-          {inputLocked && thinkingText && (
-            <div className="flex justify-start">
-              <div className="max-w-[85%] w-full">
-                <button onClick={() => setThinkingCollapsed(c => !c)}
-                  className="flex items-center gap-1.5 mb-1 text-[11px] text-[var(--text-muted)] hover:text-[var(--text)] transition-colors">
-                  <span className={`transition-transform text-[9px] ${thinkingCollapsed ? "" : "rotate-90"}`}>&#9654;</span>
-                  <span className="h-2 w-2 rounded-full bg-zinc-400 animate-pulse" />
-                  {activeAgent ? `${activeAgent} is thinking...` : "Thinking..."}
-                </button>
-                {!thinkingCollapsed && (
-                  <div className="bg-[#f4f4f5] dark:bg-[#27272a] rounded-xl px-4 py-3 border border-[#e4e4e7] dark:border-[#3f3f46]">
-                    <div className="text-[12px] text-[#71717a] dark:text-[#a1a1aa] leading-relaxed whitespace-pre-wrap font-mono max-h-[200px] overflow-y-auto">
-                      {thinkingText.slice(-2000)}<span className="animate-pulse">|</span>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Processing dots */}
-          {inputLocked && !thinkingText && (
-            <div className="flex justify-start">
-              <div className="card !p-3 flex items-center gap-2.5">
-                <div className="flex gap-1">
-                  <div className="h-2 w-2 rounded-full bg-zinc-400 animate-bounce [animation-delay:0ms]" />
-                  <div className="h-2 w-2 rounded-full bg-zinc-400 animate-bounce [animation-delay:150ms]" />
-                  <div className="h-2 w-2 rounded-full bg-zinc-400 animate-bounce [animation-delay:300ms]" />
-                </div>
-                <span className="text-[13px] text-[var(--text-muted)]">{statusText}</span>
-              </div>
-            </div>
-          )}
           <div ref={endRef} />
         </div>
+
+        {/* ── Thinking overlay — sits BETWEEN messages and input, never displaces messages ── */}
+        {inputLocked && thinkingSegments.length > 0 && (
+          <div className="border-t border-[var(--border)] bg-[#f9f9fa]">
+            <div className="px-4 pt-2 pb-1">
+              <button onClick={() => setThinkingCollapsed(c => !c)}
+                className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)] hover:text-[var(--text)] transition-colors w-full">
+                <span className={`transition-transform text-[9px] shrink-0 ${thinkingCollapsed ? "" : "rotate-90"}`}>&#9654;</span>
+                <span className="h-2 w-2 rounded-full bg-zinc-400 animate-pulse shrink-0" />
+                <span className="font-medium">{activeAgent ? `${activeAgent} is thinking…` : "Thinking…"}</span>
+                <span className="ml-1 text-[9px] text-zinc-400">
+                  {thinkingSegments.reduce((n, s) => n + s.text.length, 0).toLocaleString()} chars
+                  {thinkingSegments.length > 1 && ` · ${thinkingSegments.length} agents`}
+                </span>
+                <span className="ml-auto text-[9px] text-zinc-400">{thinkingCollapsed ? "click to expand" : "click to collapse"}</span>
+              </button>
+            </div>
+            {!thinkingCollapsed && (
+              <div className="px-4 pb-2">
+                <LiveThinkingBox segments={thinkingSegments} />
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Processing dots (when no thinking segments yet) */}
+        {inputLocked && thinkingSegments.length === 0 && (
+          <div className="border-t border-[var(--border)] px-4 py-2.5 bg-[#f9f9fa]">
+            <div className="flex items-center gap-2.5">
+              <div className="flex gap-1">
+                <div className="h-2 w-2 rounded-full bg-zinc-400 animate-bounce [animation-delay:0ms]" />
+                <div className="h-2 w-2 rounded-full bg-zinc-400 animate-bounce [animation-delay:150ms]" />
+                <div className="h-2 w-2 rounded-full bg-zinc-400 animate-bounce [animation-delay:300ms]" />
+              </div>
+              <span className="text-[13px] text-[var(--text-muted)]">{statusText}</span>
+            </div>
+          </div>
+        )}
 
         {/* Input bar */}
         <div className="flex gap-2 px-4 py-2.5 border-t border-[var(--border)]">
@@ -881,11 +906,104 @@ export default function ChatPage() {
 }
 
 
-// ── Thinking History ─────────────────────────────────────────────
-// Starts expanded so users can immediately read the model's reasoning.
+// ── Agent badge helper ────────────────────────────────────────────
+const AGENT_COLORS: Record<string, string> = {
+  planner:         "bg-violet-100 text-violet-700 border-violet-200",
+  coder:           "bg-blue-100 text-blue-700 border-blue-200",
+  tester:          "bg-emerald-100 text-emerald-700 border-emerald-200",
+  devops:          "bg-orange-100 text-orange-700 border-orange-200",
+  project_manager: "bg-amber-100 text-amber-700 border-amber-200",
+  researcher:      "bg-teal-100 text-teal-700 border-teal-200",
+  reviewer:        "bg-pink-100 text-pink-700 border-pink-200",
+  data_analyst:    "bg-cyan-100 text-cyan-700 border-cyan-200",
+  supervisor:      "bg-zinc-200 text-zinc-700 border-zinc-300",
+};
+function agentBadge(agent: string) {
+  return AGENT_COLORS[agent] ?? "bg-zinc-100 text-zinc-600 border-zinc-200";
+}
 
+
+// ── Thinking segments renderer ────────────────────────────────────
+// Shared by both live box and history — renders one block per agent.
+function ThinkingSegmentsView({ segments, isLive }: { segments: ThinkingSegment[]; isLive?: boolean }) {
+  return (
+    <div className="space-y-2">
+      {segments.map((seg, i) => (
+        <div key={i}>
+          {/* Agent label */}
+          <div className="flex items-center gap-1.5 mb-1">
+            <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${agentBadge(seg.agent)}`}>
+              {seg.agent}
+            </span>
+            {isLive && i === segments.length - 1 && (
+              <span className="text-[9px] text-zinc-400 animate-pulse">streaming…</span>
+            )}
+          </div>
+          {/* Content */}
+          <div className="thinking-md text-[12px] text-[#52525b] leading-relaxed pl-1 border-l-2 border-zinc-200">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{seg.text || " "}</ReactMarkdown>
+            {isLive && i === segments.length - 1 && (
+              <span className="inline-block h-3 w-0.5 bg-zinc-400 animate-pulse ml-0.5 align-middle" />
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Parse thinkingContent which may be JSON (new) or a plain string (legacy). */
+function parseThinkingContent(content: string): ThinkingSegment[] {
+  try {
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed)) return parsed as ThinkingSegment[];
+  } catch { /* legacy plain text */ }
+  return [{ agent: "unknown", text: content }];
+}
+
+
+// ── Live thinking box (during streaming) ─────────────────────────
+function LiveThinkingBox({ segments }: { segments: ThinkingSegment[] }) {
+  const boxRef = useRef<HTMLDivElement>(null);
+  const [userScrolled, setUserScrolled] = useState(false);
+
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!userScrolled && el) el.scrollTop = el.scrollHeight;
+  }, [segments, userScrolled]);
+
+  const handleScroll = () => {
+    const el = boxRef.current;
+    if (!el) return;
+    setUserScrolled(el.scrollHeight - el.scrollTop - el.clientHeight > 40);
+  };
+
+  return (
+    <div className="relative">
+      <div ref={boxRef} onScroll={handleScroll}
+        className="rounded-lg border border-[#e4e4e7] bg-white px-4 py-3 max-h-[40vh] overflow-y-auto">
+        <ThinkingSegmentsView segments={segments} isLive />
+      </div>
+      {userScrolled && (
+        <button
+          onClick={() => { setUserScrolled(false); if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight; }}
+          className="absolute bottom-2 right-3 text-[10px] bg-zinc-700 text-white px-2 py-0.5 rounded-full opacity-80 hover:opacity-100 transition-opacity shadow-sm"
+        >
+          ↓ latest
+        </button>
+      )}
+    </div>
+  );
+}
+
+
+// ── Thinking History ─────────────────────────────────────────────
 function ThinkingHistory({ content }: { content: string }) {
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(true);
+  const segments = parseThinkingContent(content);
+  const totalChars = segments.reduce((n, s) => n + s.text.length, 0);
+  const agentLabels = [...new Set(segments.map(s => s.agent))];
+
   return (
     <div className="mb-2">
       <button
@@ -895,12 +1013,17 @@ function ThinkingHistory({ content }: { content: string }) {
         <span className={`transition-transform text-[9px] ${collapsed ? "" : "rotate-90"}`}>&#9654;</span>
         <span className="h-1.5 w-1.5 rounded-full bg-[var(--text-muted)]" />
         {collapsed ? "Show thinking" : "Hide thinking"}
+        {/* Show mini agent badges when collapsed so user knows who thought */}
+        <span className="flex items-center gap-0.5 ml-1">
+          {agentLabels.map(a => (
+            <span key={a} className={`text-[9px] px-1.5 py-0 rounded-full border ${agentBadge(a)}`}>{a}</span>
+          ))}
+        </span>
+        <span className="ml-1 text-[9px] text-zinc-400">{totalChars.toLocaleString()} chars</span>
       </button>
       {!collapsed && (
-        <div className="bg-[#f4f4f5] dark:bg-[#27272a] rounded-xl px-4 py-3 border border-[#e4e4e7] dark:border-[#3f3f46] mb-2">
-          <div className="text-[12px] text-[#71717a] dark:text-[#a1a1aa] leading-relaxed whitespace-pre-wrap font-mono max-h-[240px] overflow-y-auto">
-            {content}
-          </div>
+        <div className="rounded-xl border border-[#e4e4e7] bg-[#fafafa] px-4 py-3 mb-2 max-h-[600px] overflow-y-auto">
+          <ThinkingSegmentsView segments={segments} />
         </div>
       )}
     </div>

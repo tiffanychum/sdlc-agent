@@ -274,6 +274,8 @@ export default function StudioPage() {
   // ── Skill form ───────────────────────────────────────────────────
   const [showSkill, setShowSkill] = useState(false);
   const [skill, setSkill] = useState({ name: "", description: "", instructions: "", trigger_pattern: "" });
+  // Skill content viewer
+  const [viewingSkill, setViewingSkill] = useState<string | null>(null);
 
   // ── Per-agent pending edits (dirty tracking) ─────────────────────
   const [pendingEdits, setPendingEdits] = useState<Record<string, PendingEdit>>({});
@@ -287,21 +289,26 @@ export default function StudioPage() {
   const promptTextCacheRef = useRef(promptTextCache);
   promptTextCacheRef.current = promptTextCache;
 
+  // ── Routing prompts (supervisor / meta_router / router) ─────────
+  const [routingPrompts, setRoutingPrompts] = useState<Record<string, any>>({});
+  const [viewingRoutingPrompt, setViewingRoutingPrompt] = useState<string | null>(null);
+  const [routingPendingVersion, setRoutingPendingVersion] = useState<Record<string, string>>({});
+  const [savingRouting, setSavingRouting] = useState<string | null>(null);
+
   useEffect(() => { load(); }, []);
 
   async function load() {
-    const [t, s, tl, models, llmCfg, allVersions] = await Promise.all([
+    const [t, s, tl, models, llmCfg, allVersions, routing] = await Promise.all([
       api.teams.list(), api.skills.list(), api.tools.list(),
       api.models.list(), api.config.llm(),
       api.prompts.versions().catch(() => ({ roles: {} })),
+      fetch("/api/prompts/routing").then(r => r.json()).catch(() => ({ routing: {} })),
     ]);
     setTeams(t); setSkills(s); setTools(tl);
     setAvailableModels(models);
     setDefaultModelName(llmCfg.default_model_name || llmCfg.default_model || "from .env");
-    // Eagerly populate all role versions so dropdowns work without clicking Edit
-    if (allVersions?.roles) {
-      setAgentVersions(allVersions.roles);
-    }
+    if (allVersions?.roles) setAgentVersions(allVersions.roles);
+    if (routing?.routing) setRoutingPrompts(routing.routing);
     if (t.length > 0 && !team) setTeam(await api.teams.get(t[0].id));
   }
 
@@ -431,6 +438,25 @@ export default function StudioPage() {
   }
 
   async function rebuild() { if (team) await api.teams.rebuild(team.id); }
+
+  // ── Routing prompt operations ─────────────────────────────────────
+  async function saveRoutingVersion(role: string) {
+    const version = routingPendingVersion[role];
+    if (!version) return;
+    setSavingRouting(role);
+    try {
+      await fetch(`/api/prompts/routing/${role}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version }),
+      });
+      const routing = await fetch("/api/prompts/routing").then(r => r.json()).catch(() => ({ routing: {} }));
+      if (routing?.routing) setRoutingPrompts(routing.routing);
+      setRoutingPendingVersion(prev => { const n = { ...prev }; delete n[role]; return n; });
+    } finally {
+      setSavingRouting(null);
+    }
+  }
 
   // ── Skill operations ─────────────────────────────────────────────
   async function createSkill() {
@@ -727,6 +753,73 @@ export default function StudioPage() {
             </div>
           </section>
 
+          {/* Routing Prompts (Supervisor / Meta-Router / Router) */}
+          <section className="card">
+            <div className="mb-3">
+              <h2 className="text-sm font-medium">Routing Prompts</h2>
+              <p className="text-[11px] text-[var(--text-muted)] mt-0.5">Active prompt versions for the supervisor, meta-router, and router. These control how tasks are delegated across agents.</p>
+            </div>
+            <div className="space-y-2.5">
+              {(["supervisor", "meta_router", "router"] as const).map(role => {
+                const rp = routingPrompts[role] || {};
+                const versions: any[] = rp.versions || [];
+                const activeVer = routingPendingVersion[role] ?? (rp.active_version || "v1");
+                const isDirtyRouting = role in routingPendingVersion;
+                return (
+                  <div key={role} className={`rounded-lg border p-3 transition-all ${isDirtyRouting ? "border-amber-300 bg-amber-50/30" : "border-[var(--border)]"}`}>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium capitalize">{role.replace("_", " ")}</span>
+                        {isDirtyRouting && <span className="text-[10px] text-amber-600 font-medium">● unsaved</span>}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <select
+                          value={activeVer}
+                          onChange={e => setRoutingPendingVersion(prev => ({ ...prev, [role]: e.target.value }))}
+                          className="input !py-0.5 !text-xs !w-auto">
+                          {versions.length === 0 && <option value="v1">v1 (baseline)</option>}
+                          {versions.map((v: any) => (
+                            <option key={v.version} value={v.version}>
+                              {v.version}{v.cot_enhanced ? " [CoT]" : ""}{v.created_by === "optimizer" ? " [opt]" : ""}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          onClick={() => setViewingRoutingPrompt(viewingRoutingPrompt === role ? null : role)}
+                          className="text-[10px] text-indigo-600 hover:underline">
+                          {viewingRoutingPrompt === role ? "Hide" : "View"}
+                        </button>
+                        {isDirtyRouting && (
+                          <>
+                            <button
+                              onClick={() => saveRoutingVersion(role)}
+                              disabled={savingRouting === role}
+                              className="btn-primary !text-[11px] !py-0.5 !px-2.5">
+                              {savingRouting === role ? "Saving…" : "Save"}
+                            </button>
+                            <button
+                              onClick={() => setRoutingPendingVersion(prev => { const n = { ...prev }; delete n[role]; return n; })}
+                              className="btn-ghost !text-[11px] !py-0.5 !px-2">Discard</button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                    {viewingRoutingPrompt === role && rp.text && (
+                      <div className="mt-2.5 bg-zinc-50 border border-zinc-200 rounded p-2.5">
+                        <div className="text-[10px] font-medium text-zinc-500 uppercase tracking-wide mb-1">
+                          {role} @ {activeVer}
+                        </div>
+                        <pre className="text-[11px] text-zinc-700 whitespace-pre-wrap leading-relaxed max-h-60 overflow-y-auto">
+                          {rp.text}
+                        </pre>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+
           {/* Skills */}
           <section className="card">
             <div className="flex items-center justify-between mb-2">
@@ -739,9 +832,24 @@ export default function StudioPage() {
             <div className="grid grid-cols-3 gap-2">
               {skills.map(s => (
                 <div key={s.id} className="p-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg)]">
-                  <div className="text-sm font-medium">{s.name}</div>
+                  <div className="flex items-center justify-between">
+                    <div className="text-sm font-medium">{s.name}</div>
+                    <button
+                      onClick={() => setViewingSkill(viewingSkill === s.id ? null : s.id)}
+                      className="text-[10px] text-indigo-600 hover:underline ml-2 flex-shrink-0">
+                      {viewingSkill === s.id ? "Hide" : "View"}
+                    </button>
+                  </div>
                   <p className="text-[11px] text-[var(--text-muted)] mt-0.5 line-clamp-2">{s.description}</p>
                   {s.trigger_pattern && <div className="text-[10px] text-[var(--warning)] mt-0.5">trigger: &quot;{s.trigger_pattern}&quot;</div>}
+                  {viewingSkill === s.id && s.instructions && (
+                    <div className="mt-2 bg-zinc-50 border border-zinc-200 rounded p-2">
+                      <div className="text-[10px] font-medium text-zinc-500 uppercase tracking-wide mb-1">Instructions</div>
+                      <pre className="text-[11px] text-zinc-700 whitespace-pre-wrap leading-relaxed max-h-40 overflow-y-auto">
+                        {s.instructions}
+                      </pre>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

@@ -59,6 +59,21 @@ async def _git(command: str, cwd: str = WORKSPACE_ROOT) -> str:
         # "nothing to commit" is idempotent — treat as success so the agent can continue.
         if "nothing to commit" in combined or "nothing added to commit" in combined:
             return f"Nothing to commit — working tree already clean. {combined}"
+        # Paths outside the workspace git repo (e.g. /tmp/calc-app/) are a common
+        # pattern for standalone scratch projects built by Coder. Return a soft
+        # informational message instead of crashing the supervisor flow — the
+        # agent can acknowledge that git is not applicable and move on.
+        if "is outside repository" in combined or "outside of repository" in combined:
+            return (
+                "NOTE: target path is outside the main repository — git operations "
+                "do not apply to standalone scratch projects. Skip git and continue. "
+                f"(raw: {combined[:200]})"
+            )
+        if "not a git repository" in combined.lower():
+            return (
+                "NOTE: working directory is not a git repository. Skip git and "
+                f"continue without committing. (raw: {combined[:200]})"
+            )
         raise RuntimeError(f"git {command} failed (exit {proc.returncode}): {combined}")
     return stdout_str
 

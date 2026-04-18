@@ -96,7 +96,7 @@
     "id": "golden_004",
     "name": "Run test suite",
     "prompt": "Run the test suite and report the results",
-    "expected_agent": "tester",
+    "expected_agent": "coder",
     "expected_tools": [
       "run_tests"
     ],
@@ -107,7 +107,7 @@
       "pytest"
     ],
     "expected_delegation_pattern": [
-      "tester"
+      "coder"
     ],
     "quality_thresholds": {
       "semantic_similarity": 0.65,
@@ -316,7 +316,7 @@
     "id": "golden_011",
     "name": "Run command and analyze output",
     "prompt": "Run 'python -m pytest tests/test_mcp_communication.py -v --tb=short' and explain which tests pass and which fail, and why",
-    "expected_agent": "tester",
+    "expected_agent": "coder",
     "expected_tools": [
       "run_command"
     ],
@@ -328,17 +328,17 @@
       "result"
     ],
     "expected_delegation_pattern": [
-      "tester"
+      "coder"
     ],
     "quality_thresholds": {
-      "semantic_similarity": 0.65,
-      "completeness": 0.7,
-      "correctness": 0.8
+      "semantic_similarity": 0.6,
+      "completeness": 0.65,
+      "correctness": 0.75
     },
-    "max_llm_calls": 5,
-    "max_tool_calls": 3,
-    "max_tokens": 20000,
-    "max_latency_ms": 60000,
+    "max_llm_calls": 8,
+    "max_tool_calls": 5,
+    "max_tokens": 40000,
+    "max_latency_ms": 120000,
     "complexity": "quick",
     "version": "3.0",
     "reference_output": "**Command**: `python -m pytest tests/test_mcp_communication.py -v --tb=short`\n\n**Results**:\n- Individual pass/fail status listed per test function\n- Coverage: filesystem, shell, web, and cross-server MCP tests\n- **Exit code**: `0` (all pass) or non-zero (failures)\n\nFor each failure:\n- Test name and assertion that failed\n- Short traceback (`--tb=short`)\n- Brief root-cause explanation"
@@ -711,7 +711,7 @@
     "max_latency_ms": 300000,
     "complexity": "complex",
     "version": "4.1",
-    "reference_output": "Multi-agent workflow completed:\n\n**Coder** implemented `utils/validate.py`:\n```python\nimport re\nEMAIL_RE = re.compile(r'^[\\w.+-]+@[\\w-]+\\.[\\w.]+$')\ndef validate_email(email: str) -> bool:\n    return bool(EMAIL_RE.match(email))\n```\n\n**Tester** wrote and ran `tests/test_validate.py`:\n- 4 test functions: valid email, missing @, missing domain, empty string\n- Results: 4 passed ✅\n\n**DevOps** committed:\n- `git commit -m 'feat: add validate_email() utility with pytest coverage'`\n- Staged: utils/validate.py, tests/test_validate.py"
+    "reference_output": "Multi-agent workflow completed:\n\n**Coder** implemented `utils/validate.py` and wrote + ran unit tests:\n```python\nimport re\nEMAIL_RE = re.compile(r'^[\\w.+-]+@[\\w-]+\\.[\\w.]+$')\ndef validate_email(email: str) -> bool:\n    return bool(EMAIL_RE.match(email))\n```\n`tests/test_validate.py`: 4 test functions (valid email, missing @, missing domain, empty string) — Results: 4 passed ✅\n\n**DevOps** committed:\n- `git commit -m 'feat: add validate_email() utility with pytest coverage'`\n- Staged: utils/validate.py, tests/test_validate.py"
   },
   {
     "id": "golden_023",
@@ -764,7 +764,7 @@
     ],
     "expected_delegation_pattern": [
       "reviewer",
-      "tester"
+      "coder"
     ],
     "quality_thresholds": {
       "semantic_similarity": 0.55,
@@ -776,8 +776,8 @@
     "max_tokens": 200000,
     "max_latency_ms": 300000,
     "complexity": "medium",
-    "version": "4.1",
-    "reference_output": "**Reviewer** assessed `src/orchestrator.py`:\n\nSUMMARY: Code is well-structured with clean dispatch table patterns. Two warnings found.\n\nFINDINGS:\n- WARNING: N+1 query pattern in agent-loading loop (line ~167) — use single JOIN query\n- INFO: `strategy_hint` guard is redundant — `_strategy_instruction()` never returns empty string\n\nVERIFIED: HITL wrap uses `elif` correctly; supervisor has max_iterations guard; routing rules are clear.\n\nRECOMMENDATIONS:\n1. Replace per-agent `session.query(AgentToolMapping)` loop with a single bulk query\n\n**Tester** ran `tests/test_orchestrator.py`:\n- Results: X passed, 0 failed ✅\n- All orchestrator unit tests passing."
+    "version": "4.2",
+    "reference_output": "**Reviewer** assessed `src/orchestrator.py`:\n\nSUMMARY: Code is well-structured with clean dispatch table patterns. Two warnings found.\n\nFINDINGS:\n- WARNING: N+1 query pattern in agent-loading loop (line ~167) — use single JOIN query\n- INFO: `strategy_hint` guard is redundant — `_strategy_instruction()` never returns empty string\n\nVERIFIED: HITL wrap uses `elif` correctly; supervisor has max_iterations guard; routing rules are clear.\n\nRECOMMENDATIONS:\n1. Replace per-agent `session.query(AgentToolMapping)` loop with a single bulk query\n\n**Coder** ran `tests/test_orchestrator.py`:\n- Results: X passed, 0 failed ✅\n- All orchestrator unit tests passing."
   },
   {
     "id": "golden_025",
@@ -804,7 +804,7 @@
     "max_latency_ms": 900000,
     "complexity": "complex",
     "version": "4.2",
-    "reference_output": "Full SDLC multi-agent workflow completed:\n\n**Coder** implemented `utils/retry.py`:\n```python\nimport time, functools\ndef retry(max_attempts=3, delay=0.0, exceptions=(Exception,)):\n    def decorator(fn):\n        @functools.wraps(fn)\n        def wrapper(*args, **kwargs):\n            for attempt in range(1, max_attempts + 1):\n                try:\n                    return fn(*args, **kwargs)\n                except exceptions as e:\n                    if attempt == max_attempts:\n                        raise\n                    time.sleep(delay)\n        return wrapper\n    return decorator\n```\n\n**Tester** wrote and ran `tests/test_retry.py`:\n- 5 test functions: success on first try, success after 2 retries, exhausted retries, delay, specific exception type\n- Results: 5 passed ✅\n\n**Reviewer** assessed: Code is clean. One INFO: consider adding type hints.\n\n**DevOps** pushed to GitHub:\n- Branch: `feature/retry-util` (from `main`)\n- Files: `utils/retry.py`, `tests/test_retry.py`\n- PR: [feat: add retry() decorator utility](https://github.com/tiffanychum/sdlc-agent-integration-test/pull/X) | State: open"
+    "reference_output": "Full SDLC multi-agent workflow completed:\n\n**Coder** implemented `utils/retry.py` and wrote + ran unit tests:\n```python\nimport time, functools\ndef retry(max_attempts=3, delay=0.0, exceptions=(Exception,)):\n    def decorator(fn):\n        @functools.wraps(fn)\n        def wrapper(*args, **kwargs):\n            for attempt in range(1, max_attempts + 1):\n                try:\n                    return fn(*args, **kwargs)\n                except exceptions as e:\n                    if attempt == max_attempts:\n                        raise\n                    time.sleep(delay)\n        return wrapper\n    return decorator\n```\n`tests/test_retry.py`: 5 test functions — Results: 5 passed ✅\n\n**Reviewer** assessed: Code is clean. One INFO: consider adding type hints.\n\n**DevOps** pushed to GitHub:\n- Branch: `feature/retry-util` (from `main`)\n- Files: `utils/retry.py`, `tests/test_retry.py`\n- PR: [feat: add retry() decorator utility](https://github.com/tiffanychum/sdlc-agent-integration-test/pull/X) | State: open"
   },
   {
     "id": "golden_026",
@@ -967,9 +967,7 @@
     ],
     "expected_delegation_pattern": [
       "planner",
-      "devops",
       "coder",
-      "tester",
       "devops"
     ],
     "quality_thresholds": {
@@ -982,7 +980,7 @@
     "max_tokens": 250000,
     "max_latency_ms": 900000,
     "complexity": "e2e",
-    "version": "1.0",
+    "version": "1.1",
     "reference_output": "## Task Manager App — Build Complete\n\n### Jira Tickets Created\n- SDLC-XX: Epic — Task Manager MVP\n- SDLC-XY: Story — Backend API\n- SDLC-XZ: Story — Frontend UI\n\n### Files Created (/tmp/sdlc-task-manager/)\n- main.py — FastAPI with GET /tasks, POST /tasks, DELETE /tasks/{id}\n- index.html — Single-page HTML with fetch()-based CRUD UI\n- requirements.txt\n- tests/test_main.py — 3 pytest tests\n\n### Test Results\n```\ntests/test_main.py::test_list_tasks_empty PASSED\ntests/test_main.py::test_create_task PASSED\ntests/test_main.py::test_delete_task PASSED\n3 passed\n```\n\n### index.html\n```html\n<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"UTF-8\"><title>Task Manager</title></head>\n<body>\n<h1>Task Manager</h1>\n<input id=\"title\" placeholder=\"New task...\">\n<button onclick=\"addTask()\">Add</button>\n<ul id=\"tasks\"></ul>\n<script>\nasync function fetchTasks(){...}\nasync function addTask(){...}\nasync function deleteTask(id){...}\nfetchTasks();\n</script>\n</body>\n</html>\n```\n\n### GitHub\nRepository created: https://github.com/tiffanychum/sdlc-task-manager\nAll files committed and pushed to main branch."
   },
   {
@@ -1116,5 +1114,82 @@
       "Minimum acceptable score?": "0.7"
     },
     "reference_output": "## PromptOptimizer Report\n\n### Setup Summary\nRole: coder | Metric: step_efficiency | Threshold: 0.7 | Version: latest\n\n### Bootstrap\nBaseline regression run on golden_001, golden_004, golden_005, golden_006, golden_021 (no prior data for this version).\n\n### Iteration Summary\n| Cycle | Version | Pass Rate | Avg step_efficiency | Δ vs Baseline |\n|-------|---------|-----------|---------------------|---------------|\n| 0 (baseline) | v_orig | ~60% | ~0.58 | — |\n| 1 | vN+1 | ~70% | ~0.67 | +0.09 |\n\n### Root Cause Analysis\nLow step_efficiency caused by: (1) no explicit read-before-write constraint, (2) no tool-call budget awareness.\n\n### Changes Made\n- Added: NEVER call write_file without first calling read_file\n- Added: SITUATION/PLAN/EXECUTE/VERIFY CoT headers\n- Added: tool call budget tracking\n\n### Final Recommendation\nAdopt vN+1: step_efficiency improved from 0.58 → 0.67 (+16%).\n\n### Prompt Diff\n[diff output between v_original and v_final]"
+  },
+  {
+    "id": "golden_034",
+    "name": "QA happy path: coder builds calculator API → QA approves in round 1",
+    "prompt": "Please have the coder agent write a new FastAPI calculator service into /tmp/calc-app/ (the directory does not exist yet — write files directly there). The app needs exactly one endpoint: POST /calculate with JSON body {\"op\": \"add\"|\"subtract\"|\"multiply\"|\"divide\", \"a\": number, \"b\": number} → returns {\"result\": number}. Divide-by-zero must return HTTP 400 {\"error\": \"division by zero\"}. Include requirements.txt (fastapi, uvicorn, httpx, pytest, pytest-asyncio, starlette). Once the code is written, have the qa agent do a full QA pass: run E2E tests covering all 4 ops and the divide-by-zero edge case, a performance test with 10 concurrent requests, and static analysis. Store QA artifacts in /tmp/calc-app/qa/ and write a final QA report qa_round1.md. If all checks pass, emit QA_STATUS: APPROVED.",
+    "strategy": "supervisor",
+    "expected_strategy": "supervisor",
+    "expected_agent": "coder",
+    "expected_tools": [
+      "write_file",
+      "run_command"
+    ],
+    "expected_output_keywords": [
+      "/tmp/calc-app",
+      "POST /calculate",
+      "divide",
+      "400",
+      "QA_STATUS: APPROVED",
+      "qa_round1.md",
+      "passed"
+    ],
+    "expected_delegation_pattern": [
+      "coder",
+      "qa"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.45,
+      "completeness": 0.5,
+      "correctness": 0.55
+    },
+    "max_llm_calls": 80,
+    "max_tool_calls": 80,
+    "max_tokens": 600000,
+    "max_latency_ms": 900000,
+    "complexity": "complex",
+    "version": "1.0",
+    "reference_output": "## Calculator API — QA Complete\n\n### Coder Output\nFiles written to /tmp/calc-app/:\n- `main.py` — FastAPI app with POST /calculate endpoint, handles add/subtract/multiply/divide, returns 400 for division by zero\n- `tests/test_main.py` — 5 unit tests (all 4 ops + div-by-zero): 5 passed ✅\n- `requirements.txt`\n\n### QA Round 1 Results\n**Static Analysis**: 0 violations (flake8 clean)\n**Unit Test Verification**: 5 passed ✅\n**E2E Tests** (tests/qa/qa_e2e_round1.py): 5/5 passed ✅\n  - test_add: POST /calculate {op:add, a:10, b:3} → {result:13} ✅\n  - test_subtract: → {result:7} ✅\n  - test_multiply: → {result:30} ✅\n  - test_divide: → {result:3.333} ✅\n  - test_divide_by_zero: → 400 {error: division by zero} ✅\n**Performance** (10 concurrent requests):\n  | p50 | p95 | p99 | RPS |\n  |-----|-----|-----|-----|\n  | 12ms | 28ms | 45ms | 380 |\n**Defects**: None found\n\n**QA Report**: /tmp/calc-app/qa/qa_round1.md written\n\nQA_STATUS: APPROVED"
+  },
+  {
+    "id": "golden_035",
+    "name": "QA bug-fix cycle: coder builds URL shortener with redirect bug → QA finds it → coder fixes → QA approves",
+    "prompt": "Create a new project at /tmp/url-shortener/ (the directory does not exist yet — create it by writing files there). Build a URL shortener service with these endpoints:\n1. POST /shorten with body {\"url\": \"https://example.com\"} → returns {\"short_code\": \"abc123\", \"short_url\": \"http://localhost:8000/abc123\"}\n2. GET /{short_code} → MUST return HTTP 301 redirect to the original URL (not a 200 with the URL in the body)\n3. GET /stats/{short_code} → returns {\"short_code\": \"abc123\", \"original_url\": \"...\", \"hits\": N}\n4. Use an in-memory dict for storage. No database needed.\n5. requirements.txt: fastapi, uvicorn, httpx, pytest, pytest-asyncio, starlette\n\nAfter building, run a full QA pass. QA should check redirect correctness (status code must be 301/302, not 200), E2E test all endpoints, run a performance test, and write a QA report to /tmp/url-shortener/qa/. If QA finds bugs, coder should fix them and QA should re-validate. Continue until QA_STATUS: APPROVED.",
+    "strategy": "supervisor",
+    "expected_strategy": "supervisor",
+    "expected_agent": "coder",
+    "expected_tools": [
+      "write_file",
+      "run_tests",
+      "run_command"
+    ],
+    "expected_output_keywords": [
+      "/tmp/url-shortener",
+      "POST /shorten",
+      "301",
+      "redirect",
+      "short_code",
+      "hits",
+      "QA_STATUS: APPROVED",
+      "qa_round1.md",
+      "RedirectResponse"
+    ],
+    "expected_delegation_pattern": [
+      "coder",
+      "qa"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.4,
+      "completeness": 0.45,
+      "correctness": 0.5
+    },
+    "max_llm_calls": 120,
+    "max_tool_calls": 100,
+    "max_tokens": 900000,
+    "max_latency_ms": 1200000,
+    "complexity": "e2e",
+    "version": "1.0",
+    "reference_output": "## URL Shortener — QA Cycle Complete\n\n### Coder Round 1\nFiles written to /tmp/url-shortener/:\n- `main.py` — FastAPI app with POST /shorten, GET /{short_code} (initially returns 200 body — BUG), GET /stats/{short_code}\n- `tests/test_main.py` — unit tests pass (miss redirect bug because TestClient follows redirects)\n- `requirements.txt`\n\n### QA Round 1 — NEEDS_FIX\n**E2E Defect Found**:\n| ID | Severity | Description | Reproduction |\n|----|----------|-------------|-------------|\n| D001 | CRITICAL | GET /{short_code} returns HTTP 200 with URL in body instead of HTTP 301 redirect | curl -I http://localhost/abc123 → 200 OK (expected 301 Moved Permanently) |\n\nQA Report: /tmp/url-shortener/qa/qa_round1.md\nQA_STATUS: NEEDS_FIX\n\n### Coder Round 2 — Fix Applied\nFixed `main.py`: changed `GET /{short_code}` to return `RedirectResponse(url=original_url, status_code=301)`\nUnit tests updated to check status_code=301 and Location header.\n\n### QA Round 2 — APPROVED\n**E2E Tests** (tests/qa/qa_e2e_round2.py): 4/4 passed ✅\n  - test_shorten: POST /shorten → {short_code, short_url} ✅\n  - test_redirect: GET /{short_code} → 301 Location: https://example.com ✅\n  - test_stats: GET /stats/{short_code} → {hits: 1} after redirect ✅\n  - test_not_found: GET /missing → 404 ✅\n**Performance**: p50=15ms, p95=32ms — within thresholds ✅\n**Defects**: 0 remaining\n\nQA Report: /tmp/url-shortener/qa/qa_round2.md\nQA_STATUS: APPROVED"
   }
 ]

@@ -243,6 +243,10 @@ class OrchestratorState(TypedDict):
     # then marks each agent's role into completed_steps after it runs.
     required_steps: Annotated[list[str], _take_last]
     completed_steps: Annotated[list[str], _merge_step_sets]
+    # QA iteration tracking: supports the coder → qa → coder → qa cycle (max 3 rounds).
+    qa_iterations: Annotated[int, _take_last]
+    qa_needs_fix: Annotated[bool, _take_last]
+    qa_bug_report: Annotated[str, _take_last]
 
 
 def _build_router_prompt(agents_config: list[dict]) -> str:
@@ -254,10 +258,16 @@ In a supervisor workflow, additional agents can be invoked afterward — you onl
 Available agents:
 {agent_descs}
 
-Routing rules (apply in strict priority order):
+Routing rules (apply in strict priority order — STOP at the first match):
+
+## Running tests / test suites (HIGHEST PRIORITY for test execution)
+1. Task asks to run tests, run the test suite, execute pytest/jest/unittest, run `python -m pytest`,
+   verify tests, or check test results — **ALWAYS → "coder"**.
+   Devops does NOT run tests. Examples: "run the test suite", "run tests", "execute pytest",
+   "run python -m pytest foo_test.py", "verify the tests pass".
 
 ## Jira operations
-1. Task involves ANY Jira work — creating/managing projects, epics, stories, tasks, assigning
+2. Task involves ANY Jira work — creating/managing projects, epics, stories, tasks, assigning
    tickets, updating status, OR decomposing a feature into dev tasks with acceptance criteria
    → route to "project_manager".
    (project_manager handles both project setup AND story decomposition)
@@ -286,10 +296,11 @@ Routing rules (apply in strict priority order):
 
 ## Source control & GitHub
 7. Task involves ONLY git or GitHub operations: commit, push, create branch, open PR, list repos,
-   check git status/log/diff — with no code to write → "devops".
+   check git status/log/diff — with no code to write and no tests to run → "devops".
+   (If the task mentions running tests, rule 1 applies — route to coder.)
 
-## Testing
-8. Task asks to write tests for existing code, run the test suite, or verify test results → "tester".
+## Independent QA validation
+8. Task asks for QA, E2E testing, performance testing, load testing, or a QA report → "qa".
 
 ## Implementation
 9. Task asks to write, edit, implement, or fix source code files → "coder".
@@ -300,7 +311,7 @@ Routing rules (apply in strict priority order):
 
 ## Defaults
 - If the task starts with implementation AND also mentions testing/git: route to "coder" first
-  (supervisor will invoke "tester" and "devops" in subsequent turns).
+  (coder writes code + unit tests; supervisor will invoke "qa" and "devops" in subsequent turns).
 - If genuinely unclear: "planner".
 
 Respond with ONLY the agent name from: {agent_names}."""
@@ -369,11 +380,26 @@ def _build_handoff_context(state: OrchestratorState, current_role: str) -> str |
             "Proceed directly with your task — do NOT call ask_human for anything already confirmed above."
         )
 
+    # Inject QA bug report when coder is being called back after a QA NEEDS_FIX verdict.
+    qa_bug_section = ""
+    if current_role == "coder":
+        qa_bug_report = state.get("qa_bug_report", "")
+        if qa_bug_report:
+            qa_iterations = state.get("qa_iterations", 0)
+            qa_bug_section = (
+                f"\n\nBUG REPORT FROM QA (round {qa_iterations} — fix ALL defects before QA re-validates):\n"
+                + qa_bug_report
+                + "\n⚠ Fix every CRITICAL and HIGH defect listed above. "
+                "Do NOT ask for clarification — the defect log is your specification. "
+                "After fixing, run the unit tests to confirm they still pass."
+            )
+
     return (
         header
         + "WORKFLOW CONTEXT — completed by prior agents (do NOT repeat this work):\n"
         + "\n".join(lines)
         + hitl_section
+        + qa_bug_section
         + f"\n\nYOUR TASK: You are the {current_role}. Focus only on what has NOT been "
         "done yet and pick up exactly where the previous agent left off."
     )
@@ -422,7 +448,7 @@ def _make_agent_executor(role: str, built_agents: dict):
             if not model_used:
                 model_used = meta.get("model_name") or meta.get("model") or ""
 
-        return {
+        state_update: dict = {
             "messages": out_messages,
             "selected_agent": role,
             "agent_trace": [{
@@ -439,6 +465,34 @@ def _make_agent_executor(role: str, built_agents: dict):
             # Mark this agent as completed in the ReAct step tracker
             "completed_steps": [role],
         }
+
+        # Parse QA verdict from QA agent's output so the supervisor can cycle
+        # back to coder if NEEDS_FIX, or proceed to DONE/devops if APPROVED.
+        if role == "qa":
+            qa_text = " ".join(
+                _extract_text(m.content)
+                for m in out_messages
+                if isinstance(m, AIMessage)
+            )
+            if "QA_STATUS: NEEDS_FIX" in qa_text:
+                # Extract the bug report (everything after the defect log header)
+                bug_report = ""
+                for marker in ("## Defect Log", "Defect Log", "BUG REPORT", "NEEDS_FIX"):
+                    idx = qa_text.find(marker)
+                    if idx != -1:
+                        bug_report = qa_text[idx:]
+                        break
+                if not bug_report:
+                    bug_report = qa_text[-3000:]  # last 3000 chars as fallback
+                state_update["qa_needs_fix"] = True
+                state_update["qa_bug_report"] = bug_report
+                logger.info("QA emitted NEEDS_FIX — bug report captured (%d chars).", len(bug_report))
+            elif "QA_STATUS: APPROVED" in qa_text:
+                state_update["qa_needs_fix"] = False
+                state_update["qa_bug_report"] = ""
+                logger.info("QA emitted APPROVED.")
+
+        return state_update
     return execute
 
 
@@ -565,10 +619,18 @@ async def build_orchestrator_from_team(
         from src.prompts.registry import get_registry as _get_registry
         _reg = _get_registry()
         # Seed routing prompts on first run (idempotent) using module-level prompt templates
+        _router_prompt_text = _build_router_prompt(agents_config)
         _reg.seed_routing_prompts(
             supervisor_prompt=_META_ROUTER_PROMPT,   # meta-router strategy selection
             meta_router_prompt=_META_ROUTER_PROMPT,  # same template, versioned separately
-            router_prompt=_build_router_prompt(agents_config),  # single-agent router
+            router_prompt=_router_prompt_text,        # single-agent router
+        )
+        # Drift detection — bump to a new version if the code prompt has changed
+        # (e.g. after the tester→coder/qa merge the router prompt was updated).
+        _reg.sync_routing_prompts(
+            supervisor_prompt=_META_ROUTER_PROMPT,
+            meta_router_prompt=_META_ROUTER_PROMPT,
+            router_prompt=_router_prompt_text,
         )
         for role in ("supervisor", "meta_router", "router"):
             ver = (routing_prompt_versions or {}).get(role)
@@ -810,41 +872,43 @@ Agents and their capabilities:
 {agent_descs}
 
 Tool routing rules (delegate only to agents that HAVE the right tools):
-- Writing source code files (.py, .html, .ts, .js, etc.) → "coder"
+- Writing source code files (.py, .html, .ts, .js, etc.) AND unit tests → "coder"
   ❌ If source files need to be created and coder has NOT run yet → next agent MUST be "coder"
   ❌ NEVER route file creation to planner, devops, or project_manager
-- Running tests (pytest, jest, etc.) → "tester"
-  ❌ tester MUST run AFTER coder, BEFORE devops on any build task
-  ❌ NEVER use devops to run pytest or any test suite
+- Independent QA validation (E2E tests, performance tests, static analysis, QA report) → "qa"
+  ❌ qa runs AFTER coder — never before coder has implemented the code
+  ❌ qa NEVER writes production code; it only files defect reports
+  ✅ After qa emits NEEDS_FIX, route back to "coder" for fixes, then back to "qa" (max 3 rounds)
+  ✅ After qa emits APPROVED (or round 3 completes), proceed to "devops" or DONE
 - Git/GitHub (commit, push, PR, branch) → "devops"
-  devops runs LAST — only after coder and tester have finished their work
+  devops runs LAST — only after coder (and qa if requested) have finished their work
 - Web research → "researcher"
 - Jira tickets (epics, stories, dev tasks, acceptance criteria) → "project_manager"
 - Multi-file analysis, architecture audit, cross-concern coordination → "planner"
   planner reads files for context ONLY — it does NOT create or write files
 
 For full build/implementation tasks, enforce this STRICT sequential order:
-  1. planner   — FIRST: read architecture, create the step-by-step plan
+  1. planner        — FIRST: read architecture, create the step-by-step plan
   2. project_manager — SECOND (if Jira work is requested): create epics/stories
-  3. coder     — THIRD: implement ALL source code files (write_file for every .py, .html, etc.)
-  4. tester    — FOURTH: run the test suite (run_tests/run_command for pytest)
-  5. devops    — FIFTH/LAST: git commit + push + GitHub repo creation
+  3. coder          — THIRD: implement ALL source code files + unit tests
+  4. qa             — FOURTH (if QA is requested): E2E/perf/static QA pass; may cycle with coder
+  5. devops         — FIFTH/LAST: git commit + push + GitHub repo creation
 
 ⚠️ If NO prior agent has run yet and the task involves planning + coding + deployment:
    → ALWAYS start with "planner". Never start with coder when no plan exists yet.
 
 ⚠️ If planner has run but coder has NOT run yet and source files still need to be written:
-   → Next agent MUST be "coder". Do not route to devops or tester before coder writes files.
+   → Next agent MUST be "coder". Do not route to devops or qa before coder writes files.
 
-⚠️ If coder has run but tester has NOT run yet:
-   → Next agent MUST be "tester". Do not route to devops before tests pass.
+⚠️ If coder has run and qa is required but has NOT run yet:
+   → Next agent MUST be "qa". Do not route to devops before QA approves.
 
 Before deciding, answer these two questions internally:
 1. What has each prior agent actually completed? (check conversation above for tool calls made)
 2. Which step in the build pipeline is still missing?
 
 Then reply with EXACTLY ONE of:
-- "DONE" — if ALL deliverables are complete (plan created, Jira done, files written, tests run, git pushed)
+- "DONE" — if ALL deliverables are complete (plan created, Jira done, files written, QA approved, git pushed)
 - A single agent name — if any step remains
 
 Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
@@ -875,9 +939,14 @@ Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
             "research", "search", "find", "look up", "investigate", "latency",
             "performance", "playbook", "anomaly", "attribution",
         ))
+        needs_qa = any(kw in text for kw in (
+            "qa", "quality assurance", "e2e", "end-to-end", "end2end",
+            "performance test", "load test", "qa report", "qa pass",
+            "qa round", "independent qa", "qa gate",
+        ))
 
         # Pure test-execution task: "run the test suite", "run tests", "run pytest" etc.
-        # These are single-agent tasks — route directly to tester with no pipeline.
+        # These are single-agent tasks — route directly to coder with no pipeline.
         is_pure_test = (
             needs_testing
             and not is_build_task
@@ -885,13 +954,30 @@ Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
             and not needs_jira
             and not needs_git
             and not needs_research
+            and not needs_qa
         )
         if is_pure_test:
-            steps.append("tester")
+            steps.append("coder")
             return steps
 
-        # Build up the required sequence for multi-step pipeline tasks
-        if needs_planning or (is_build_task and not needs_research):
+        # Build up the required sequence for multi-step pipeline tasks.
+        #
+        # Planner is only added when the user EXPLICITLY asks for planning
+        # (keywords: plan / architect / design / analyze / audit). We no longer
+        # auto-add planner for every build task — when the prompt directly names
+        # agents ("have the coder do X; have the qa do Y") a planner step is pure
+        # overhead and can mis-lead the supervisor LLM into project_manager/
+        # researcher detours.
+        text_lower = text
+        names_coder = any(
+            kw in text_lower for kw in ("coder agent", "the coder", "have coder")
+        )
+        names_qa = any(
+            kw in text_lower for kw in ("qa agent", "the qa", "have qa")
+        )
+        explicit_agent_naming = names_coder or names_qa
+
+        if needs_planning and not explicit_agent_naming:
             steps.append("planner")
         if needs_jira:
             steps.append("project_manager")
@@ -899,8 +985,10 @@ Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
             steps.append("coder")
         if needs_research:
             steps.append("researcher")
-        if needs_testing and is_build_task:
-            steps.append("tester")
+        if needs_testing and is_build_task and not needs_qa:
+            steps.append("coder")  # coder now handles unit tests inline
+        if needs_qa:
+            steps.append("qa")
         if needs_git:
             steps.append("devops")
 
@@ -948,6 +1036,37 @@ Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
         for agent in agents_run:
             if agent not in new_completed and agent in valid_roles:
                 new_completed.append(agent)
+
+        # ── QA Cycle Check ─────────────────────────────────────────────────────
+        # If QA just ran and emitted NEEDS_FIX, remove qa and coder from
+        # completed_steps so the supervisor re-routes to coder (for the fix),
+        # then back to qa (for re-validation). Max 3 QA rounds total.
+        qa_needs_fix = state.get("qa_needs_fix", False)
+        qa_iterations = state.get("qa_iterations", 0)
+        if qa_needs_fix and "qa" in new_completed and qa_iterations < 3:
+            new_qa_iterations = qa_iterations + 1
+            logger.info(
+                "QA NEEDS_FIX detected (iteration %d/3) — cycling coder back for fixes.",
+                new_qa_iterations,
+            )
+            # Remove both qa and coder so they appear in "pending" again
+            new_completed = [s for s in new_completed if s not in ("qa", "coder")]
+            return {
+                "selected_agent": "coder",
+                "agent_trace": [{
+                    "step": "supervisor",
+                    "decision": "coder",
+                    "method": "qa_cycle",
+                    "qa_iteration": new_qa_iterations,
+                    "required": required,
+                    "completed": new_completed,
+                }],
+                "supervisor_iterations": 1,
+                "required_steps": required,
+                "completed_steps": new_completed,
+                "qa_iterations": new_qa_iterations,
+                "qa_needs_fix": False,  # reset — executor will re-set if QA flags again
+            }
 
         # ── ReAct Step 3: Diff required vs completed → next step ──────────────
         # If we have a required pipeline, pick the next un-completed step.

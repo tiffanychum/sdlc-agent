@@ -1,6 +1,7 @@
 "use client";
 import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { api } from "@/lib/api";
+import { useRegressionRun } from "@/contexts/RegressionRunContext";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -97,14 +98,18 @@ export default function RegressionPage() {
   const [goldenCases, setGoldenCases] = useState<any[]>([]);
   const [expandedCaseId, setExpandedCaseId] = useState<string | null>(null);
 
-  // run tests
-  const [regModels, setRegModels] = useState<Set<string>>(new Set());
+  // run tests — default model: claude-sonnet-4-6
+  const [regModels, setRegModels] = useState<Set<string>>(new Set(["claude-sonnet-4-6"]));
   const [regPromptVer, setRegPromptVer] = useState("v1");
   const [regBaselineRunId, setRegBaselineRunId] = useState("");
   const [selectedCaseIds, setSelectedCaseIds] = useState<Set<string>>(new Set());
   const [caseSearch, setCaseSearch] = useState("");
   const [regRunning, setRegRunning] = useState(false);
   const [regRunResult, setRegRunResult] = useState<any>(null);
+
+  // live streaming — delegated to global RegressionRunContext
+  const regrCtx = useRegressionRun();
+  const liveBottomRef = useRef<HTMLDivElement>(null);
 
   // results
   const [regRuns, setRegRuns] = useState<any[]>([]);
@@ -167,10 +172,33 @@ export default function RegressionPage() {
     api.teams.list().then(t => { setTeams(t); if (t.length) setTeamId(t[0].id); });
     api.models.list().then(setAvailableModels).catch(() => {});
     api.promptVersions.list().then(setPromptVersions).catch(() => {});
-    // Load all roles' version lists from the registry
-    api.prompts.versions().then((res: any) => {
-      if (res?.roles) setRoleVersionsMap(res.roles);
-    }).catch(() => {});
+    // Load all roles' version lists from the registry, then auto-select latest per role.
+    // Also read the agent prompt_version from Studio (DB) so defaults match what's configured there.
+    Promise.all([
+      api.prompts.versions().catch(() => ({ roles: {} })),
+      api.teams.get("default").catch(() => ({ agents: [] })),
+    ]).then(([versionsRes, teamData]: [any, any]) => {
+      const roles = versionsRes?.roles || {};
+      setRoleVersionsMap(roles);
+      // Build default map: use Studio-configured version for each agent, falling back to
+      // the latest version in the registry, then v1.
+      const studioVersions: Record<string, string> = {};
+      for (const agent of (teamData?.agents || [])) {
+        if (agent.role && agent.prompt_version) studioVersions[agent.role] = agent.prompt_version;
+      }
+      const defaults: Record<string, string> = {};
+      for (const [role, versions] of Object.entries(roles) as [string, any[]][]) {
+        const studioVer = studioVersions[role];
+        if (studioVer && studioVer !== "v1") {
+          defaults[role] = studioVer;
+        } else {
+          // Pick the latest (first) non-v1 version if one exists
+          const latest = (versions as any[]).find((v: any) => v.version !== "v1");
+          if (latest) defaults[role] = latest.version;
+        }
+      }
+      setRolePromptVerMap(defaults);
+    });
   }, []);
 
   const loadGolden = useCallback(async () => {
@@ -284,47 +312,46 @@ export default function RegressionPage() {
     loadRegRuns();
   }, [loadGolden, loadRegRuns]);
 
-  // ── Run tests ──────────────────────────────────────────────────
+  // Refresh run history when the active session finishes
+  useEffect(() => {
+    const active = regrCtx.sessions.find(s => s.sessionId === regrCtx.activeSessionId);
+    if (active && (active.status === "done" || active.status === "error")) {
+      loadRegRuns();
+    }
+  }, [regrCtx.sessions, regrCtx.activeSessionId, loadRegRuns]);
+
+  // ── Run tests — delegates to global RegressionRunContext ───────────────────
 
   async function runRegression() {
     setRegRunning(true);
     setRegRunResult(null);
-    const models = regModels.size > 0 ? Array.from(regModels) : [undefined];
-    // Build per-role version map (omit roles that are still on v1)
+
     const pvByRole = Object.fromEntries(
       Object.entries(rolePromptVerMap).filter(([, v]) => v && v !== "v1")
     );
     const hasPvByRole = Object.keys(pvByRole).length > 0;
-    // Global fallback version (used when no per-role overrides set)
     const globalVersion = regPromptVer !== "v1" ? regPromptVer : undefined;
+    const models = regModels.size > 0 ? Array.from(regModels) : [undefined as string | undefined];
+
+    const baseParams = {
+      team_id: teamId,
+      case_ids: selectedCaseIds.size > 0 ? Array.from(selectedCaseIds) : undefined,
+      prompt_version: !hasPvByRole ? (globalVersion || "v1") : "v1",
+      prompt_versions_by_role: hasPvByRole ? pvByRole : undefined,
+      baseline_run_id: regBaselineRunId || undefined,
+    };
+
     try {
-      if (models.length > 1) {
-        const runs: any[] = [];
-        for (const model of models) {
-          const result = await api.regression.run({
-            team_id: teamId,
-            case_ids: selectedCaseIds.size > 0 ? Array.from(selectedCaseIds) : undefined,
-            model: model || undefined,
-            prompt_version: !hasPvByRole ? (globalVersion || "v1") : "v1",
-            prompt_versions_by_role: hasPvByRole ? pvByRole : undefined,
-            baseline_run_id: regBaselineRunId || undefined,
-          });
-          runs.push(result);
-        }
-        setRegRunResult({ multi_run: true, runs });
-      } else {
-        const result = await api.regression.run({
-          team_id: teamId,
-          case_ids: selectedCaseIds.size > 0 ? Array.from(selectedCaseIds) : undefined,
-          model: models[0] || undefined,
-          prompt_version: !hasPvByRole ? (globalVersion || "v1") : "v1",
-          prompt_versions_by_role: hasPvByRole ? pvByRole : undefined,
-          baseline_run_id: regBaselineRunId || undefined,
-        });
-        setRegRunResult(result);
+      // Each model gets its own session in the global context (shows as separate tab in widget)
+      for (const model of models) {
+        regrCtx.startRun(
+          { ...baseParams, model: model || undefined },
+          model ?? "default",
+        );
       }
-      await loadRegRuns();
-      setSubTab("results");
+      setRegRunResult({ streamed: true });
+      // Give runs a moment to start, then refresh the run history
+      setTimeout(() => { loadRegRuns(); }, 3000);
     } catch (e: any) {
       setRegRunResult({ error: e.message });
     }
@@ -499,7 +526,7 @@ export default function RegressionPage() {
                     <button onClick={() => setRegModels(new Set())} className="text-[10px] text-[var(--text-muted)] underline">Clear</button>
                   )}
                 </div>
-                <p className="text-[10px] text-[var(--text-muted)]">Select 1+ to compare models side-by-side</p>
+                <p className="text-[10px] text-[var(--text-muted)]">Defaults to <span className="font-medium text-zinc-600">claude-sonnet-4-6</span>. Select 1+ to compare models side-by-side.</p>
                 <div className="border border-[var(--border)] rounded overflow-hidden">
                   <label className={`flex items-center gap-2 px-2 py-1.5 text-[11px] border-b border-[var(--border)] cursor-pointer hover:bg-[var(--bg-hover)] ${regModels.size === 0 ? "bg-zinc-50 font-medium" : ""}`}>
                     <input type="checkbox" checked={regModels.size === 0} onChange={() => setRegModels(new Set())} className="h-3 w-3 rounded border-gray-300 accent-[var(--accent)]" />
@@ -531,28 +558,31 @@ export default function RegressionPage() {
                   <span className="text-[10px] text-zinc-400">per role</span>
                 </div>
                 <p className="text-[10px] text-[var(--text-muted)] leading-snug">
-                  Choose which prompt version each agent role uses for this run. Roles with no versions default to v1.
+                  Defaults to the latest version per role (from Studio). Override per role if needed.
                 </p>
                 {Object.keys(roleVersionsMap).length > 0 ? (
                   <div className="space-y-1.5">
                     {Object.entries(roleVersionsMap).map(([role, versions]: [string, any[]]) => {
                       const selected = rolePromptVerMap[role] || "v1";
-                      const hasNonV1 = versions.some((v: any) => v.version !== "v1");
+                      const allVersions = versions as any[];
+                      const latestVer = allVersions.find((v: any) => v.version !== "v1");
+                      const isLatest = latestVer && selected === latestVer.version;
                       return (
                         <div key={role} className={`flex items-center gap-2 px-2 py-1.5 rounded-md border ${selected !== "v1" ? "border-indigo-200 bg-indigo-50/50" : "border-transparent"}`}>
                           <span className="text-[11px] text-zinc-700 font-medium w-24 shrink-0">{role}</span>
                           <select
                             value={selected}
                             onChange={e => setRolePromptVerMap(prev => ({ ...prev, [role]: e.target.value }))}
-                            className={`input !py-0.5 text-[10px] flex-1 ${!hasNonV1 ? "opacity-50" : ""}`}
-                            disabled={!hasNonV1}>
+                            className="input !py-0.5 text-[10px] flex-1">
                             <option value="v1">v1 (baseline)</option>
-                            {versions.filter((v: any) => v.version !== "v1").map((v: any) => (
+                            {allVersions.filter((v: any) => v.version !== "v1").map((v: any) => (
                               <option key={v.version} value={v.version}>
                                 {v.version}{v.cot_enhanced ? " [CoT]" : ""}{v.created_by === "optimizer" ? " [opt]" : ""}
+                                {v.version === latestVer?.version ? " ← latest" : ""}
                               </option>
                             ))}
                           </select>
+                          {isLatest && <span className="text-[9px] font-medium text-emerald-600 shrink-0">latest</span>}
                         </div>
                       );
                     })}
@@ -605,10 +635,8 @@ export default function RegressionPage() {
                 <div className={`text-xs p-3 rounded-lg border ${regRunResult.error ? "border-red-200 bg-red-50 text-red-700" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}>
                   {regRunResult.error ? (
                     <span>Error: {regRunResult.error}</span>
-                  ) : regRunResult.multi_run ? (
-                    <span>{regRunResult.runs?.length} model runs completed → see Results tab</span>
                   ) : (
-                    <span>{regRunResult.summary?.num_passed}/{regRunResult.num_cases} passed · ${(regRunResult.summary?.total_cost || 0).toFixed(4)} · Results tab updated</span>
+                    <span>Run started — see live widget (bottom-left) for progress. Results tab updates when done.</span>
                   )}
                 </div>
               )}
@@ -706,6 +734,8 @@ export default function RegressionPage() {
           </div>
         </div>
       )}
+
+      {/* Live run widget is shown globally via the floating RegressionRunWidget */}
 
       {/* ─────────── RESULTS ─────────── */}
       {subTab === "results" && (
@@ -1804,7 +1834,6 @@ export default function RegressionPage() {
   );
 }
 
-// ── Sub-components ───────────────────────────────────────────────────────────
 
 function GoldenCaseExpanded({ c, activeStrategy }: { c: any; activeStrategy?: string }) {
   return (
