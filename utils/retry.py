@@ -1,96 +1,74 @@
-"""
-utils/retry.py
---------------
-Provides the `retry` decorator for automatically retrying a function call
-on exception, with configurable maximum attempts and inter-attempt delay.
-
-Typical usage
--------------
-    from utils.retry import retry
-
-    @retry(n=3, delay=0.5)
-    def fetch_data(url: str) -> dict:
-        ...
-
-    # Or applied programmatically:
-    result = retry(n=5)(some_flaky_function)(arg1, arg2)
-"""
-
-import time
+"""Retry decorator utility for handling transient failures."""
 import functools
-from typing import Callable, TypeVar, Any
+import time
+from typing import Callable, Optional, Tuple, Type, TypeVar
 
-F = TypeVar("F", bound=Callable[..., Any])
+# Use typing_extensions for Python < 3.10 compatibility, or typing for 3.10+
+try:
+    from typing import ParamSpec
+except ImportError:
+    from typing_extensions import ParamSpec
+
+P = ParamSpec('P')
+R = TypeVar('R')
 
 
-def retry(n: int, delay: float = 0.0) -> Callable[[F], F]:
-    """Return a decorator that retries the wrapped function up to *n* times.
-
-    The wrapped function is called repeatedly until it either:
-    - returns a value successfully (that value is returned to the caller), or
-    - raises an exception on every one of the *n* allowed attempts, in which
-      case the **last** exception is re-raised.
-
-    A ``delay`` of ``0.0`` (the default) means the retry loop is tight with no
-    sleep between attempts.  Any positive value causes ``time.sleep(delay)`` to
-    be called **between** attempts (i.e. after a failure and before the next
-    try), so it is called at most ``n - 1`` times.
-
-    Parameters
-    ----------
-    n : int
-        Maximum number of attempts.  Must be a positive integer (>= 1).
-    delay : float, optional
-        Seconds to wait between consecutive attempts.  Must be >= 0.
-        Defaults to ``0.0``.
-
-    Returns
-    -------
-    Callable
-        A decorator that wraps *any* callable with the retry logic.
-
-    Raises
-    ------
-    ValueError
-        If ``n`` is not a positive integer, or if ``delay`` is negative.
-
-    Examples
-    --------
-    >>> call_count = 0
-    >>> @retry(n=3, delay=0)
-    ... def sometimes_fails():
-    ...     global call_count
-    ...     call_count += 1
-    ...     if call_count < 3:
-    ...         raise RuntimeError("not yet")
-    ...     return "ok"
-    >>> sometimes_fails()
-    'ok'
+def retry(
+    max_retries: int = 3,
+    delay: float = 0.0,
+    exceptions: Tuple[Type[BaseException], ...] = (Exception,)
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """
-    if not isinstance(n, int) or isinstance(n, bool):
-        raise ValueError(f"n must be a positive integer, got {n!r}")
-    if n < 1:
-        raise ValueError(f"n must be >= 1, got {n}")
-    if delay < 0:
-        raise ValueError(f"delay must be >= 0, got {delay}")
+    Decorator that retries a function up to N times on exception.
 
-    def decorator(func: F) -> F:
+    Args:
+        max_retries: Maximum number of retry attempts after the initial call
+            (default: 3). Total attempts = max_retries + 1.
+        delay: Delay in seconds between retries (default: 0.0).
+        exceptions: Tuple of exception types to catch and retry on
+            (default: (Exception,)).
+
+    Returns:
+        Decorated function that implements retry logic.
+
+    Raises:
+        The last exception if all retries are exhausted.
+
+    Example:
+        @retry(max_retries=3, delay=1.0)
+        def unstable_api_call():
+            # This will be retried up to 3 times on failure
+            return requests.get('https://api.example.com/data')
+
+        @retry(max_retries=2, exceptions=(ConnectionError, TimeoutError))
+        def network_operation():
+            # Only retries on ConnectionError or TimeoutError
+            ...
+    """
+    if max_retries < 0:
+        raise ValueError("max_retries must be non-negative")
+    if delay < 0:
+        raise ValueError("delay must be non-negative")
+
+    def decorator(func: Callable[P, R]) -> Callable[P, R]:
         @functools.wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            last_exception: BaseException | None = None
-            for attempt in range(1, n + 1):
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            last_exception: Optional[BaseException] = None
+
+            for attempt in range(max_retries + 1):  # +1 for initial attempt
                 try:
                     return func(*args, **kwargs)
-                except Exception as exc:  # noqa: BLE001
-                    last_exception = exc
-                    if attempt < n and delay > 0:
-                        time.sleep(delay)
-            # last_exception is always set here because n >= 1, so the loop
-            # body ran at least once; the only exit path that doesn't return
-            # is when every attempt raised.
-            assert last_exception is not None  # narrow type for mypy
-            raise last_exception
+                except exceptions as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        if delay > 0:
+                            time.sleep(delay)
+                    else:
+                        raise
 
-        return wrapper  # type: ignore[return-value]
+            # This should never be reached, but satisfies type checker
+            raise last_exception  # type: ignore[misc]
+
+        return wrapper
 
     return decorator

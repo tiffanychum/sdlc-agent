@@ -225,11 +225,28 @@ def _add_int(a: int, b: int) -> int:
     return a + b
 
 
+def _merge_step_sets(a: list[str], b: list[str]) -> list[str]:
+    """Accumulate completed step names without duplicates (order-preserving)."""
+    result = list(a)
+    for item in b:
+        if item not in result:
+            result.append(item)
+    return result
+
+
 class OrchestratorState(TypedDict):
     messages: Annotated[list, operator.add]
     selected_agent: Annotated[str, _take_last]
     agent_trace: Annotated[list[dict], operator.add]
     supervisor_iterations: Annotated[int, _add_int]
+    # ReAct step tracking: supervisor populates required_steps once from the task,
+    # then marks each agent's role into completed_steps after it runs.
+    required_steps: Annotated[list[str], _take_last]
+    completed_steps: Annotated[list[str], _merge_step_sets]
+    # QA iteration tracking: supports the coder → qa → coder → qa cycle (max 3 rounds).
+    qa_iterations: Annotated[int, _take_last]
+    qa_needs_fix: Annotated[bool, _take_last]
+    qa_bug_report: Annotated[str, _take_last]
 
 
 def _build_router_prompt(agents_config: list[dict]) -> str:
@@ -241,12 +258,19 @@ In a supervisor workflow, additional agents can be invoked afterward — you onl
 Available agents:
 {agent_descs}
 
-Routing rules (apply in strict priority order):
+Routing rules (apply in strict priority order — STOP at the first match):
+
+## Running tests / test suites (HIGHEST PRIORITY for test execution)
+1. Task asks to run tests, run the test suite, execute pytest/jest/unittest, run `python -m pytest`,
+   verify tests, or check test results — **ALWAYS → "coder"**.
+   Devops does NOT run tests. Examples: "run the test suite", "run tests", "execute pytest",
+   "run python -m pytest foo_test.py", "verify the tests pass".
 
 ## Jira operations
-1. Task involves CREATING or MANAGING Jira (new projects, epics, stories, assigning tickets,
-   updating status) → route to "project_manager".
-2. Task involves DECOMPOSING a feature or requirement into developer tasks in Jira → "business_analyst".
+2. Task involves ANY Jira work — creating/managing projects, epics, stories, tasks, assigning
+   tickets, updating status, OR decomposing a feature into dev tasks with acceptance criteria
+   → route to "project_manager".
+   (project_manager handles both project setup AND story decomposition)
 
 ## Local file access (filesystem)
 3. Task asks to READ, OPEN, EXAMINE, SUMMARIZE, or INSPECT a local file or directory
@@ -254,32 +278,40 @@ Routing rules (apply in strict priority order):
    "list files in src/", "what does X.py do?") → "coder".
    NOTE: This rule takes priority over research. Reading a local file is NOT a web search.
 
+## Data / metrics analysis (SQL + regression DB)
+4. Task asks to QUERY the regression database, compare eval runs, find which golden test
+   costs most, which metric scores lowest, which agent fails most, show cost/latency trends
+   from regression history, or do any SQL-based analysis of past runs → "data_analyst".
+   Keywords: "regression", "eval run", "golden test", "metric score", "cost trend",
+   "which agent failed", "compare run A vs run B", "faithfulness score", "deepeval".
+
 ## Research (web / external sources only)
-4. Task requires SEARCHING THE WEB, fetching external URLs, finding real-time best practices,
-   or answering a question that needs live internet information → "researcher".
-   Do NOT route here if the task references a local file path.
+5. Task requires SEARCHING THE WEB, fetching external URLs, finding real-time best practices,
+   or consulting the performance knowledge base about agentic system design → "researcher".
+   Do NOT route here if the task references a local file path or regression data.
 
 ## Code quality / review
-5. Task says "review", "assess quality", "find bugs", "suggest improvements" for source code or
+6. Task says "review", "assess quality", "find bugs", "suggest improvements" for source code or
    a git diff, with NO request to also run or change anything → "reviewer".
 
 ## Source control & GitHub
-6. Task involves ONLY git or GitHub operations: commit, push, create branch, open PR, list repos,
-   check git status/log/diff — with no code to write → "devops".
+7. Task involves ONLY git or GitHub operations: commit, push, create branch, open PR, list repos,
+   check git status/log/diff — with no code to write and no tests to run → "devops".
+   (If the task mentions running tests, rule 1 applies — route to coder.)
 
-## Testing
-7. Task asks to write tests for existing code, run the test suite, or verify test results → "tester".
+## Independent QA validation
+8. Task asks for QA, E2E testing, performance testing, load testing, or a QA report → "qa".
 
 ## Implementation
-8. Task asks to write, edit, implement, or fix source code files → "coder".
+9. Task asks to write, edit, implement, or fix source code files → "coder".
 
 ## Multi-step planning / analysis
-9. Task requires analyzing multiple files or areas without writing code (architecture audit,
+10. Task requires analyzing multiple files or areas without writing code (architecture audit,
    dependency analysis, codebase overview) → "planner".
 
 ## Defaults
 - If the task starts with implementation AND also mentions testing/git: route to "coder" first
-  (supervisor will invoke "tester" and "devops" in subsequent turns).
+  (coder writes code + unit tests; supervisor will invoke "qa" and "devops" in subsequent turns).
 - If genuinely unclear: "planner".
 
 Respond with ONLY the agent name from: {agent_names}."""
@@ -318,20 +350,56 @@ def _build_handoff_context(state: OrchestratorState, current_role: str) -> str |
     )
 
     lines = []
+    hitl_notes = []
     for e in completed:
         agent = e.get("agent", "?")
-        tools = [tc["tool"] for tc in e.get("tool_calls", [])]
+        tool_calls = e.get("tool_calls", [])
+        tools = [tc["tool"] for tc in tool_calls if tc.get("tool") != "ask_human"]
         tool_str = ", ".join(dict.fromkeys(tools)) if tools else "no tools"
         lines.append(f"  • {agent}: used [{tool_str}]")
+
+        # Capture any ask_human calls so downstream agents don't repeat them
+        for tc in tool_calls:
+            if tc.get("tool") == "ask_human":
+                question = tc.get("args", {}).get("question", "")
+                if question:
+                    hitl_notes.append(
+                        f"  ✓ {agent} asked: \"{question[:120]}\" — already answered/approved"
+                    )
 
     header = ""
     if original_request:
         header = f"ORIGINAL REQUEST: {original_request}\n\n"
 
+    hitl_section = ""
+    if hitl_notes:
+        hitl_section = (
+            "\n\nHITL CLARIFICATIONS ALREADY RESOLVED (do NOT ask again):\n"
+            + "\n".join(hitl_notes)
+            + "\n⚠ All pre-flight checks and user confirmations are complete. "
+            "Proceed directly with your task — do NOT call ask_human for anything already confirmed above."
+        )
+
+    # Inject QA bug report when coder is being called back after a QA NEEDS_FIX verdict.
+    qa_bug_section = ""
+    if current_role == "coder":
+        qa_bug_report = state.get("qa_bug_report", "")
+        if qa_bug_report:
+            qa_iterations = state.get("qa_iterations", 0)
+            qa_bug_section = (
+                f"\n\nBUG REPORT FROM QA (round {qa_iterations} — fix ALL defects before QA re-validates):\n"
+                + qa_bug_report
+                + "\n⚠ Fix every CRITICAL and HIGH defect listed above. "
+                "Do NOT ask for clarification — the defect log is your specification. "
+                "After fixing, run the unit tests to confirm they still pass."
+            )
+
     return (
         header
         + "WORKFLOW CONTEXT — completed by prior agents (do NOT repeat this work):\n"
         + "\n".join(lines)
+        + hitl_section
+        + qa_bug_section
         + f"\n\nYOUR TASK: You are the {current_role}. Focus only on what has NOT been "
         "done yet and pick up exactly where the previous agent left off."
     )
@@ -340,6 +408,7 @@ def _build_handoff_context(state: OrchestratorState, current_role: str) -> str |
 def _make_agent_executor(role: str, built_agents: dict):
     """Create an executor closure for a given agent role."""
     async def execute(state: OrchestratorState) -> OrchestratorState:
+        import time as _time
         msgs = _ensure_messages(state["messages"])
 
         # Inject a structured handoff context when prior agents have already run.
@@ -354,22 +423,76 @@ def _make_agent_executor(role: str, built_agents: dict):
             # HumanMessage to keep the API happy.
             msgs = [*msgs, HumanMessage(content="Continue with your part of the task.")]
 
+        _t0 = _time.time()
         result = await built_agents[role].ainvoke({"messages": msgs})
+        _latency_ms = (_time.time() - _t0) * 1000
+
         out_messages = _ensure_messages(result.get("messages", []))
         tool_calls = []
+        tokens_in = 0
+        tokens_out = 0
+        model_used = ""
         for msg in out_messages:
             if hasattr(msg, "tool_calls") and msg.tool_calls:
                 for tc in msg.tool_calls:
                     tool_calls.append({"tool": tc["name"], "args": tc["args"]})
-        return {
+            # Capture token usage and model from response metadata
+            meta = getattr(msg, "response_metadata", None) or {}
+            usage = meta.get("token_usage") or meta.get("usage", {}) or {}
+            tokens_in += usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
+            tokens_out += usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
+            um = getattr(msg, "usage_metadata", None)
+            if um:
+                tokens_in += getattr(um, "input_tokens", 0) or 0
+                tokens_out += getattr(um, "output_tokens", 0) or 0
+            if not model_used:
+                model_used = meta.get("model_name") or meta.get("model") or ""
+
+        state_update: dict = {
             "messages": out_messages,
             "selected_agent": role,
             "agent_trace": [{
-                "step": "execution", "agent": role, "tool_calls": tool_calls,
+                "step": "execution",
+                "agent": role,
+                "tool_calls": tool_calls,
                 "num_messages": len(out_messages),
+                "latency_ms": round(_latency_ms, 1),
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "model": model_used,
             }],
             "supervisor_iterations": 0,
+            # Mark this agent as completed in the ReAct step tracker
+            "completed_steps": [role],
         }
+
+        # Parse QA verdict from QA agent's output so the supervisor can cycle
+        # back to coder if NEEDS_FIX, or proceed to DONE/devops if APPROVED.
+        if role == "qa":
+            qa_text = " ".join(
+                _extract_text(m.content)
+                for m in out_messages
+                if isinstance(m, AIMessage)
+            )
+            if "QA_STATUS: NEEDS_FIX" in qa_text:
+                # Extract the bug report (everything after the defect log header)
+                bug_report = ""
+                for marker in ("## Defect Log", "Defect Log", "BUG REPORT", "NEEDS_FIX"):
+                    idx = qa_text.find(marker)
+                    if idx != -1:
+                        bug_report = qa_text[idx:]
+                        break
+                if not bug_report:
+                    bug_report = qa_text[-3000:]  # last 3000 chars as fallback
+                state_update["qa_needs_fix"] = True
+                state_update["qa_bug_report"] = bug_report
+                logger.info("QA emitted NEEDS_FIX — bug report captured (%d chars).", len(bug_report))
+            elif "QA_STATUS: APPROVED" in qa_text:
+                state_update["qa_needs_fix"] = False
+                state_update["qa_bug_report"] = ""
+                logger.info("QA emitted APPROVED.")
+
+        return state_update
     return execute
 
 
@@ -377,6 +500,8 @@ async def build_orchestrator_from_team(
     team_id: str = "default",
     model_override=None,
     strategy_override: str = None,
+    prompt_versions_by_role: dict = None,
+    routing_prompt_versions: dict = None,
 ):
     # Deferred imports to avoid circular imports at module load time.
     from src.db.database import get_session
@@ -403,14 +528,34 @@ async def build_orchestrator_from_team(
         for m in all_mappings:
             mapping_by_agent[m.agent_id].append(m.tool_group)
 
+        # Load versioned prompts from PromptRegistry when agent.prompt_version != v1.
+        try:
+            from src.prompts.registry import get_registry as _get_registry
+            _registry = _get_registry()
+        except Exception:
+            _registry = None
+
         agents_config = []
         for a in agents_db:
+            system_prompt = a.system_prompt or ""
+            # Resolve effective prompt version: per-role override > agent DB value > "v1"
+            pv_db = getattr(a, "prompt_version", "v1") or "v1"
+            pv = (prompt_versions_by_role or {}).get(a.role) or pv_db
+            if _registry and pv != "v1":
+                try:
+                    versioned = _registry.get_prompt(a.role, pv)
+                    if versioned:
+                        system_prompt = versioned
+                except Exception:
+                    pass  # fall back to DB value
+
             agents_config.append({
                 "id": a.id, "name": a.name, "role": a.role,
-                "description": a.description, "system_prompt": a.system_prompt,
+                "description": a.description, "system_prompt": system_prompt,
                 "tool_groups": mapping_by_agent[a.id],
                 "model": getattr(a, "model", "") or "",
                 "decision_strategy": getattr(a, "decision_strategy", "react") or "react",
+                "prompt_version": pv,
             })
 
         strategy = team.decision_strategy or "router_decides"
@@ -466,6 +611,33 @@ async def build_orchestrator_from_team(
                 model=llm, tools=list(agent_tools), prompt=final_prompt,
             )
 
+    # ── Seed and resolve routing prompt versions ──────────────────────────────
+    # Load the supervisor/router/meta_router prompt from the registry so that
+    # versioned routing prompts can be tracked, A/B tested, and optimized.
+    resolved_routing_versions = {"supervisor": "v1", "meta_router": "v1", "router": "v1"}
+    try:
+        from src.prompts.registry import get_registry as _get_registry
+        _reg = _get_registry()
+        # Seed routing prompts on first run (idempotent) using module-level prompt templates
+        _router_prompt_text = _build_router_prompt(agents_config)
+        _reg.seed_routing_prompts(
+            supervisor_prompt=_META_ROUTER_PROMPT,   # meta-router strategy selection
+            meta_router_prompt=_META_ROUTER_PROMPT,  # same template, versioned separately
+            router_prompt=_router_prompt_text,        # single-agent router
+        )
+        # Drift detection — bump to a new version if the code prompt has changed
+        # (e.g. after the tester→coder/qa merge the router prompt was updated).
+        _reg.sync_routing_prompts(
+            supervisor_prompt=_META_ROUTER_PROMPT,
+            meta_router_prompt=_META_ROUTER_PROMPT,
+            router_prompt=_router_prompt_text,
+        )
+        for role in ("supervisor", "meta_router", "router"):
+            ver = (routing_prompt_versions or {}).get(role)
+            resolved_routing_versions[role] = ver if ver else _reg.latest_version(role)
+    except Exception as _e:
+        logger.debug("Routing prompt versioning unavailable: %s", _e)
+
     builders = {
         "router_decides": _build_router_graph,
         "sequential": _build_sequential_graph,
@@ -473,8 +645,12 @@ async def build_orchestrator_from_team(
         "supervisor": _build_supervisor_graph,
     }
     builder_fn = builders.get(strategy, _build_router_graph)
-    return builder_fn(agents_config, built_agents, checkpointer=checkpointer,
-                      exec_agents=exec_agents)
+    graph = builder_fn(agents_config, built_agents, checkpointer=checkpointer,
+                       exec_agents=exec_agents)
+    # Attach resolved routing prompt versions as metadata on the compiled graph
+    # so callers (regression runner) can read them back.
+    graph.__routing_prompt_versions__ = resolved_routing_versions
+    return graph
 
 
 def _build_router_graph(agents_config, built_agents, checkpointer=None,
@@ -696,24 +872,149 @@ Agents and their capabilities:
 {agent_descs}
 
 Tool routing rules (delegate only to agents that HAVE the right tools):
-- File read/write/edit/implement → "coder" (NOT business_analyst)
-- Code tests → "tester" or "coder"
-- Git/GitHub operations (push, PR, branch) → "devops"
+- Writing source code files (.py, .html, .ts, .js, etc.) AND unit tests → "coder"
+  ❌ If source files need to be created and coder has NOT run yet → next agent MUST be "coder"
+  ❌ NEVER route file creation to planner, devops, or project_manager
+- Independent QA validation (E2E tests, performance tests, static analysis, QA report) → "qa"
+  ❌ qa runs AFTER coder — never before coder has implemented the code
+  ❌ qa NEVER writes production code; it only files defect reports
+  ✅ After qa emits NEEDS_FIX, route back to "coder" for fixes, then back to "qa" (max 3 rounds)
+  ✅ After qa emits APPROVED (or round 3 completes), proceed to "devops" or DONE
+- Git/GitHub (commit, push, PR, branch) → "devops"
+  devops runs LAST — only after coder (and qa if requested) have finished their work
 - Web research → "researcher"
-- Jira ticket management (create/update issues) → "project_manager"
-- Requirements decomposition, Jira lookup only → "business_analyst" (do NOT use for code writing or file operations)
+- Jira tickets (epics, stories, dev tasks, acceptance criteria) → "project_manager"
+- Multi-file analysis, architecture audit, cross-concern coordination → "planner"
+  planner reads files for context ONLY — it does NOT create or write files
 
-❌ NEVER route coding, implementation, or file-writing tasks to "business_analyst".
+For full build/implementation tasks, enforce this STRICT sequential order:
+  1. planner        — FIRST: read architecture, create the step-by-step plan
+  2. project_manager — SECOND (if Jira work is requested): create epics/stories
+  3. coder          — THIRD: implement ALL source code files + unit tests
+  4. qa             — FOURTH (if QA is requested): E2E/perf/static QA pass; may cycle with coder
+  5. devops         — FIFTH/LAST: git commit + push + GitHub repo creation
 
-Before deciding, briefly answer these two questions internally:
-1. What has been completed so far (based on the conversation above)?
-2. What deliverables from the original request are still missing?
+⚠️ If NO prior agent has run yet and the task involves planning + coding + deployment:
+   → ALWAYS start with "planner". Never start with coder when no plan exists yet.
+
+⚠️ If planner has run but coder has NOT run yet and source files still need to be written:
+   → Next agent MUST be "coder". Do not route to devops or qa before coder writes files.
+
+⚠️ If coder has run and qa is required but has NOT run yet:
+   → Next agent MUST be "qa". Do not route to devops before QA approves.
+
+Before deciding, answer these two questions internally:
+1. What has each prior agent actually completed? (check conversation above for tool calls made)
+2. Which step in the build pipeline is still missing?
 
 Then reply with EXACTLY ONE of:
-- "DONE" — if ALL deliverables are complete (files written, tests run, etc.)
-- A single agent name — if work remains
+- "DONE" — if ALL deliverables are complete (plan created, Jira done, files written, QA approved, git pushed)
+- A single agent name — if any step remains
 
 Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
+
+    def _derive_required_steps(user_request: str) -> list[str]:
+        """
+        Derive the ordered required pipeline steps from the user request.
+        This is the ReAct plan — the supervisor diffs completed_steps against this
+        list to decide the next agent, rather than relying purely on LLM reasoning.
+        """
+        text = user_request.lower()
+        steps: list[str] = []
+
+        # Full build/e2e tasks: infer the standard pipeline
+        is_build_task = any(kw in text for kw in (
+            "implement", "build", "create", "develop", "write", "code",
+            "fullstack", "full stack", "app", "service", "api",
+        ))
+        needs_jira = any(kw in text for kw in (
+            "jira", "epic", "story", "ticket ", "tickets", "acceptance criteria",
+        ))
+        # Only treat "project" as a Jira signal when it clearly refers to Jira work,
+        # not when Coder is asked to "create a project at /tmp/foo/" (scratch app).
+        if ("jira project" in text or "project in jira" in text):
+            needs_jira = True
+        needs_planning = any(kw in text for kw in (
+            "architect", "audit",
+        )) or (
+            # "plan", "design", "analyze" are only planner signals when used explicitly
+            # as a verb by the user — not when they appear inside normal sentences like
+            # "design a REST API" (that is a coder task).
+            any(
+                kw in text for kw in (
+                    "create a plan", "make a plan", "draft a plan", "devise a plan",
+                    "analyse the ", "analyze the ",
+                )
+            )
+        )
+        needs_testing = any(kw in text for kw in ("test", "pytest", "unittest", "verify"))
+        needs_git = any(kw in text for kw in (
+            "github", "push", "commit", "pull request", "open a pr", "open pr",
+        )) or (" git " in f" {text} " or text.endswith(" git") or text.startswith("git "))
+        # Research = web search / external lookup — NOT local performance tests.
+        # Dropped "performance", "latency", "find" because build-task prompts often
+        # mention them innocuously ("performance test with 10 concurrent requests").
+        needs_research = any(kw in text for kw in (
+            "research ", "search the web", "look up", "investigate ",
+            "playbook", "best practices", "industry practice", "prior art",
+        ))
+        needs_qa = any(kw in text for kw in (
+            "qa", "quality assurance", "e2e", "end-to-end", "end2end",
+            "performance test", "load test", "qa report", "qa pass",
+            "qa round", "independent qa", "qa gate",
+        ))
+
+        # Pure test-execution task: "run the test suite", "run tests", "run pytest" etc.
+        # These are single-agent tasks — route directly to coder with no pipeline.
+        is_pure_test = (
+            needs_testing
+            and not is_build_task
+            and not needs_planning
+            and not needs_jira
+            and not needs_git
+            and not needs_research
+            and not needs_qa
+        )
+        if is_pure_test:
+            steps.append("coder")
+            return steps
+
+        # Build up the required sequence for multi-step pipeline tasks.
+        #
+        # Planner is only added when the user EXPLICITLY asks for planning
+        # (keywords: plan / architect / design / analyze / audit). We no longer
+        # auto-add planner for every build task — when the prompt directly names
+        # agents ("have the coder do X; have the qa do Y") a planner step is pure
+        # overhead and can mis-lead the supervisor LLM into project_manager/
+        # researcher detours.
+        text_lower = text
+        names_coder = any(
+            kw in text_lower for kw in ("coder agent", "the coder", "have coder")
+        )
+        names_qa = any(
+            kw in text_lower for kw in ("qa agent", "the qa", "have qa")
+        )
+        explicit_agent_naming = names_coder or names_qa
+
+        if needs_planning and not explicit_agent_naming:
+            steps.append("planner")
+        if needs_jira:
+            steps.append("project_manager")
+        # Researcher always runs BEFORE coder when external research is needed.
+        if needs_research:
+            steps.append("researcher")
+        # Coder runs for any build/implementation task — regardless of whether
+        # research was needed first. (The previous logic incorrectly skipped
+        # coder whenever researcher ran, which broke build-after-research flows.)
+        if is_build_task:
+            steps.append("coder")
+        if needs_qa:
+            steps.append("qa")
+        if needs_git:
+            steps.append("devops")
+
+        # If no steps derived, return empty (supervisor falls back to LLM routing)
+        return steps
 
     async def supervisor_decide(state: OrchestratorState) -> OrchestratorState:
         iterations = state.get("supervisor_iterations", 0)
@@ -725,9 +1026,110 @@ Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
                 "selected_agent": "__done__",
                 "agent_trace": [{"step": "supervisor", "decision": "forced_done_iteration_limit"}],
                 "supervisor_iterations": 1,
+                "required_steps": state.get("required_steps", []),
+                "completed_steps": state.get("completed_steps", []),
             }
 
         msgs = _ensure_messages(state["messages"])
+        completed = state.get("completed_steps", [])
+        required = state.get("required_steps", [])
+
+        # ── ReAct Step 1: Derive required_steps on first call ──────────────────
+        # If this is the first supervisor call, extract the pipeline from the user request.
+        if not required:
+            user_msg = next(
+                (m.content for m in msgs if isinstance(m, HumanMessage)), ""
+            )
+            required = _derive_required_steps(
+                user_msg if isinstance(user_msg, str) else str(user_msg)
+            )
+            logger.info("Supervisor derived required_steps=%s", required)
+
+        # ── ReAct Step 2: Mark completed agents from trace ─────────────────────
+        # Pull agents that have actually run (have execution entries in the trace)
+        trace = state.get("agent_trace", [])
+        agents_run = [
+            e["agent"] for e in trace
+            if e.get("step") == "execution" and e.get("agent")
+        ]
+        # Merge newly-completed agents into completed_steps
+        new_completed = list(completed)
+        for agent in agents_run:
+            if agent not in new_completed and agent in valid_roles:
+                new_completed.append(agent)
+
+        # ── QA Cycle Check ─────────────────────────────────────────────────────
+        # If QA just ran and emitted NEEDS_FIX, remove qa and coder from
+        # completed_steps so the supervisor re-routes to coder (for the fix),
+        # then back to qa (for re-validation). Max 3 QA rounds total.
+        qa_needs_fix = state.get("qa_needs_fix", False)
+        qa_iterations = state.get("qa_iterations", 0)
+        if qa_needs_fix and "qa" in new_completed and qa_iterations < 3:
+            new_qa_iterations = qa_iterations + 1
+            logger.info(
+                "QA NEEDS_FIX detected (iteration %d/3) — cycling coder back for fixes.",
+                new_qa_iterations,
+            )
+            # Remove both qa and coder so they appear in "pending" again
+            new_completed = [s for s in new_completed if s not in ("qa", "coder")]
+            return {
+                "selected_agent": "coder",
+                "agent_trace": [{
+                    "step": "supervisor",
+                    "decision": "coder",
+                    "method": "qa_cycle",
+                    "qa_iteration": new_qa_iterations,
+                    "required": required,
+                    "completed": new_completed,
+                }],
+                "supervisor_iterations": 1,
+                "required_steps": required,
+                "completed_steps": new_completed,
+                "qa_iterations": new_qa_iterations,
+                "qa_needs_fix": False,  # reset — executor will re-set if QA flags again
+            }
+
+        # ── ReAct Step 3: Diff required vs completed → next step ──────────────
+        # If we have a required pipeline, pick the next un-completed step.
+        if required:
+            pending = [s for s in required if s not in new_completed]
+            if pending:
+                next_step = pending[0]
+                if next_step in valid_roles:
+                    logger.info(
+                        "ReAct routing: required=%s completed=%s → next=%s",
+                        required, new_completed, next_step,
+                    )
+                    return {
+                        "selected_agent": next_step,
+                        "agent_trace": [{
+                            "step": "supervisor",
+                            "decision": next_step,
+                            "method": "react_step_tracking",
+                            "required": required,
+                            "completed": new_completed,
+                        }],
+                        "supervisor_iterations": 1,
+                        "required_steps": required,
+                        "completed_steps": new_completed,
+                    }
+            else:
+                # All required steps completed — done
+                logger.info(
+                    "ReAct: all required steps completed (%s); routing to DONE.", required
+                )
+                return {
+                    "selected_agent": "__done__",
+                    "agent_trace": [{"step": "supervisor", "decision": "done",
+                                     "method": "react_step_tracking",
+                                     "required": required, "completed": new_completed}],
+                    "supervisor_iterations": 1,
+                    "required_steps": required,
+                    "completed_steps": new_completed,
+                }
+
+        # ── ReAct Step 4: Fall back to LLM routing for unstructured tasks ─────
+        # (tasks where _derive_required_steps returned [] — e.g. open-ended questions)
         # Some models (e.g. Claude) reject requests where the conversation ends with
         # an AIMessage. After an agent turn, the last message is an AIMessage, so we
         # append a sentinel HumanMessage to keep the API happy.
@@ -770,6 +1172,9 @@ Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
         # agents_config order) in case the supervisor returns an unrecognisable token.
         fallback_role = agents_config[0]["role"]
 
+        # Carry step-tracking state through LLM-fallback path too
+        step_state = {"required_steps": required, "completed_steps": new_completed}
+
         if decision == "done":
             if no_agents_ran:
                 logger.warning(
@@ -780,19 +1185,22 @@ Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
                 return {
                     "selected_agent": fallback_role,
                     "agent_trace": [{"step": "supervisor", "decision": fallback_role,
-                                     "note": "overrode premature DONE"}],
+                                     "note": "overrode premature DONE", "method": "llm"}],
                     "supervisor_iterations": 1,
+                    **step_state,
                 }
             return {
                 "selected_agent": "__done__",
-                "agent_trace": [{"step": "supervisor", "decision": "done"}],
+                "agent_trace": [{"step": "supervisor", "decision": "done", "method": "llm"}],
                 "supervisor_iterations": 1,
+                **step_state,
             }
         if decision in valid_roles:
             return {
                 "selected_agent": decision,
-                "agent_trace": [{"step": "supervisor", "decision": decision}],
+                "agent_trace": [{"step": "supervisor", "decision": decision, "method": "llm"}],
                 "supervisor_iterations": 1,
+                **step_state,
             }
 
         # Unrecognised token — fall back to first agent if nothing has run yet,
@@ -806,8 +1214,10 @@ Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
             return {
                 "selected_agent": fallback_role,
                 "agent_trace": [{"step": "supervisor", "decision": fallback_role,
-                                  "note": "fallback from unrecognised token", "raw": raw}],
+                                  "note": "fallback from unrecognised token",
+                                  "method": "llm", "raw": raw}],
                 "supervisor_iterations": 1,
+                **step_state,
             }
 
         logger.warning(
@@ -818,8 +1228,9 @@ Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
         return {
             "selected_agent": "__done__",
             "agent_trace": [{"step": "supervisor", "decision": "done_unrecognised_role",
-                              "raw": raw}],
+                              "method": "llm", "raw": raw}],
             "supervisor_iterations": 1,
+            **step_state,
         }
 
     async def _sup_synthesize(state: OrchestratorState) -> OrchestratorState:
@@ -858,8 +1269,17 @@ async def build_orchestrator():
 
 
 def get_graph_config(thread_id: str, callbacks=None) -> dict:
-    """Build the LangGraph config dict with thread_id for checkpointing and optional callbacks."""
-    config: dict = {"configurable": {"thread_id": thread_id}}
+    """Build the LangGraph config dict with thread_id for checkpointing and optional callbacks.
+
+    Multi-agent supervisor flows can exceed LangGraph's default recursion_limit
+    of 25 super-steps (e.g. supervisor → coder → supervisor → qa → supervisor →
+    DONE plus inner ReAct cycles), silently terminating before qa runs. Bump
+    the limit to 100 so the pipeline can complete.
+    """
+    config: dict = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": 100,
+    }
     if callbacks:
         config["callbacks"] = callbacks
     return config

@@ -1,6 +1,7 @@
 "use client";
-import React, { useEffect, useState, useCallback, useMemo } from "react";
+import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { api } from "@/lib/api";
+import { useRegressionRun } from "@/contexts/RegressionRunContext";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -86,7 +87,7 @@ const STRAT_INFO: Record<string, { label: string; desc: string; cls: string }> =
 
 // ── Main Page ────────────────────────────────────────────────────────────────
 
-type SubTab = "golden" | "run" | "results" | "compare";
+type SubTab = "golden" | "run" | "results" | "ab" | "perf" | "prompts";
 
 export default function RegressionPage() {
   const [subTab, setSubTab] = useState<SubTab>("run");
@@ -97,14 +98,18 @@ export default function RegressionPage() {
   const [goldenCases, setGoldenCases] = useState<any[]>([]);
   const [expandedCaseId, setExpandedCaseId] = useState<string | null>(null);
 
-  // run tests
-  const [regModels, setRegModels] = useState<Set<string>>(new Set());
+  // run tests — default model: claude-sonnet-4-6
+  const [regModels, setRegModels] = useState<Set<string>>(new Set(["claude-sonnet-4-6"]));
   const [regPromptVer, setRegPromptVer] = useState("v1");
   const [regBaselineRunId, setRegBaselineRunId] = useState("");
   const [selectedCaseIds, setSelectedCaseIds] = useState<Set<string>>(new Set());
   const [caseSearch, setCaseSearch] = useState("");
   const [regRunning, setRegRunning] = useState(false);
   const [regRunResult, setRegRunResult] = useState<any>(null);
+
+  // live streaming — delegated to global RegressionRunContext
+  const regrCtx = useRegressionRun();
+  const liveBottomRef = useRef<HTMLDivElement>(null);
 
   // results
   const [regRuns, setRegRuns] = useState<any[]>([]);
@@ -116,18 +121,50 @@ export default function RegressionPage() {
   const [resultsSearch, setResultsSearch] = useState("");
   const [resultsFilter, setResultsFilter] = useState<"all" | "pass" | "fail">("all");
 
-  // compare
-  const [regDiffRunA, setRegDiffRunA] = useState("");
-  const [regDiffRunB, setRegDiffRunB] = useState("");
-  const [regDiffCaseId, setRegDiffCaseId] = useState("");
-  const [regDiff, setRegDiff] = useState<any>(null);
-  const [regRCA, setRegRCA] = useState<any>(null);
-  const [rcaLoading, setRcaLoading] = useState(false);
+  // A/B comparison
+  const [abGoldenId, setAbGoldenId] = useState("");
+  const [abOptions, setAbOptions] = useState<any[]>([]);   // available runs for chosen golden
+  const [abOptionsLoading, setAbOptionsLoading] = useState(false);
+  const [abRunIdA, setAbRunIdA] = useState("");
+  const [abRunIdB, setAbRunIdB] = useState("");
+  const [abResult, setAbResult] = useState<any>(null);
+  const [abLoading, setAbLoading] = useState(false);
+  const [abExpandAgent, setAbExpandAgent] = useState<string | null>(null);
+
+  // Performance analysis (moved from monitoring)
+  const [perfReport, setPerfReport] = useState<any>(null);
+  const [perfDays, setPerfDays] = useState(7);
+  const [regressionInsights, setRegressionInsights] = useState<any>(null);
+  const [expandedAnomalies, setExpandedAnomalies] = useState<Set<number>>(new Set());
+
+  // Prompt versions (moved from monitoring)
+  const [promptVersionsReg, setPromptVersionsReg] = useState<any>(null);
+  const [selectedRoleReg, setSelectedRoleReg] = useState("coder");
+  const [promptDiffReg, setPromptDiffReg] = useState<any>(null);
+  const [diffOldReg, setDiffOldReg] = useState("v1");
+  const [diffNewReg, setDiffNewReg] = useState("v2");
+  const [promptAbVersionAReg, setPromptAbVersionAReg] = useState("v1");
+  const [promptAbVersionBReg, setPromptAbVersionBReg] = useState("v2");
+  const [promptAbResultReg, setPromptAbResultReg] = useState<any>(null);
+  const [promptAbLoadingReg, setPromptAbLoadingReg] = useState(false);
+  const [optimizeLoading, setOptimizeLoading] = useState(false);
+  const [optimizeResult, setOptimizeResult] = useState<any>(null);
+  const [showOptimizeSetup, setShowOptimizeSetup] = useState(false);
+  const [optimizeRole, setOptimizeRole] = useState("coder");
+  const [optimizeVersion, setOptimizeVersion] = useState("latest");
+  const [optimizeMetric, setOptimizeMetric] = useState("step_efficiency");
+  const [optimizeThreshold, setOptimizeThreshold] = useState("0.7");
+  const [optimizeTrajectory, setOptimizeTrajectory] = useState<Array<{type: string; text: string; ts: number}>>([]);
+  const trajectoryEndRef = useRef<HTMLDivElement>(null);
 
   // config
   const [availableModels, setAvailableModels] = useState<any[]>([]);
   const [promptVersions, setPromptVersions] = useState<any[]>([]);
   const [showBaselineInfo, setShowBaselineInfo] = useState(false);
+  // Per-role versions loaded from PromptRegistry (keyed by role slug)
+  const [roleVersionsMap, setRoleVersionsMap] = useState<Record<string, any[]>>({});
+  // Per-role selected prompt version for the upcoming run
+  const [rolePromptVerMap, setRolePromptVerMap] = useState<Record<string, string>>({});
 
   const selectedTeam = teams.find(t => t.id === teamId);
 
@@ -135,6 +172,33 @@ export default function RegressionPage() {
     api.teams.list().then(t => { setTeams(t); if (t.length) setTeamId(t[0].id); });
     api.models.list().then(setAvailableModels).catch(() => {});
     api.promptVersions.list().then(setPromptVersions).catch(() => {});
+    // Load all roles' version lists from the registry, then auto-select latest per role.
+    // Also read the agent prompt_version from Studio (DB) so defaults match what's configured there.
+    Promise.all([
+      api.prompts.versions().catch(() => ({ roles: {} })),
+      api.teams.get("default").catch(() => ({ agents: [] })),
+    ]).then(([versionsRes, teamData]: [any, any]) => {
+      const roles = versionsRes?.roles || {};
+      setRoleVersionsMap(roles);
+      // Build default map: use Studio-configured version for each agent, falling back to
+      // the latest version in the registry, then v1.
+      const studioVersions: Record<string, string> = {};
+      for (const agent of (teamData?.agents || [])) {
+        if (agent.role && agent.prompt_version) studioVersions[agent.role] = agent.prompt_version;
+      }
+      const defaults: Record<string, string> = {};
+      for (const [role, versions] of Object.entries(roles) as [string, any[]][]) {
+        const studioVer = studioVersions[role];
+        if (studioVer && studioVer !== "v1") {
+          defaults[role] = studioVer;
+        } else {
+          // Pick the latest (first) non-v1 version if one exists
+          const latest = (versions as any[]).find((v: any) => v.version !== "v1");
+          if (latest) defaults[role] = latest.version;
+        }
+      }
+      setRolePromptVerMap(defaults);
+    });
   }, []);
 
   const loadGolden = useCallback(async () => {
@@ -145,43 +209,149 @@ export default function RegressionPage() {
     try { const r = await api.regression.runs(); setRegRuns(r); } catch { /* ignore */ }
   }, []);
 
+  const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+  const loadPerfReport = useCallback(async (days: number) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/traces/performance-report?days=${days}`);
+      setPerfReport(await res.json());
+      setExpandedAnomalies(new Set());
+    } catch { /* ignore */ }
+  }, [API_BASE]);
+
+  const loadRegressionInsights = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/traces/performance-report/regression-insights?days=90`);
+      setRegressionInsights(await res.json());
+    } catch { /* ignore */ }
+  }, [API_BASE]);
+
+  const loadPromptVersionsReg = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/prompts/versions`);
+      setPromptVersionsReg(await res.json());
+    } catch { /* ignore */ }
+  }, [API_BASE]);
+
+  const loadPromptDiffReg = useCallback(async (role: string, vOld: string, vNew: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/prompts/diff?role=${role}&version_old=${vOld}&version_new=${vNew}`);
+      setPromptDiffReg(await res.json());
+    } catch { /* ignore */ }
+  }, [API_BASE]);
+
+  const runPromptAbCompareReg = useCallback(async (role: string, va: string, vb: string) => {
+    setPromptAbLoadingReg(true);
+    setPromptAbResultReg(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/prompts/ab-compare?role=${role}&version_a=${va}&version_b=${vb}`);
+      setPromptAbResultReg(await res.json());
+    } catch { /* ignore */ }
+    finally { setPromptAbLoadingReg(false); }
+  }, [API_BASE]);
+
+  const runOptimize = useCallback(async (role: string, version: string, metric: string, threshold: string) => {
+    setOptimizeLoading(true);
+    setOptimizeResult(null);
+    setOptimizeTrajectory([]);
+    const addEvent = (type: string, text: string) =>
+      setOptimizeTrajectory(prev => [...prev, { type, text, ts: Date.now() }]);
+    try {
+      const res = await fetch(`${API_BASE}/api/prompts/optimize/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role, version: version || undefined, metric, threshold: parseFloat(threshold) || 0.7, model: "claude-sonnet-4.6" }),
+      });
+      if (!res.body) throw new Error("No SSE body");
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = ""; let finalResponse = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split("\n\n");
+        buf = parts.pop() || "";
+        for (const part of parts) {
+          if (!part.trim()) continue;
+          const lines = part.split("\n");
+          let eventType = ""; let dataStr = "";
+          for (const line of lines) {
+            if (line.startsWith("event: ")) eventType = line.slice(7);
+            else if (line.startsWith("data: ")) dataStr = line.slice(6);
+          }
+          if (!eventType || !dataStr) continue;
+          try {
+            const d = JSON.parse(dataStr);
+            if (eventType === "optimize_start") addEvent("start", `▶ Starting — role: ${d.role} | metric: ${d.metric} | version: ${d.version}`);
+            else if (eventType === "agent_start") addEvent("agent", `🤖 Agent: ${d.agent}`);
+            else if (eventType === "tool_start") addEvent("tool", `  ⚙ ${d.tool}(${Object.entries(d.args || {}).map(([k,v]) => `${k}=${String(v).slice(0,60)}`).join(", ")})`);
+            else if (eventType === "tool_end") addEvent("tool_result", `  ↳ ${d.output_preview}`);
+            else if (eventType === "version_registering") addEvent("version", `  📝 Registering new version for ${d.role}: ${d.rationale}`);
+            else if (eventType === "version_registered") addEvent("version_done", `  ✅ Registered ${d.role} @ ${d.version}`);
+            else if (eventType === "regression_result") addEvent("regression", `  📊 ${d.tool_output}`);
+            else if (eventType === "thinking") { addEvent("thinking", d.delta); finalResponse += d.delta; }
+            else if (eventType === "done") addEvent("done", `✓ Optimization complete — ${d.role} / ${d.metric}`);
+            else if (eventType === "error") addEvent("error", `✗ Error: ${d.message}`);
+          } catch { /* skip */ }
+        }
+      }
+      setOptimizeResult({ status: "completed", response: finalResponse });
+      await loadPromptVersionsReg();
+    } catch (e: any) {
+      setOptimizeResult({ status: "error", error: e.message });
+    } finally { setOptimizeLoading(false); }
+  }, [API_BASE, loadPromptVersionsReg]);
+
+  useEffect(() => {
+    if (optimizeTrajectory.length > 0) trajectoryEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [optimizeTrajectory]);
+
   useEffect(() => {
     loadGolden();
     loadRegRuns();
   }, [loadGolden, loadRegRuns]);
 
-  // ── Run tests ──────────────────────────────────────────────────
+  // Refresh run history when the active session finishes
+  useEffect(() => {
+    const active = regrCtx.sessions.find(s => s.sessionId === regrCtx.activeSessionId);
+    if (active && (active.status === "done" || active.status === "error")) {
+      loadRegRuns();
+    }
+  }, [regrCtx.sessions, regrCtx.activeSessionId, loadRegRuns]);
+
+  // ── Run tests — delegates to global RegressionRunContext ───────────────────
 
   async function runRegression() {
     setRegRunning(true);
     setRegRunResult(null);
-    const models = regModels.size > 0 ? Array.from(regModels) : [undefined];
+
+    const pvByRole = Object.fromEntries(
+      Object.entries(rolePromptVerMap).filter(([, v]) => v && v !== "v1")
+    );
+    const hasPvByRole = Object.keys(pvByRole).length > 0;
+    const globalVersion = regPromptVer !== "v1" ? regPromptVer : undefined;
+    const models = regModels.size > 0 ? Array.from(regModels) : [undefined as string | undefined];
+
+    const baseParams = {
+      team_id: teamId,
+      case_ids: selectedCaseIds.size > 0 ? Array.from(selectedCaseIds) : undefined,
+      prompt_version: !hasPvByRole ? (globalVersion || "v1") : "v1",
+      prompt_versions_by_role: hasPvByRole ? pvByRole : undefined,
+      baseline_run_id: regBaselineRunId || undefined,
+    };
+
     try {
-      if (models.length > 1) {
-        const runs: any[] = [];
-        for (const model of models) {
-          const result = await api.regression.run({
-            team_id: teamId,
-            case_ids: selectedCaseIds.size > 0 ? Array.from(selectedCaseIds) : undefined,
-            model: model || undefined,
-            prompt_version: regPromptVer !== "v1" ? regPromptVer : undefined,
-            baseline_run_id: regBaselineRunId || undefined,
-          });
-          runs.push(result);
-        }
-        setRegRunResult({ multi_run: true, runs });
-      } else {
-        const result = await api.regression.run({
-          team_id: teamId,
-          case_ids: selectedCaseIds.size > 0 ? Array.from(selectedCaseIds) : undefined,
-          model: models[0] || undefined,
-          prompt_version: regPromptVer !== "v1" ? regPromptVer : undefined,
-          baseline_run_id: regBaselineRunId || undefined,
-        });
-        setRegRunResult(result);
+      // Each model gets its own session in the global context (shows as separate tab in widget)
+      for (const model of models) {
+        regrCtx.startRun(
+          { ...baseParams, model: model || undefined },
+          model ?? "default",
+        );
       }
-      await loadRegRuns();
-      setSubTab("results");
+      setRegRunResult({ streamed: true });
+      // Give runs a moment to start, then refresh the run history
+      setTimeout(() => { loadRegRuns(); }, 3000);
     } catch (e: any) {
       setRegRunResult({ error: e.message });
     }
@@ -202,15 +372,43 @@ export default function RegressionPage() {
     try { const d = await api.regression.caseDetail(runId, caseId); setRegCaseDetail(d); } catch { /* ignore */ }
   }
 
-  async function loadTraceDiff() {
-    if (!regDiffRunA || !regDiffRunB || !regDiffCaseId) return;
-    try { const d = await api.regression.diff(regDiffRunA, regDiffRunB, regDiffCaseId); setRegDiff(d); } catch { /* ignore */ }
+  async function onAbGoldenChange(id: string) {
+    setAbGoldenId(id);
+    setAbOptions([]);
+    setAbRunIdA("");
+    setAbRunIdB("");
+    setAbResult(null);
+    if (!id) return;
+    setAbOptionsLoading(true);
+    try {
+      const d = await api.regression.abOptions(id);
+      const opts = d.options || [];
+      setAbOptions(opts);
+      // Auto-select: oldest as A, newest as B (if ≥2 distinct runs)
+      if (opts.length >= 2) {
+        setAbRunIdA(opts[opts.length - 1].run_id);
+        setAbRunIdB(opts[0].run_id);
+      } else if (opts.length === 1) {
+        setAbRunIdA(opts[0].run_id);
+        setAbRunIdB(opts[0].run_id);
+      }
+    } catch { /* ignore */ }
+    setAbOptionsLoading(false);
   }
 
-  async function runRCA(runId: string, caseId: string, baselineRunId?: string) {
-    setRcaLoading(true);
-    try { const r = await api.regression.rca(runId, caseId, baselineRunId); setRegRCA(r); } catch { /* ignore */ }
-    setRcaLoading(false);
+  async function loadAbCompare() {
+    if (!abGoldenId) return;
+    setAbLoading(true);
+    setAbResult(null);
+    try {
+      const d = await api.regression.ab({
+        golden_id: abGoldenId,
+        run_id_a: abRunIdA || undefined,
+        run_id_b: abRunIdB || undefined,
+      });
+      setAbResult(d);
+    } catch { /* ignore */ }
+    setAbLoading(false);
   }
 
   // ── Computed values ────────────────────────────────────────────
@@ -245,14 +443,16 @@ export default function RegressionPage() {
     });
   }, [regResults, resultsSearch, resultsFilter]);
 
-  const comparableCases = useMemo(() => {
-    const a = regRuns.find(r => r.id === regDiffRunA);
-    const b = regRuns.find(r => r.id === regDiffRunB);
-    if (!a?.case_ids || !b?.case_ids) return [];
-    const setB = new Set(b.case_ids as string[]);
-    const intersection = (a.case_ids as string[]).filter(id => setB.has(id));
-    return goldenCases.filter(c => intersection.includes(c.id));
-  }, [regDiffRunA, regDiffRunB, regRuns, goldenCases]);
+  // Lazy-load perf + prompts when those tabs are first visited
+  useEffect(() => {
+    if (subTab === "perf") { loadPerfReport(perfDays); loadRegressionInsights(); }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subTab]);
+
+  useEffect(() => {
+    if (subTab === "prompts" && !promptVersionsReg) loadPromptVersionsReg();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subTab]);
 
   // ── Render ─────────────────────────────────────────────────────
 
@@ -262,7 +462,7 @@ export default function RegressionPage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-semibold">Regression Testing</h1>
-          <p className="text-xs text-[var(--text-muted)] mt-0.5">Golden dataset driven quality gates, model comparison & RCA</p>
+          <p className="text-xs text-[var(--text-muted)] mt-0.5">Golden dataset quality gates, A/B comparison, performance analysis & prompt versioning</p>
         </div>
         <div className="flex items-center gap-2">
           <select value={teamId} onChange={e => setTeamId(e.target.value)} className="input !w-auto">
@@ -273,12 +473,14 @@ export default function RegressionPage() {
       </div>
 
       {/* Sub-tabs */}
-      <div className="flex gap-1 border-b border-[var(--border)]">
+      <div className="flex gap-1 border-b border-[var(--border)] flex-wrap">
         {([
           { id: "run" as SubTab, label: "Run Tests" },
           { id: "results" as SubTab, label: `Results${regRuns.length ? ` (${regRuns.length})` : ""}` },
           { id: "golden" as SubTab, label: `Golden Dataset (${goldenCases.filter(c => c.is_active).length})` },
-          { id: "compare" as SubTab, label: "Trace Diff & RCA" },
+          { id: "ab" as SubTab, label: "A/B Comparison" },
+          { id: "perf" as SubTab, label: "Performance Analysis" },
+          { id: "prompts" as SubTab, label: "Prompt Versions" },
         ]).map(tab => (
           <button key={tab.id} onClick={() => setSubTab(tab.id)}
             className={`px-4 py-2 text-sm font-medium border-b-2 transition-all ${
@@ -324,7 +526,7 @@ export default function RegressionPage() {
                     <button onClick={() => setRegModels(new Set())} className="text-[10px] text-[var(--text-muted)] underline">Clear</button>
                   )}
                 </div>
-                <p className="text-[10px] text-[var(--text-muted)]">Select 1+ to compare models side-by-side</p>
+                <p className="text-[10px] text-[var(--text-muted)]">Defaults to <span className="font-medium text-zinc-600">claude-sonnet-4-6</span>. Select 1+ to compare models side-by-side.</p>
                 <div className="border border-[var(--border)] rounded overflow-hidden">
                   <label className={`flex items-center gap-2 px-2 py-1.5 text-[11px] border-b border-[var(--border)] cursor-pointer hover:bg-[var(--bg-hover)] ${regModels.size === 0 ? "bg-zinc-50 font-medium" : ""}`}>
                     <input type="checkbox" checked={regModels.size === 0} onChange={() => setRegModels(new Set())} className="h-3 w-3 rounded border-gray-300 accent-[var(--accent)]" />
@@ -349,17 +551,50 @@ export default function RegressionPage() {
                 )}
               </div>
 
-              {/* Prompt Version */}
-              <div className="card !p-3 space-y-1.5">
-                <label className="text-[11px] font-medium uppercase text-[var(--text-muted)] tracking-wide">Prompt Version</label>
-                <select value={regPromptVer} onChange={e => setRegPromptVer(e.target.value)} className="input text-xs w-full">
-                  <option value="v1">v1 (current)</option>
-                  {promptVersions.map(pv => (
-                    <option key={pv.id} value={pv.version_label}>
-                      {pv.version_label}{pv.description ? ` — ${pv.description}` : ""}
-                    </option>
-                  ))}
-                </select>
+              {/* Prompt Version — per-role */}
+              <div className="card !p-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-[11px] font-medium uppercase text-[var(--text-muted)] tracking-wide">Prompt Versions</label>
+                  <span className="text-[10px] text-zinc-400">per role</span>
+                </div>
+                <p className="text-[10px] text-[var(--text-muted)] leading-snug">
+                  Defaults to the latest version per role (from Studio). Override per role if needed.
+                </p>
+                {Object.keys(roleVersionsMap).length > 0 ? (
+                  <div className="space-y-1.5">
+                    {Object.entries(roleVersionsMap).map(([role, versions]: [string, any[]]) => {
+                      const selected = rolePromptVerMap[role] || "v1";
+                      const allVersions = versions as any[];
+                      const latestVer = allVersions.find((v: any) => v.version !== "v1");
+                      const isLatest = latestVer && selected === latestVer.version;
+                      return (
+                        <div key={role} className={`flex items-center gap-2 px-2 py-1.5 rounded-md border ${selected !== "v1" ? "border-indigo-200 bg-indigo-50/50" : "border-transparent"}`}>
+                          <span className="text-[11px] text-zinc-700 font-medium w-24 shrink-0">{role}</span>
+                          <select
+                            value={selected}
+                            onChange={e => setRolePromptVerMap(prev => ({ ...prev, [role]: e.target.value }))}
+                            className="input !py-0.5 text-[10px] flex-1">
+                            <option value="v1">v1 (baseline)</option>
+                            {allVersions.filter((v: any) => v.version !== "v1").map((v: any) => (
+                              <option key={v.version} value={v.version}>
+                                {v.version}{v.cot_enhanced ? " [CoT]" : ""}{v.created_by === "optimizer" ? " [opt]" : ""}
+                                {v.version === latestVer?.version ? " ← latest" : ""}
+                              </option>
+                            ))}
+                          </select>
+                          {isLatest && <span className="text-[9px] font-medium text-emerald-600 shrink-0">latest</span>}
+                        </div>
+                      );
+                    })}
+                    {Object.values(rolePromptVerMap).some(v => v && v !== "v1") && (
+                      <div className="text-[10px] text-indigo-600 font-medium mt-1">
+                        {Object.entries(rolePromptVerMap).filter(([, v]) => v && v !== "v1").map(([r, v]) => `${r}→${v}`).join(", ")} will use non-baseline prompts
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-[10px] text-zinc-400 italic">Loading role versions…</div>
+                )}
               </div>
 
               {/* Baseline Run */}
@@ -400,10 +635,8 @@ export default function RegressionPage() {
                 <div className={`text-xs p-3 rounded-lg border ${regRunResult.error ? "border-red-200 bg-red-50 text-red-700" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}>
                   {regRunResult.error ? (
                     <span>Error: {regRunResult.error}</span>
-                  ) : regRunResult.multi_run ? (
-                    <span>{regRunResult.runs?.length} model runs completed → see Results tab</span>
                   ) : (
-                    <span>{regRunResult.summary?.num_passed}/{regRunResult.num_cases} passed · ${(regRunResult.summary?.total_cost || 0).toFixed(4)} · Results tab updated</span>
+                    <span>Run started — see live widget (bottom-left) for progress. Results tab updates when done.</span>
                   )}
                 </div>
               )}
@@ -502,6 +735,8 @@ export default function RegressionPage() {
         </div>
       )}
 
+      {/* Live run widget is shown globally via the floating RegressionRunWidget */}
+
       {/* ─────────── RESULTS ─────────── */}
       {subTab === "results" && (
         <div className="grid grid-cols-[320px_1fr] gap-4">
@@ -566,6 +801,20 @@ export default function RegressionPage() {
               </div>
             ) : (
               <>
+                {/* Run ID header with copy button */}
+                <div className="flex items-center gap-2 px-1">
+                  <span className="text-[10px] text-[var(--text-muted)] uppercase font-medium">Run</span>
+                  <code className="text-xs font-mono font-semibold text-zinc-700 bg-zinc-100 px-2 py-0.5 rounded border border-zinc-200">{regSelectedRunId}</code>
+                  <button
+                    onClick={() => { navigator.clipboard.writeText(regSelectedRunId); }}
+                    className="text-[10px] px-2 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:border-zinc-400 hover:text-zinc-700 transition-all"
+                    title="Copy run ID"
+                  >Copy</button>
+                  {regResults?.model && (
+                    <span className="text-[10px] text-[var(--text-muted)] ml-auto">{regResults.model}</span>
+                  )}
+                </div>
+
                 {/* Summary KPIs */}
                 <div className="grid grid-cols-5 gap-3">
                   <Metric label="Pass Rate" value={`${((regResults.summary?.pass_rate || 0) * 100).toFixed(0)}%`}
@@ -671,7 +920,7 @@ export default function RegressionPage() {
                 </div>
 
                 {/* Case detail drawer */}
-                {regCaseDetail && <CaseDetailPanel detail={regCaseDetail} runId={regSelectedRunId} baselineRunId={regBaselineRunId} onClose={() => setRegCaseDetail(null)} onRCA={runRCA} rcaLoading={rcaLoading} regRCA={regRCA} />}
+                {regCaseDetail && <CaseDetailPanel detail={regCaseDetail} onClose={() => setRegCaseDetail(null)} />}
               </>
             )}
           </div>
@@ -746,48 +995,845 @@ export default function RegressionPage() {
         </div>
       )}
 
-      {/* ─────────── TRACE DIFF & RCA ─────────── */}
-      {subTab === "compare" && (
+      {/* ─────────── A/B COMPARISON ─────────── */}
+      {subTab === "ab" && (
         <div className="space-y-4">
-          <div className="card">
-            <h2 className="text-sm font-medium mb-2">Trace-Based Comparison</h2>
-            <p className="text-[11px] text-[var(--text-muted)] mb-3">
-              Compare execution traces side-by-side for the same golden test case across two regression runs.
+          {/* Filter bar */}
+          <div className="card space-y-3">
+            <h2 className="text-sm font-medium">A/B Comparison</h2>
+            <p className="text-[11px] text-[var(--text-muted)]">
+              Compare two configurations (model, prompt version) for the same golden test. Fetches the most recent regression result matching each set of filters.
             </p>
-            <div className="grid grid-cols-3 gap-3 mb-3">
-              <div>
-                <label className="text-[10px] text-[var(--text-muted)] block mb-0.5">Run A</label>
-                <select value={regDiffRunA} onChange={e => setRegDiffRunA(e.target.value)} className="input text-xs w-full">
-                  <option value="">Select run A…</option>
-                  {regRuns.map(r => <option key={r.id} value={r.id}>{r.id.slice(0, 8)} — {r.model} ({r.passed}/{r.num_cases})</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="text-[10px] text-[var(--text-muted)] block mb-0.5">Run B</label>
-                <select value={regDiffRunB} onChange={e => setRegDiffRunB(e.target.value)} className="input text-xs w-full">
-                  <option value="">Select run B…</option>
-                  {regRuns.filter(r => r.id !== regDiffRunA).map(r => <option key={r.id} value={r.id}>{r.id.slice(0, 8)} — {r.model} ({r.passed}/{r.num_cases})</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="text-[10px] text-[var(--text-muted)] block mb-0.5">Test Case</label>
-                <select value={regDiffCaseId} onChange={e => setRegDiffCaseId(e.target.value)} className="input text-xs w-full" disabled={comparableCases.length === 0}>
-                  <option value="">{comparableCases.length === 0 ? "Pick runs first" : "Select case…"}</option>
-                  {comparableCases.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                </select>
-              </div>
+            {/* Step 1: pick golden test */}
+            <div>
+              <label className="text-[10px] text-[var(--text-muted)] block mb-0.5">1 · Golden Test</label>
+              <select value={abGoldenId} onChange={e => onAbGoldenChange(e.target.value)} className="input text-xs w-full max-w-lg">
+                <option value="">— select test —</option>
+                {goldenCases.filter(c => c.is_active).map(c => (
+                  <option key={c.id} value={c.id}>{c.name || c.id}</option>
+                ))}
+              </select>
             </div>
-            <button onClick={loadTraceDiff} disabled={!regDiffRunA || !regDiffRunB || !regDiffCaseId} className="btn-primary">Load Diff</button>
+
+            {/* Step 2: pick runs (populated after golden selection) */}
+            {abGoldenId && (
+              <div className="space-y-2">
+                <div className="text-[10px] text-[var(--text-muted)]">
+                  2 · Pick two runs to compare — each run shows its model and prompt-version set
+                </div>
+                {abOptionsLoading && (
+                  <p className="text-xs text-[var(--text-muted)] animate-pulse">Loading available runs…</p>
+                )}
+                {!abOptionsLoading && abOptions.length === 0 && (
+                  <p className="text-xs text-amber-600">No regression results for this test yet — run it first.</p>
+                )}
+                {!abOptionsLoading && abOptions.length > 0 && (
+                  <div className="grid grid-cols-2 gap-4">
+                    {(["A","B"] as const).map(side => {
+                      const val = side === "A" ? abRunIdA : abRunIdB;
+                      const setVal = side === "A" ? setAbRunIdA : setAbRunIdB;
+                      const other = side === "A" ? abRunIdB : abRunIdA;
+                      const color = side === "A" ? "border-blue-200 bg-blue-50" : "border-orange-200 bg-orange-50";
+                      const label = side === "A" ? "text-blue-700" : "text-orange-700";
+                      return (
+                        <div key={side} className={`rounded-lg border p-3 ${color}`}>
+                          <div className={`text-[11px] font-bold mb-2 ${label}`}>Side {side}</div>
+                          <div className="space-y-1">
+                            {abOptions.map(opt => {
+                              const selected = val === opt.run_id;
+                              const isOther = other === opt.run_id && opt.run_id !== val;
+                              const date = opt.created_at ? new Date(opt.created_at).toLocaleDateString("en", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "?";
+                              return (
+                                <button key={opt.run_id}
+                                  onClick={() => setVal(opt.run_id)}
+                                  className={`w-full text-left px-2 py-1.5 rounded border text-[11px] transition-all ${
+                                    selected
+                                      ? side === "A" ? "border-blue-400 bg-blue-100 font-medium" : "border-orange-400 bg-orange-100 font-medium"
+                                      : isOther
+                                      ? "border-[var(--border)] opacity-40 cursor-not-allowed"
+                                      : "border-[var(--border)] bg-white hover:bg-zinc-50"
+                                  }`}
+                                  disabled={isOther && !selected}>
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="font-mono text-[10px] text-[var(--text-muted)]">{opt.run_id.slice(0, 8)}</span>
+                                    <span className="font-medium truncate max-w-[120px]">{opt.model?.split("/").pop() || opt.model}</span>
+                                    <span className={`px-1.5 py-0.5 rounded text-[9px] font-mono border ${
+                                      opt.prompt_version !== "v1" ? "bg-violet-50 text-violet-700 border-violet-200" : "bg-zinc-100 text-zinc-500 border-zinc-200"
+                                    }`}>{opt.prompt_version}</span>
+                                    {opt.actual_strategy && (
+                                      <span className="px-1.5 py-0.5 rounded text-[9px] border bg-zinc-50 text-zinc-500 border-zinc-200">{opt.actual_strategy}</span>
+                                    )}
+                                    <span className={`ml-auto text-[10px] font-semibold ${opt.overall_pass ? "text-emerald-600" : "text-red-500"}`}>
+                                      {opt.overall_pass ? "✓" : "✗"}
+                                    </span>
+                                  </div>
+                                  {opt.router_prompt_version && (
+                                    <div className="text-[9px] text-purple-500 mt-0.5 font-mono">{opt.router_prompt_version}</div>
+                                  )}
+                                  <div className="text-[10px] text-[var(--text-muted)] mt-0.5">{date}</div>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <button onClick={loadAbCompare} disabled={!abGoldenId || !abRunIdA || abLoading} className="btn-primary text-sm">
+              {abLoading ? "Loading…" : "Compare →"}
+            </button>
           </div>
 
-          {regDiff && <TraceDiffPanel diff={regDiff} onRCA={() => runRCA(regDiffRunA, regDiffCaseId, regDiffRunB)} rcaLoading={rcaLoading} regRCA={regRCA} />}
+          {abResult?.error && !abResult.side_a && !abResult.side_b && (
+            <div className="card border-l-4 border-amber-400">
+              <p className="text-xs text-amber-700">{abResult.error}</p>
+              <p className="text-[11px] text-[var(--text-muted)] mt-1">Run regression tests for this golden case first, then compare.</p>
+            </div>
+          )}
+
+          {abResult && (abResult.side_a || abResult.side_b) && (
+            <div className="space-y-4">
+              {/* Header */}
+              <div className="card !py-3">
+                <div className="flex items-center gap-3 flex-wrap">
+                  <div>
+                    <div className="text-[10px] text-[var(--text-muted)] uppercase font-medium">{abResult.golden_id}</div>
+                    <div className="text-sm font-semibold">{abResult.golden_name}</div>
+                  </div>
+                  {abResult.golden_prompt && (
+                    <div className="flex-1 min-w-0 text-xs text-[var(--text-muted)] italic truncate" title={abResult.golden_prompt}>
+                      {abResult.golden_prompt.slice(0, 140)}…
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Expected Output */}
+              {abResult.expected_output && (
+                <div className="card">
+                  <div className="text-[10px] text-[var(--text-muted)] uppercase font-medium mb-1.5 flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" /> Expected Output
+                  </div>
+                  <div className="p-2 rounded bg-emerald-50 border border-emerald-100 max-h-36 overflow-y-auto">
+                    <Md content={abResult.expected_output} />
+                  </div>
+                </div>
+              )}
+
+              {/* Side-by-side actual outputs */}
+              <div className="grid grid-cols-2 gap-4">
+                {(["a", "b"] as const).map(side => {
+                  const s = abResult[`side_${side}`];
+                  if (!s) return (
+                    <div key={side} className="card flex items-center justify-center py-12 text-xs text-[var(--text-muted)]">
+                      No data for Side {side.toUpperCase()} with these filters
+                    </div>
+                  );
+                  const color = side === "a" ? "blue" : "orange";
+                  return (
+                    <div key={side} className={`rounded-lg border overflow-hidden ${side === "a" ? "border-blue-200" : "border-orange-200"}`}>
+                      <div className={`px-3 py-2 border-b flex items-center gap-2 flex-wrap ${side === "a" ? "bg-blue-50 border-blue-200" : "bg-orange-50 border-orange-200"}`}>
+                        <span className={`text-[11px] font-bold ${side === "a" ? "text-blue-700" : "text-orange-700"}`}>Side {side.toUpperCase()}</span>
+                        <span className="text-[10px] text-[var(--text-muted)] font-mono">{s.model || "any"}</span>
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white border">{s.prompt_version || "v?"}</span>
+                        {s.actual_strategy && <span className="text-[10px] text-[var(--text-muted)]">{s.actual_strategy}</span>}
+                        <span className={`ml-auto text-[10px] font-semibold ${s.overall_pass ? "text-emerald-600" : "text-red-600"}`}>
+                          {s.overall_pass ? "✓ PASS" : "✗ FAIL"}
+                        </span>
+                      </div>
+                      <div className="p-3 space-y-3">
+                        {/* Stats */}
+                        <div className="grid grid-cols-3 gap-1.5 text-[10px]">
+                          <span><span className="text-[var(--text-muted)]">LLM:</span> <b>{s.actual_llm_calls ?? "—"}</b></span>
+                          <span><span className="text-[var(--text-muted)]">Tools:</span> <b>{s.actual_tool_calls ?? "—"}</b></span>
+                          <span><span className="text-[var(--text-muted)]">Latency:</span> <b>{s.actual_latency_ms ? `${(s.actual_latency_ms/1000).toFixed(1)}s` : "—"}</b></span>
+                          <span><span className="text-[var(--text-muted)]">Cost:</span> <b>${s.actual_cost?.toFixed(5) ?? "—"}</b></span>
+                          <span><span className="text-[var(--text-muted)]">Sim:</span> <b className={s.semantic_similarity >= 0.7 ? "text-emerald-600" : "text-amber-600"}>{s.semantic_similarity != null ? `${(s.semantic_similarity*100).toFixed(1)}%` : "—"}</b></span>
+                          {s.run_id && <span className="text-[var(--text-muted)] font-mono truncate" title={s.run_id}>{s.run_id.slice(0,8)}</span>}
+                        </div>
+                        {/* Trajectory path */}
+                        <div className="text-[10px]">
+                          <span className="text-[var(--text-muted)]">Trajectory: </span>
+                          <span className="font-medium">{(s.actual_delegation_pattern?.length ? s.actual_delegation_pattern : [s.actual_agent]).filter(Boolean).join(" → ") || "—"}</span>
+                        </div>
+                        {/* Tools */}
+                        {s.actual_tools?.length > 0 && (
+                          <div className="flex flex-wrap gap-1">
+                            {s.actual_tools.map((t: string, i: number) => (
+                              <span key={i} className="px-1.5 py-0.5 rounded bg-violet-50 text-violet-600 text-[9px] border border-violet-200 font-mono">{t}</span>
+                            ))}
+                          </div>
+                        )}
+                        {/* Per-agent breakdown */}
+                        {Object.keys(s.per_agent || {}).length > 0 && (
+                          <div className="space-y-1">
+                            <div className="text-[10px] text-[var(--text-muted)] uppercase font-medium">Per-Agent</div>
+                            {Object.entries(s.per_agent || {}).map(([agent, info]: [string, any]) => {
+                              const isOpen = abExpandAgent === `${side}:${agent}`;
+                              return (
+                                <div key={agent} className="border border-[var(--border)] rounded overflow-hidden">
+                                  <button
+                                    onClick={() => setAbExpandAgent(isOpen ? null : `${side}:${agent}`)}
+                                    className="w-full flex items-center gap-2 px-2 py-1 bg-zinc-50 hover:bg-zinc-100 text-left">
+                                    <span className="text-[10px] font-semibold text-zinc-700">{agent}</span>
+                                    <span className="text-[9px] text-[var(--text-muted)] ml-auto">{info.tool_calls} tools · {info.llm_calls} llm {isOpen ? "▾" : "▸"}</span>
+                                  </button>
+                                  {isOpen && info.tools?.length > 0 && (
+                                    <div className="px-2 py-1.5 flex flex-wrap gap-1">
+                                      {info.tools.map((t: string, i: number) => (
+                                        <span key={i} className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 text-[9px] border border-amber-200 font-mono">{t}</span>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                        {/* Actual output */}
+                        <div>
+                          <div className="text-[10px] text-[var(--text-muted)] uppercase font-medium mb-0.5">Actual Output</div>
+                          <div className="p-2 rounded bg-[var(--bg)] border border-[var(--border)] max-h-48 overflow-y-auto">
+                            <Md content={s.actual_output || "—"} />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* DeepEval metric diff table */}
+              {Object.keys(abResult.metric_diff || {}).length > 0 && (
+                <div className="card">
+                  <h3 className="text-sm font-medium mb-3">DeepEval Metric Comparison</h3>
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-left text-[var(--text-muted)] border-b border-[var(--border)]">
+                        <th className="pb-2 font-medium">Metric</th>
+                        <th className="pb-2 font-medium text-right">Side A</th>
+                        <th className="pb-2 font-medium text-right">Side B</th>
+                        <th className="pb-2 font-medium text-right">Δ</th>
+                        <th className="pb-2 font-medium pr-2">A Reasoning</th>
+                        <th className="pb-2 font-medium">B Reasoning</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(abResult.metric_diff || {}).map(([metric, d]: [string, any]) => (
+                        <tr key={metric} className="border-b border-[var(--border)] last:border-0 align-top">
+                          <td className="py-2 font-medium capitalize">{metric.replace(/_/g, " ")}</td>
+                          <td className="py-2 text-right font-mono">
+                            {d.a_score != null ? (
+                              <span className={`${Number(d.a_score) >= 0.7 ? "text-emerald-600" : Number(d.a_score) >= 0.4 ? "text-amber-600" : "text-red-600"}`}>
+                                {(Number(d.a_score)*100).toFixed(0)}%
+                              </span>
+                            ) : "—"}
+                          </td>
+                          <td className="py-2 text-right font-mono">
+                            {d.b_score != null ? (
+                              <span className={`${Number(d.b_score) >= 0.7 ? "text-emerald-600" : Number(d.b_score) >= 0.4 ? "text-amber-600" : "text-red-600"}`}>
+                                {(Number(d.b_score)*100).toFixed(0)}%
+                              </span>
+                            ) : "—"}
+                          </td>
+                          <td className={`py-2 text-right font-mono font-medium ${d.improved ? "text-emerald-600" : d.regressed ? "text-red-600" : "text-[var(--text-muted)]"}`}>
+                            {d.delta != null ? `${d.delta > 0 ? "+" : ""}${(d.delta*100).toFixed(0)}pp` : "—"}
+                          </td>
+                          <td className="py-2 pr-2 text-[10px] text-[var(--text-muted)] max-w-[180px]">
+                            {d.a_reason ? <span className="line-clamp-3" title={d.a_reason}>{d.a_reason}</span> : "—"}
+                          </td>
+                          <td className="py-2 text-[10px] text-[var(--text-muted)] max-w-[180px]">
+                            {d.b_reason ? <span className="line-clamp-3" title={d.b_reason}>{d.b_reason}</span> : "—"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ─────────── PERFORMANCE ANALYSIS ─────────── */}
+      {subTab === "perf" && (
+        <div className="space-y-5">
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-[var(--text-muted)]">Look-back window:</span>
+            {[1, 7, 14, 30].map(d => (
+              <button key={d} onClick={() => { setPerfDays(d); loadPerfReport(d); }}
+                className={`px-3 py-1 rounded text-xs font-medium border transition-all ${perfDays === d ? "bg-zinc-900 text-white border-zinc-900" : "border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)]"}`}>
+                {d}d
+              </button>
+            ))}
+            <button onClick={() => { loadPerfReport(perfDays); loadRegressionInsights(); }} className="btn-secondary ml-2">Refresh</button>
+          </div>
+
+          {!perfReport && <div className="card text-center py-8 text-[var(--text-muted)] text-sm">Loading performance report…</div>}
+
+          {perfReport && (
+            <>
+              <div className="grid grid-cols-4 gap-3">
+                <Metric label="Total cost" value={`$${(perfReport.cost_breakdown?.summary?.total_cost_usd || 0).toFixed(4)}`} sub={`${perfDays}d window`} />
+                <Metric label="Total agent calls" value={String(perfReport.cost_breakdown?.summary?.total_calls || 0)} />
+                <Metric label="Avg cost/call" value={`$${(perfReport.cost_breakdown?.summary?.avg_cost_per_call_usd || 0).toFixed(5)}`} />
+                <Metric label="Anomalies detected" value={String((perfReport.performance_anomalies || []).length)} accent={(perfReport.performance_anomalies || []).length > 0 ? "text-amber-600" : "text-emerald-600"} />
+              </div>
+
+              <div className="card">
+                <h3 className="text-sm font-medium mb-3">Agent Call Latency Percentiles (ms)</h3>
+                {Object.keys(perfReport.agent_latency_percentiles || {}).length === 0 ? (
+                  <p className="text-xs text-[var(--text-muted)]">No agent execution spans recorded yet.</p>
+                ) : (
+                  <table className="w-full text-xs">
+                    <thead><tr className="text-left text-[var(--text-muted)] border-b border-[var(--border)]">
+                      <th className="pb-2 font-medium">Agent</th>
+                      <th className="pb-2 font-medium text-right">Count</th>
+                      <th className="pb-2 font-medium text-right">Avg</th>
+                      <th className="pb-2 font-medium text-right">p50</th>
+                      <th className="pb-2 font-medium text-right">p95</th>
+                      <th className="pb-2 font-medium text-right text-amber-600">p99</th>
+                      <th className="pb-2 font-medium text-right">Max</th>
+                    </tr></thead>
+                    <tbody>
+                      {Object.entries(perfReport.agent_latency_percentiles || {}).map(([agent, d]: [string, any]) => (
+                        <tr key={agent} className="border-b border-[var(--border)] last:border-0">
+                          <td className="py-1.5 font-medium">{agent === "_overall" ? "▶ Overall" : agent}</td>
+                          <td className="py-1.5 text-right text-[var(--text-muted)]">{d.count}</td>
+                          <td className="py-1.5 text-right">{d.avg}ms</td>
+                          <td className="py-1.5 text-right">{d.p50}ms</td>
+                          <td className="py-1.5 text-right">{d.p95}ms</td>
+                          <td className={`py-1.5 text-right font-medium ${d.p99 > 5000 ? "text-red-600" : d.p99 > 2000 ? "text-amber-600" : "text-emerald-600"}`}>{d.p99}ms</td>
+                          <td className="py-1.5 text-right text-[var(--text-muted)]">{d.max}ms</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+
+              <div className="card">
+                <h3 className="text-sm font-medium mb-3">Tool Failure Rates</h3>
+                {Object.keys(perfReport.tool_failure_rates || {}).length === 0 ? (
+                  <p className="text-xs text-[var(--text-muted)]">No tool call spans recorded yet.</p>
+                ) : (
+                  <table className="w-full text-xs">
+                    <thead><tr className="text-left text-[var(--text-muted)] border-b border-[var(--border)]">
+                      <th className="pb-2 font-medium">Tool</th>
+                      <th className="pb-2 font-medium text-right">Total</th>
+                      <th className="pb-2 font-medium text-right">Failed</th>
+                      <th className="pb-2 font-medium text-right">Failure %</th>
+                    </tr></thead>
+                    <tbody>
+                      {Object.entries(perfReport.tool_failure_rates || {})
+                        .sort(([, a]: any, [, b]: any) => (b.failure_rate_pct || 0) - (a.failure_rate_pct || 0))
+                        .map(([tool, d]: [string, any]) => (
+                        <tr key={tool} className="border-b border-[var(--border)] last:border-0">
+                          <td className="py-1.5 font-medium">{tool === "_overall" ? "▶ Overall" : tool}</td>
+                          <td className="py-1.5 text-right">{d.total}</td>
+                          <td className="py-1.5 text-right">{d.failed}</td>
+                          <td className={`py-1.5 text-right font-medium ${(d.failure_rate_pct || 0) > 10 ? "text-red-600" : (d.failure_rate_pct || 0) > 3 ? "text-amber-600" : "text-emerald-600"}`}>
+                            {d.failure_rate_pct}%
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="card">
+                  <h3 className="text-sm font-medium mb-3">Cost by Agent Role</h3>
+                  {Object.keys(perfReport.cost_breakdown?.by_agent || {}).length === 0 ? (
+                    <p className="text-xs text-[var(--text-muted)]">No cost data recorded yet.</p>
+                  ) : (
+                    <div className="space-y-2">
+                      {Object.entries(perfReport.cost_breakdown?.by_agent || {}).map(([agent, d]: [string, any]) => {
+                        const total = perfReport.cost_breakdown?.summary?.total_cost_usd || 1;
+                        const pct = total > 0 ? ((d.total_cost_usd / total) * 100) : 0;
+                        return (
+                          <div key={agent}>
+                            <div className="flex justify-between text-xs mb-0.5">
+                              <span className="font-medium">{agent}</span>
+                              <span className="text-[var(--text-muted)]">${d.total_cost_usd.toFixed(5)} ({pct.toFixed(1)}%)</span>
+                            </div>
+                            <div className="h-1.5 rounded bg-zinc-100">
+                              <div className="h-1.5 rounded bg-zinc-800" style={{ width: `${Math.min(100, pct)}%` }} />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+                <div className="card">
+                  <h3 className="text-sm font-medium mb-3">Context Window Utilisation</h3>
+                  {Object.keys(perfReport.context_window_utilization || {}).length === 0 ? (
+                    <p className="text-xs text-[var(--text-muted)]">No LLM call spans recorded yet.</p>
+                  ) : (
+                    <table className="w-full text-xs">
+                      <thead><tr className="text-left text-[var(--text-muted)] border-b border-[var(--border)]">
+                        <th className="pb-2 font-medium">Model</th>
+                        <th className="pb-2 font-medium text-right">Avg util</th>
+                        <th className="pb-2 font-medium text-right">p99 util</th>
+                        <th className="pb-2 font-medium text-right">⚠ &gt;80%</th>
+                      </tr></thead>
+                      <tbody>
+                        {Object.entries(perfReport.context_window_utilization || {}).map(([model, d]: [string, any]) => (
+                          <tr key={model} className="border-b border-[var(--border)] last:border-0">
+                            <td className="py-1.5 font-medium truncate max-w-[120px]" title={model}>{model.split("/").pop() || model}</td>
+                            <td className="py-1.5 text-right">{d.avg_utilization_pct}%</td>
+                            <td className={`py-1.5 text-right font-medium ${d.p99_utilization_pct > 80 ? "text-red-600" : d.p99_utilization_pct > 50 ? "text-amber-600" : "text-emerald-600"}`}>{d.p99_utilization_pct}%</td>
+                            <td className={`py-1.5 text-right ${d.at_risk_count > 0 ? "text-amber-600" : "text-[var(--text-muted)]"}`}>{d.at_risk_count}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+
+              {/* Latency Anomalies — expandable */}
+              {(perfReport.performance_anomalies || []).length > 0 && (
+                <div className="card border-l-4 border-amber-400">
+                  <div className="flex items-center justify-between mb-3">
+                    <h3 className="text-sm font-medium">⚠ Latency Anomalies (z-score ≥ 2.5)</h3>
+                    <span className="text-[10px] text-[var(--text-muted)]">
+                      {(perfReport.performance_anomalies || []).length} total · click a row to expand
+                    </span>
+                  </div>
+                  <div className="space-y-1.5">
+                    {(perfReport.performance_anomalies || []).slice(0, 15).map((a: any, i: number) => {
+                      const isOpen = expandedAnomalies.has(i);
+                      const critCls = a.severity === "CRITICAL" ? "border-red-300 bg-red-50" : "border-amber-200 bg-amber-50";
+                      const toggleAnom = () => setExpandedAnomalies(prev => {
+                        const next = new Set(prev);
+                        if (next.has(i)) next.delete(i); else next.add(i);
+                        return next;
+                      });
+                      return (
+                        <div key={i} className={`rounded border text-xs overflow-hidden ${critCls}`}>
+                          {/* Summary row — always visible */}
+                          <button
+                            onClick={toggleAnom}
+                            className="w-full flex items-center gap-2 px-2.5 py-2 hover:brightness-95 transition-all text-left">
+                            <span className={`text-[10px] font-bold shrink-0 ${a.severity === "CRITICAL" ? "text-red-600" : "text-amber-600"}`}>
+                              {a.severity}
+                            </span>
+                            <span className="font-medium truncate max-w-[180px]">{a.name || "—"}</span>
+                            <span className="text-[var(--text-muted)] text-[10px] shrink-0">({a.span_type})</span>
+                            <span className="font-mono shrink-0">{a.duration_ms?.toFixed(0)}ms</span>
+                            <span className="text-[var(--text-muted)] text-[10px] shrink-0">vs μ {a.mean_ms?.toFixed(0)}ms</span>
+                            <span className="font-mono text-amber-700 text-[10px] shrink-0">z={a.z_score}</span>
+                            {a.agent_role && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-white border border-[var(--border)] text-zinc-600 shrink-0">{a.agent_role}</span>
+                            )}
+                            {a.prompt_version && a.prompt_version !== "v1" && (
+                              <span className="text-[9px] px-1.5 py-0.5 rounded bg-violet-100 text-violet-700 border border-violet-200 font-mono shrink-0">{a.prompt_version}</span>
+                            )}
+                            <span className="ml-auto text-[10px] text-[var(--text-muted)] shrink-0">{isOpen ? "▾" : "▸"}</span>
+                          </button>
+
+                          {/* Expanded detail */}
+                          {isOpen && (
+                            <div className="px-3 pb-3 pt-0 space-y-2 border-t border-[var(--border)]">
+                              <div className="grid grid-cols-2 gap-x-6 gap-y-1 mt-2 text-[10px]">
+                                <div className="flex gap-1.5">
+                                  <span className="text-[var(--text-muted)] shrink-0">Span type:</span>
+                                  <span className="font-medium">{a.span_type}</span>
+                                </div>
+                                <div className="flex gap-1.5">
+                                  <span className="text-[var(--text-muted)] shrink-0">Duration:</span>
+                                  <span className="font-mono font-medium">{a.duration_ms?.toFixed(1)}ms</span>
+                                </div>
+                                <div className="flex gap-1.5">
+                                  <span className="text-[var(--text-muted)] shrink-0">Mean:</span>
+                                  <span className="font-mono">{a.mean_ms?.toFixed(1)}ms</span>
+                                </div>
+                                <div className="flex gap-1.5">
+                                  <span className="text-[var(--text-muted)] shrink-0">Std Dev:</span>
+                                  <span className="font-mono">{a.stdev_ms?.toFixed(1)}ms</span>
+                                </div>
+                                <div className="flex gap-1.5">
+                                  <span className="text-[var(--text-muted)] shrink-0">Z-score:</span>
+                                  <span className={`font-mono font-bold ${a.z_score >= 4 ? "text-red-600" : "text-amber-600"}`}>{a.z_score}</span>
+                                </div>
+                                {a.model && a.model !== "unknown" && (
+                                  <div className="flex gap-1.5">
+                                    <span className="text-[var(--text-muted)] shrink-0">Model:</span>
+                                    <span className="font-mono truncate">{a.model?.split("/").pop() || a.model}</span>
+                                  </div>
+                                )}
+                                {a.agent_role && (
+                                  <div className="flex gap-1.5">
+                                    <span className="text-[var(--text-muted)] shrink-0">Agent:</span>
+                                    <span className="font-medium">{a.agent_role}</span>
+                                  </div>
+                                )}
+                                {a.prompt_version && (
+                                  <div className="flex gap-1.5">
+                                    <span className="text-[var(--text-muted)] shrink-0">Prompt ver.:</span>
+                                    <span className={`font-mono ${a.prompt_version !== "v1" ? "text-violet-700" : ""}`}>{a.prompt_version}</span>
+                                  </div>
+                                )}
+                                {a.trace_id && (
+                                  <div className="flex gap-1.5">
+                                    <span className="text-[var(--text-muted)] shrink-0">Trace:</span>
+                                    <span className="font-mono text-zinc-500">{String(a.trace_id).slice(0, 16)}</span>
+                                  </div>
+                                )}
+                              </div>
+                              {a.task && (
+                                <div className="text-[10px] mt-1">
+                                  <span className="text-[var(--text-muted)]">Task: </span>
+                                  <span className="text-zinc-700 italic">{a.task}</span>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {(perfReport.performance_anomalies || []).length > 15 && (
+                    <p className="text-[10px] text-[var(--text-muted)] mt-2">
+                      Showing 15 of {(perfReport.performance_anomalies || []).length} anomalies. Narrow the look-back window to see fewer.
+                    </p>
+                  )}
+                </div>
+              )}
+              {(perfReport.performance_anomalies || []).length === 0 && (
+                <div className="card"><p className="text-xs text-emerald-600">✓ No latency anomalies in the last {perfDays} days.</p></div>
+              )}
+            </>
+          )}
+
+          {/* Regression Quality Insights */}
+          <div className="mt-2">
+            <h2 className="text-sm font-semibold mb-3 text-zinc-700 uppercase tracking-wide">Regression Quality Insights</h2>
+            {!regressionInsights && <div className="card text-center py-6 text-[var(--text-muted)] text-xs">Loading…</div>}
+            {regressionInsights && regressionInsights.summary?.total_runs > 0 && (
+              <>
+                <div className="grid grid-cols-4 gap-3 mb-4">
+                  <Metric label="Total regression runs" value={String(regressionInsights.summary.total_runs)} />
+                  <Metric label="Overall pass rate" value={`${((regressionInsights.summary.pass_rate || 0)*100).toFixed(1)}%`} accent={(regressionInsights.summary.pass_rate || 0) >= 0.8 ? "text-emerald-600" : "text-amber-600"} />
+                  <Metric label="Worst metric" value={regressionInsights.summary.worst_metric || "—"} accent="text-red-600" />
+                  <Metric label="Most failed agent" value={regressionInsights.summary.most_failed_agent || "—"} accent="text-amber-600" />
+                </div>
+                <div className="grid grid-cols-2 gap-4 mb-4">
+                  <div className="card">
+                    <h3 className="text-sm font-medium mb-3">DeepEval Metric Averages (lowest first)</h3>
+                    <table className="w-full text-xs">
+                      <thead><tr className="text-left text-[var(--text-muted)] border-b border-[var(--border)]">
+                        <th className="pb-2 font-medium">Metric</th>
+                        <th className="pb-2 font-medium text-right">Avg</th>
+                        <th className="pb-2 font-medium text-right">Threshold</th>
+                        <th className="pb-2 font-medium text-right text-red-500">Below</th>
+                      </tr></thead>
+                      <tbody>
+                        {(regressionInsights.worst_metrics || []).map((m: any) => (
+                          <tr key={m.metric} className="border-b border-[var(--border)] last:border-0">
+                            <td className="py-1.5 font-medium">{m.metric}</td>
+                            <td className={`py-1.5 text-right font-medium ${m.avg < m.threshold ? "text-red-600" : "text-emerald-600"}`}>{m.avg}</td>
+                            <td className="py-1.5 text-right text-[var(--text-muted)]">{m.threshold}</td>
+                            <td className={`py-1.5 text-right ${m.below_threshold > 0 ? "text-red-600" : "text-[var(--text-muted)]"}`}>{m.below_threshold}/{m.count}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="card">
+                    <h3 className="text-sm font-medium mb-3">Pass Rate by Golden Test</h3>
+                    <table className="w-full text-xs">
+                      <thead><tr className="text-left text-[var(--text-muted)] border-b border-[var(--border)]">
+                        <th className="pb-2 font-medium">Test</th>
+                        <th className="pb-2 font-medium text-right">Runs</th>
+                        <th className="pb-2 font-medium text-right">Pass rate</th>
+                      </tr></thead>
+                      <tbody>
+                        {Object.entries(regressionInsights.pass_rate_by_test || {})
+                          .sort(([, a]: any, [, b]: any) => (a.pass_rate || 0) - (b.pass_rate || 0))
+                          .slice(0, 10)
+                          .map(([tid, d]: [string, any]) => (
+                            <tr key={tid} className="border-b border-[var(--border)] last:border-0">
+                              <td className="py-1.5 font-mono text-[10px]">{tid}</td>
+                              <td className="py-1.5 text-right text-[var(--text-muted)]">{d.total}</td>
+                              <td className={`py-1.5 text-right font-medium ${(d.pass_rate||0) >= 0.8 ? "text-emerald-600" : (d.pass_rate||0) >= 0.5 ? "text-amber-600" : "text-red-600"}`}>
+                                {((d.pass_rate||0)*100).toFixed(0)}%
+                              </td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ─────────── PROMPT VERSIONS ─────────── */}
+      {subTab === "prompts" && (
+        <div className="space-y-6">
+          <div className="card flex items-start justify-between gap-4">
+            <div>
+              <h2 className="text-sm font-semibold text-zinc-700 uppercase tracking-wide mb-1">Prompt Version Registry</h2>
+              <p className="text-xs text-[var(--text-muted)]">Versioned system prompts per agent role. v1 = seed, v2 = CoT-enhanced, v3+ = optimizer-generated.</p>
+            </div>
+            <button onClick={loadPromptVersionsReg} className="btn-secondary text-xs shrink-0">Refresh</button>
+          </div>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="card lg:col-span-1 space-y-4">
+              <h3 className="text-xs font-semibold text-zinc-600 uppercase tracking-wide">Agent Roles</h3>
+              <div className="flex flex-col gap-1">
+                {promptVersionsReg && Object.keys(promptVersionsReg.roles || {}).map((role: string) => {
+                  const versions = promptVersionsReg.roles[role] || [];
+                  const latest = versions[0];
+                  return (
+                    <button key={role} onClick={() => { setSelectedRoleReg(role); setPromptDiffReg(null); setPromptAbResultReg(null); }}
+                      className={`text-left px-3 py-2 rounded text-xs transition-all ${selectedRoleReg === role ? "bg-[var(--accent)] text-white" : "hover:bg-[var(--bg-hover)] text-zinc-700"}`}>
+                      <div className="font-medium">{role}</div>
+                      <div className={`text-[11px] mt-0.5 ${selectedRoleReg === role ? "text-indigo-200" : "text-[var(--text-muted)]"}`}>
+                        {versions.length} version{versions.length !== 1 ? "s" : ""} · latest: {latest?.version}
+                        {latest?.cot_enhanced ? " (CoT)" : ""}
+                      </div>
+                    </button>
+                  );
+                })}
+                {!promptVersionsReg && <div className="text-xs text-[var(--text-muted)]">Loading…</div>}
+              </div>
+            </div>
+            <div className="lg:col-span-2 space-y-4">
+              {/* Version timeline */}
+              {promptVersionsReg?.roles?.[selectedRoleReg] && (
+                <div className="card">
+                  <h3 className="text-xs font-semibold text-zinc-600 uppercase tracking-wide mb-3">Version History — {selectedRoleReg}</h3>
+                  <div className="space-y-2">
+                    {(promptVersionsReg.roles[selectedRoleReg] as any[]).map((v: any, i: number) => (
+                      <div key={v.version} className="flex items-start gap-3 pb-2 border-b border-[var(--border)] last:border-0">
+                        <div className={`text-xs font-mono font-semibold px-2 py-0.5 rounded ${i === 0 ? "bg-emerald-100 text-emerald-700" : "bg-zinc-100 text-zinc-600"}`}>{v.version}</div>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            {v.cot_enhanced && <span className="text-[10px] bg-violet-100 text-violet-700 px-1.5 py-0.5 rounded font-medium">CoT</span>}
+                            <span className="text-[10px] bg-zinc-100 text-zinc-600 px-1.5 py-0.5 rounded">{v.created_by}</span>
+                            {i === 0 && <span className="text-[10px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded">active</span>}
+                          </div>
+                          {v.rationale && <p className="text-[11px] text-zinc-600 mt-1 line-clamp-2">{v.rationale}</p>}
+                          {v.metric_scores && Object.keys(v.metric_scores).length > 0 && (
+                            <div className="flex gap-2 mt-1 flex-wrap">
+                              {Object.entries(v.metric_scores).map(([m, s]: [string, any]) => (
+                                <span key={m} className="text-[10px] text-zinc-500">{m}={typeof s === "number" ? s.toFixed(2) : s}</span>
+                              ))}
+                            </div>
+                          )}
+                          <div className="text-[10px] text-[var(--text-muted)] mt-0.5">{v.created_at ? new Date(v.created_at).toLocaleString() : ""}</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {/* Prompt Diff */}
+              <div className="card space-y-3">
+                <h3 className="text-xs font-semibold text-zinc-600 uppercase tracking-wide">Prompt Diff</h3>
+                <div className="flex items-center gap-2 flex-wrap">
+                  {(() => {
+                    const vers: any[] = promptVersionsReg?.roles?.[selectedRoleReg] || [];
+                    return vers.length > 0 ? (
+                      <>
+                        <select className="input text-xs" value={diffOldReg} onChange={e => setDiffOldReg(e.target.value)}>
+                          {[...vers].reverse().map((v: any) => <option key={v.version} value={v.version}>{v.version}{v.cot_enhanced ? " [CoT]" : ""}{v.created_by === "optimizer" ? " [opt]" : ""}</option>)}
+                        </select>
+                        <span className="text-xs text-[var(--text-muted)]">→</span>
+                        <select className="input text-xs" value={diffNewReg} onChange={e => setDiffNewReg(e.target.value)}>
+                          {[...vers].reverse().map((v: any) => <option key={v.version} value={v.version}>{v.version}{v.cot_enhanced ? " [CoT]" : ""}{v.created_by === "optimizer" ? " [opt]" : ""}</option>)}
+                        </select>
+                      </>
+                    ) : (
+                      <>
+                        <input className="input !w-20 text-xs" value={diffOldReg} onChange={e => setDiffOldReg(e.target.value)} placeholder="v1" />
+                        <span className="text-xs text-[var(--text-muted)]">→</span>
+                        <input className="input !w-20 text-xs" value={diffNewReg} onChange={e => setDiffNewReg(e.target.value)} placeholder="v2" />
+                      </>
+                    );
+                  })()}
+                  <button className="btn-secondary text-xs" onClick={() => loadPromptDiffReg(selectedRoleReg, diffOldReg, diffNewReg)}>Show Diff</button>
+                </div>
+                {promptDiffReg?.diff && (
+                  <div>
+                    <div className="flex gap-4 text-xs text-[var(--text-muted)] mb-2">
+                      <span className="text-emerald-600">+{promptDiffReg.lines_added} added</span>
+                      <span className="text-red-500">−{promptDiffReg.lines_removed} removed</span>
+                    </div>
+                    <pre className="text-[11px] bg-zinc-50 rounded p-3 overflow-x-auto max-h-80 border border-[var(--border)] whitespace-pre-wrap leading-relaxed">
+                      {(promptDiffReg.diff as string).split("\n").map((line: string, i: number) => (
+                        <span key={i} className={line.startsWith("+") && !line.startsWith("+++") ? "text-emerald-700 block" : line.startsWith("-") && !line.startsWith("---") ? "text-red-600 block" : line.startsWith("@@") ? "text-blue-600 block" : "text-zinc-600 block"}>{line}</span>
+                      ))}
+                    </pre>
+                  </div>
+                )}
+              </div>
+              {/* Prompt Version A/B */}
+              <div className="card space-y-3">
+                <h3 className="text-xs font-semibold text-zinc-600 uppercase tracking-wide">Prompt Version A/B Comparison</h3>
+                <p className="text-xs text-[var(--text-muted)]">Compare two prompt versions for <span className="font-mono font-medium text-zinc-700">{selectedRoleReg}</span> across all golden tests.</p>
+                <div className="flex items-center gap-2 flex-wrap">
+                  {(() => {
+                    const vers: any[] = promptVersionsReg?.roles?.[selectedRoleReg] || [];
+                    return vers.length > 0 ? (
+                      <>
+                        <span className="text-xs text-[var(--text-muted)]">Version A:</span>
+                        <select className="input text-xs" value={promptAbVersionAReg} onChange={e => setPromptAbVersionAReg(e.target.value)}>
+                          {[...vers].reverse().map((v: any) => <option key={v.version} value={v.version}>{v.version}{v.cot_enhanced ? " [CoT]" : ""}{v.created_by === "optimizer" ? " [opt]" : ""}</option>)}
+                        </select>
+                        <span className="text-xs text-[var(--text-muted)]">vs</span>
+                        <span className="text-xs text-[var(--text-muted)]">Version B:</span>
+                        <select className="input text-xs" value={promptAbVersionBReg} onChange={e => setPromptAbVersionBReg(e.target.value)}>
+                          {[...vers].reverse().map((v: any) => <option key={v.version} value={v.version}>{v.version}{v.cot_enhanced ? " [CoT]" : ""}{v.created_by === "optimizer" ? " [opt]" : ""}</option>)}
+                        </select>
+                      </>
+                    ) : null;
+                  })()}
+                  <button className="btn-secondary text-xs" onClick={() => runPromptAbCompareReg(selectedRoleReg, promptAbVersionAReg, promptAbVersionBReg)} disabled={promptAbLoadingReg}>
+                    {promptAbLoadingReg ? "Comparing…" : "Compare →"}
+                  </button>
+                </div>
+                {promptAbResultReg?.error && <p className="text-xs text-red-500">{promptAbResultReg.error}</p>}
+                {promptAbResultReg && !promptAbResultReg.error && (
+                  <div className="space-y-4 mt-2">
+                    <div className={`px-3 py-2 rounded text-xs font-medium border-l-4 ${promptAbResultReg.recommendation?.startsWith("✓") ? "bg-emerald-50 border-emerald-500 text-emerald-800" : promptAbResultReg.recommendation?.startsWith("✗") ? "bg-red-50 border-red-500 text-red-800" : "bg-zinc-50 border-zinc-300 text-zinc-700"}`}>
+                      {promptAbResultReg.recommendation}
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      {[
+                        { label: "Pass Rate", aVal: `${((promptAbResultReg.summary?.a_pass_rate||0)*100).toFixed(1)}%`, bVal: `${((promptAbResultReg.summary?.b_pass_rate||0)*100).toFixed(1)}%`, better: (promptAbResultReg.summary?.pass_rate_delta_pp||0) > 0 },
+                        { label: "Avg Cost", aVal: `$${(promptAbResultReg.summary?.a_avg_cost||0).toFixed(5)}`, bVal: `$${(promptAbResultReg.summary?.b_avg_cost||0).toFixed(5)}`, better: (promptAbResultReg.summary?.b_avg_cost||0) <= (promptAbResultReg.summary?.a_avg_cost||0) },
+                        { label: "Avg Latency", aVal: `${((promptAbResultReg.summary?.a_avg_latency_ms||0)/1000).toFixed(1)}s`, bVal: `${((promptAbResultReg.summary?.b_avg_latency_ms||0)/1000).toFixed(1)}s`, better: (promptAbResultReg.summary?.b_avg_latency_ms||0) <= (promptAbResultReg.summary?.a_avg_latency_ms||0) },
+                      ].map(c => (
+                        <div key={c.label} className="card text-center !p-2">
+                          <div className="text-[10px] text-[var(--text-muted)] mb-1">{c.label}</div>
+                          <div className="text-xs"><span className="text-[var(--text-muted)]">A:</span> {c.aVal}</div>
+                          <div className="text-xs mt-0.5"><span className="text-[var(--text-muted)]">B:</span> {c.bVal}</div>
+                        </div>
+                      ))}
+                    </div>
+                    {Object.keys(promptAbResultReg.metrics || {}).length > 0 && (
+                      <table className="w-full text-xs">
+                        <thead><tr className="text-left text-[var(--text-muted)] border-b border-[var(--border)]">
+                          <th className="pb-1.5 font-medium">Metric</th>
+                          <th className="pb-1.5 font-medium text-right">A ({promptAbVersionAReg})</th>
+                          <th className="pb-1.5 font-medium text-right">B ({promptAbVersionBReg})</th>
+                          <th className="pb-1.5 font-medium text-right">Δ</th>
+                        </tr></thead>
+                        <tbody>
+                          {Object.entries(promptAbResultReg.metrics || {})
+                            .sort(([, a]: any, [, b]: any) => Math.abs(parseFloat(b.delta)||0) - Math.abs(parseFloat(a.delta)||0))
+                            .map(([metric, d]: [string, any]) => {
+                              const delta = parseFloat(d.delta);
+                              return (
+                                <tr key={metric} className="border-b border-[var(--border)] last:border-0">
+                                  <td className="py-1.5 font-medium">{metric}</td>
+                                  <td className="py-1.5 text-right text-[var(--text-muted)]">{parseFloat(d.a_avg).toFixed(3)}</td>
+                                  <td className="py-1.5 text-right text-[var(--text-muted)]">{parseFloat(d.b_avg).toFixed(3)}</td>
+                                  <td className={`py-1.5 text-right font-medium ${d.improved ? "text-emerald-600" : d.regressed ? "text-red-600" : "text-[var(--text-muted)]"}`}>
+                                    {!isNaN(delta) ? `${delta>0?"+":""}${delta.toFixed(3)}` : d.delta}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                )}
+              </div>
+              {/* Prompt Optimizer */}
+              <div className="card space-y-3">
+                <h3 className="text-xs font-semibold text-zinc-600 uppercase tracking-wide">Run Optimization Loop</h3>
+                <p className="text-xs text-[var(--text-muted)]">Triggers the PromptOptimizer agent to analyse failures, bootstrap if needed, and run up to 3 improvement cycles.</p>
+                {showOptimizeSetup ? (
+                  <div className="p-3 border border-indigo-200 bg-indigo-50/40 rounded-lg space-y-2.5">
+                    <div className="text-[11px] font-medium text-indigo-700 uppercase tracking-wide">Optimization Setup</div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="text-[10px] text-zinc-500 block mb-0.5">Agent Role</label>
+                        <select value={optimizeRole} onChange={e => setOptimizeRole(e.target.value)} className="input text-xs w-full">
+                          {(promptVersionsReg ? Object.keys(promptVersionsReg.roles || {}) : [selectedRoleReg]).map((r: string) => <option key={r} value={r}>{r}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-[10px] text-zinc-500 block mb-0.5">Target Version</label>
+                        <select value={optimizeVersion} onChange={e => setOptimizeVersion(e.target.value)} className="input text-xs w-full">
+                          <option value="latest">latest</option>
+                          {(promptVersionsReg?.roles?.[optimizeRole] || []).map((v: any) => <option key={v.version} value={v.version}>{v.version}{v.cot_enhanced ? " [CoT]" : ""}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-[10px] text-zinc-500 block mb-0.5">Metric to Improve</label>
+                        <select value={optimizeMetric} onChange={e => setOptimizeMetric(e.target.value)} className="input text-xs w-full">
+                          {["step_efficiency","tool_usage","completeness","faithfulness","coherence","correctness","relevance"].map(m => <option key={m} value={m}>{m}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-[10px] text-zinc-500 block mb-0.5">Threshold (0–1)</label>
+                        <input type="number" min="0" max="1" step="0.05" value={optimizeThreshold} onChange={e => setOptimizeThreshold(e.target.value)} className="input text-xs w-full" />
+                      </div>
+                    </div>
+                    <div className="flex gap-2 pt-1">
+                      <button className="btn-primary text-xs" disabled={optimizeLoading} onClick={() => { setShowOptimizeSetup(false); runOptimize(optimizeRole, optimizeVersion, optimizeMetric, optimizeThreshold); }}>
+                        {optimizeLoading ? "Running…" : "▶ Run Optimization"}
+                      </button>
+                      <button className="btn-ghost text-xs" onClick={() => setShowOptimizeSetup(false)}>Cancel</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-3">
+                    <button className="btn-primary text-xs" onClick={() => { setOptimizeRole(selectedRoleReg); setOptimizeVersion("latest"); setShowOptimizeSetup(true); setOptimizeTrajectory([]); setOptimizeResult(null); }} disabled={optimizeLoading}>
+                      {optimizeLoading ? "Running optimizer…" : "⚙ Configure & Run"}
+                    </button>
+                    {optimizeLoading && <span className="text-xs text-[var(--text-muted)] animate-pulse">Running — may take 2–10 min…</span>}
+                  </div>
+                )}
+                {optimizeTrajectory.length > 0 && (
+                  <div className="mt-2">
+                    <div className="text-[10px] font-medium text-zinc-500 uppercase tracking-wide mb-1.5">Live Trajectory</div>
+                    <div className="bg-zinc-950 rounded-lg p-3 max-h-72 overflow-y-auto font-mono text-[10px] space-y-0.5">
+                      {optimizeTrajectory.map((ev, i) => (
+                        <div key={i} className={ev.type==="agent"?"text-cyan-400":ev.type==="tool"?"text-yellow-300":ev.type==="tool_result"?"text-zinc-400":ev.type==="version"||ev.type==="version_done"?"text-green-400":ev.type==="regression"?"text-purple-300":ev.type==="thinking"?"text-zinc-300":ev.type==="start"?"text-blue-300 font-semibold":ev.type==="done"?"text-emerald-400 font-semibold":ev.type==="error"?"text-red-400":"text-zinc-500"}>
+                          {ev.type !== "thinking" && <span className="text-zinc-600 mr-1">{new Date(ev.ts).toLocaleTimeString("en",{hour12:false,hour:"2-digit",minute:"2-digit",second:"2-digit"})}</span>}
+                          {ev.text}
+                        </div>
+                      ))}
+                      <div ref={trajectoryEndRef} />
+                    </div>
+                  </div>
+                )}
+                {optimizeResult && (
+                  <div className="mt-2">
+                    <div className={`text-xs font-medium mb-1 ${optimizeResult.status==="completed"?"text-emerald-600":"text-red-500"}`}>
+                      {optimizeResult.status==="completed" ? "✓ Optimization complete" : "✗ Error"}
+                    </div>
+                    <pre className="text-[11px] bg-zinc-50 rounded p-3 max-h-64 overflow-y-auto border border-[var(--border)] whitespace-pre-wrap leading-relaxed text-zinc-700">
+                      {optimizeResult.response || optimizeResult.error}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-// ── Sub-components ───────────────────────────────────────────────────────────
 
 function GoldenCaseExpanded({ c, activeStrategy }: { c: any; activeStrategy?: string }) {
   return (
@@ -911,7 +1957,7 @@ function TrajectoryView({ trace, tools }: { trace: any[]; tools: string[] }) {
   );
 }
 
-function CaseDetailPanel({ detail, runId, baselineRunId, onClose, onRCA, rcaLoading, regRCA }: any) {
+function CaseDetailPanel({ detail, onClose }: any) {
   const res = detail.result || {};
   return (
     <div className="card space-y-3">
@@ -919,13 +1965,29 @@ function CaseDetailPanel({ detail, runId, baselineRunId, onClose, onRCA, rcaLoad
         <h3 className="text-sm font-medium">
           Detail: {detail.golden_case?.name || res.golden_case_name}
         </h3>
-        <div className="flex gap-2">
-          <button onClick={() => onRCA(runId, res.golden_case_id, baselineRunId)}
-            disabled={rcaLoading} className="btn-secondary text-xs">
-            {rcaLoading ? "Analyzing…" : "Run RCA"}
-          </button>
-          <button onClick={onClose} className="text-xs text-[var(--text-muted)]">✕ Close</button>
-        </div>
+        <button onClick={onClose} className="text-xs text-[var(--text-muted)]">✕ Close</button>
+      </div>
+
+      {/* Meta row: strategy, prompt versions, router versions */}
+      <div className="flex flex-wrap items-center gap-2 text-[10px] text-[var(--text-muted)]">
+        {res.actual_strategy && (
+          <span className="px-1.5 py-0.5 rounded bg-zinc-100 border border-zinc-200 text-zinc-600 font-mono">
+            strategy: {res.actual_strategy}
+          </span>
+        )}
+        {res.prompt_version && (
+          <span className="px-1.5 py-0.5 rounded bg-blue-50 border border-blue-200 text-blue-700 font-mono">
+            agent prompts: {res.prompt_version}
+          </span>
+        )}
+        {res.router_prompt_version && (
+          <span className="px-1.5 py-0.5 rounded bg-purple-50 border border-purple-200 text-purple-700 font-mono">
+            routing: {res.router_prompt_version}
+          </span>
+        )}
+        {res.model_used && (
+          <span className="ml-auto text-[10px] text-zinc-400">{res.model_used}</span>
+        )}
       </div>
 
       {/* Trajectory */}
@@ -979,48 +2041,87 @@ function CaseDetailPanel({ detail, runId, baselineRunId, onClose, onRCA, rcaLoad
         </div>
       </div>
 
-      {/* Radar chart for scores overview */}
+      {/* Verdict Breakdown — which criteria caused pass/fail */}
       {(() => {
-        const qMetrics = Object.keys(res.quality_scores || {}).map(k => ({ key: k, label: k.replace(/_/g, " ") }));
-        const deMetrics = DEEPEVAL_METRICS.filter(m => res.deepeval_scores?.[m.key] != null);
-        const allMetrics = [...qMetrics, ...deMetrics];
-        const allScores = { ...(res.quality_scores || {}), ...(res.deepeval_scores || {}) };
-        if (allMetrics.length < 3) return null;
+        const assertions = res.trace_assertions || {};
+        const hasAssertions = Object.keys(assertions).length > 0;
+        if (!hasAssertions) return null;
+
+        const flagRows = [
+          { key: "trace_regression", label: "Trace Assertions", fail: res.trace_regression },
+          { key: "quality_regression", label: "Quality (Similarity + DeepEval)", fail: res.quality_regression },
+          { key: "cost_regression", label: "Cost Budget", fail: res.cost_regression },
+          { key: "latency_regression", label: "Latency Budget", fail: res.latency_regression },
+        ];
+
+        const assertionLabels: Record<string, string> = {
+          required_tools_called: "Required Tools Called",
+          delegation_pattern: "Agent Delegation Pattern",
+          llm_call_budget: "LLM Call Budget",
+          tool_call_budget: "Tool Call Budget",
+          token_budget: "Token Budget",
+          latency_budget: "Latency Budget",
+        };
+
         return (
-          <div className="p-3 rounded border border-[var(--border)] bg-[var(--bg)]">
-            <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1 font-medium">Score Overview</div>
-            <SingleRadarChart scoresMap={allScores} metrics={allMetrics} color="#3b82f6" label="Score" />
+          <div className="rounded-lg border border-[var(--border)] overflow-hidden">
+            <div className="px-3 py-2 bg-[var(--bg)] border-b border-[var(--border)] flex items-center justify-between">
+              <span className="text-[10px] font-medium uppercase tracking-wide text-[var(--text-muted)]">Verdict Breakdown</span>
+              <span className={`text-[11px] font-bold px-2 py-0.5 rounded ${res.overall_pass ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>
+                {res.overall_pass ? "PASS" : "FAIL"}
+              </span>
+            </div>
+            <div className="p-2 space-y-1">
+              {/* High-level flags */}
+              <div className="grid grid-cols-2 gap-1">
+                {flagRows.map(f => (
+                  <div key={f.key} className={`flex items-center justify-between text-[10px] px-2 py-1 rounded ${f.fail ? "bg-red-50 border border-red-200" : "bg-emerald-50 border border-emerald-200"}`}>
+                    <span className={f.fail ? "text-red-700" : "text-emerald-700"}>{f.label}</span>
+                    <span className={`font-bold ${f.fail ? "text-red-600" : "text-emerald-600"}`}>{f.fail ? "✗ FAIL" : "✓ OK"}</span>
+                  </div>
+                ))}
+              </div>
+              {/* Per-assertion details */}
+              <div className="mt-1 space-y-0.5">
+                {Object.entries(assertions).map(([key, val]: [string, any]) => (
+                  <div key={key} className={`flex items-start gap-2 text-[10px] px-2 py-1.5 rounded ${val.passed ? "bg-emerald-50/60" : "bg-red-50/60"}`}>
+                    <span className={`shrink-0 font-bold mt-0.5 ${val.passed ? "text-emerald-600" : "text-red-600"}`}>
+                      {val.passed ? "✓" : "✗"}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <span className="font-semibold text-zinc-700">{assertionLabels[key] || key}</span>
+                      {val.reason && (
+                        <div className="text-zinc-500 mt-0.5">{val.reason}</div>
+                      )}
+                      {val.expected !== undefined && val.actual !== undefined && (
+                        <div className="text-zinc-400 mt-0.5 font-mono">
+                          expected: {JSON.stringify(val.expected)} · actual: {JSON.stringify(val.actual)}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         );
       })()}
 
-      {/* Scores */}
-      <div className="grid grid-cols-2 gap-3">
-        {res.quality_scores && Object.keys(res.quality_scores).length > 0 && (
-          <div>
-            <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1">G-Eval (LLM-as-Judge)</div>
-            <div className="space-y-1.5">
-              {Object.entries(res.quality_scores).map(([k, v]: [string, any]) => (
-                <div key={k} className="p-2 rounded bg-[var(--bg)] border border-[var(--border)]">
-                  <div className="flex items-center justify-between mb-0.5">
-                    <span className="text-xs font-medium capitalize">{k.replace(/_/g, " ")}</span>
-                    <span className={`text-xs font-mono font-bold ${Number(v) >= 0.7 ? "text-emerald-600" : Number(v) >= 0.4 ? "text-amber-600" : "text-red-600"}`}>
-                      {(Number(v) * 100).toFixed(0)}%
-                    </span>
-                  </div>
-                  <div className="h-1 bg-gray-200 rounded-full overflow-hidden">
-                    <div className="h-full rounded-full" style={{ width: `${Math.min(100, Number(v) * 100)}%`, backgroundColor: Number(v) >= 0.7 ? "#059669" : Number(v) >= 0.4 ? "#ca8a04" : "#dc2626" }} />
-                  </div>
-                  {res.eval_reasoning?.[k] && (
-                    <div className="text-[10px] text-[var(--text-muted)] italic mt-1">{res.eval_reasoning[k]}</div>
-                  )}
-                </div>
-              ))}
-            </div>
+      {/* Radar chart for scores overview */}
+      {(() => {
+        const deMetrics = DEEPEVAL_METRICS.filter(m => res.deepeval_scores?.[m.key] != null);
+        if (deMetrics.length < 3) return null;
+        return (
+          <div className="p-3 rounded border border-[var(--border)] bg-[var(--bg)]">
+            <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1 font-medium">DeepEval Score Overview</div>
+            <SingleRadarChart scoresMap={res.deepeval_scores || {}} metrics={deMetrics} color="#3b82f6" label="Score" />
           </div>
-        )}
-        <div>
-          <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1">DeepEval Agentic Metrics</div>
+        );
+      })()}
+
+      {/* DeepEval Scores only */}
+      <div>
+        <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1">DeepEval Agentic Metrics</div>
           {res.deepeval_scores && Object.keys(res.deepeval_scores).length > 0 ? (
             <div className="space-y-1.5">
               {DEEPEVAL_METRICS.map(({ key, label, reasonKey, description }) => {
@@ -1062,17 +2163,6 @@ function CaseDetailPanel({ detail, runId, baselineRunId, onClose, onRCA, rcaLoad
             </div>
           )}
         </div>
-      </div>
-
-      {/* RCA */}
-      {regRCA && (
-        <div>
-          <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1">Root Cause Analysis</div>
-          <div className="p-3 rounded bg-amber-50 border border-amber-200 text-xs">
-            <Md content={typeof regRCA === "string" ? regRCA : JSON.stringify(regRCA, null, 2)} />
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -1175,126 +2265,3 @@ function DiffRadarChart({
   );
 }
 
-function TraceDiffPanel({ diff, onRCA, rcaLoading, regRCA }: any) {
-  const rA = diff.run_a || {};
-  const rB = diff.run_b || {};
-
-  const fmtAgents = (r: any) => (r.actual_delegation_pattern?.length ? r.actual_delegation_pattern : [r.actual_agent]).filter(Boolean).join(" → ") || "—";
-
-  // Collect all metric keys across both runs
-  const allQualityKeys = Array.from(new Set([
-    ...Object.keys(rA.quality_scores || {}),
-    ...Object.keys(rB.quality_scores || {}),
-  ]));
-  const allDeepEvalKeys = DEEPEVAL_METRICS.filter(m =>
-    (rA.deepeval_scores || {})[m.key] != null || (rB.deepeval_scores || {})[m.key] != null
-  );
-
-  return (
-    <div className="card space-y-4">
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm font-medium">Trace Diff — {diff.case_id}</h3>
-        <button onClick={onRCA} disabled={rcaLoading} className="btn-secondary text-xs">
-          {rcaLoading ? "Analyzing…" : "Run RCA"}
-        </button>
-      </div>
-
-      {/* Legend */}
-      <div className="flex items-center gap-4 text-[10px]">
-        <div className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-blue-400 inline-block" /> Run A ({String(rA.id || "").slice(0, 8)})</div>
-        <div className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-orange-400 inline-block" /> Run B ({String(rB.id || "").slice(0, 8)})</div>
-      </div>
-
-      {/* Side-by-side stats + trajectory */}
-      <div className="grid grid-cols-2 gap-3">
-        {[
-          { label: "Run A", r: rA, color: "blue" },
-          { label: "Run B", r: rB, color: "orange" },
-        ].map(({ label, r, color }) => (
-          <div key={label} className={`rounded-lg border overflow-hidden ${color === "blue" ? "border-blue-200" : "border-orange-200"}`}>
-            <div className={`px-3 py-2 border-b flex items-center justify-between ${color === "blue" ? "bg-blue-50 border-blue-200" : "bg-orange-50 border-orange-200"}`}>
-              <span className={`text-[11px] font-semibold ${color === "blue" ? "text-blue-700" : "text-orange-700"}`}>{label}</span>
-              <span className="font-mono text-[10px] text-[var(--text-muted)]">{String(r.id || "").slice(0, 8)}</span>
-              <PassFailBadge pass={r.overall_pass} />
-            </div>
-            <div className="p-3 space-y-2">
-              {/* Agents */}
-              <div className="text-[10px]">
-                <span className="text-[var(--text-muted)]">Trajectory: </span>
-                <span className="font-medium">{fmtAgents(r)}</span>
-              </div>
-              {/* Tools */}
-              {r.actual_tools?.length > 0 && (
-                <div className="flex flex-wrap gap-1">
-                  {r.actual_tools.map((t: string, i: number) => (
-                    <span key={i} className="px-1.5 py-0.5 rounded bg-violet-50 text-violet-600 text-[9px] border border-violet-200 font-mono">{t}</span>
-                  ))}
-                </div>
-              )}
-              {/* Stats row */}
-              <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[10px]">
-                <span><span className="text-[var(--text-muted)]">LLM calls:</span> <strong>{r.actual_llm_calls ?? "—"}</strong></span>
-                <span><span className="text-[var(--text-muted)]">Tool calls:</span> <strong>{r.actual_tool_calls ?? "—"}</strong></span>
-                <span><span className="text-[var(--text-muted)]">Latency:</span> <strong>{r.actual_latency_ms?.toFixed(0) ?? "—"}ms</strong></span>
-                <span><span className="text-[var(--text-muted)]">Cost:</span> <strong>${r.actual_cost?.toFixed(4) ?? "—"}</strong></span>
-                <span><span className="text-[var(--text-muted)]">Similarity:</span> <strong className={r.semantic_similarity >= 0.7 ? "text-emerald-600" : "text-amber-600"}>{r.semantic_similarity != null ? `${(r.semantic_similarity * 100).toFixed(1)}%` : "—"}</strong></span>
-                {r.actual_strategy && <span><span className="text-[var(--text-muted)]">Strategy:</span> <strong>{r.actual_strategy}</strong></span>}
-              </div>
-              {/* Trajectory details */}
-              {(r.full_trace?.length > 0) && (
-                <details className="text-[10px]">
-                  <summary className="cursor-pointer text-[var(--text-muted)] hover:text-[var(--text)] select-none">Tool call details ▸</summary>
-                  <div className="mt-1.5">
-                    <TrajectoryView trace={r.full_trace || []} tools={r.actual_tools || []} />
-                  </div>
-                </details>
-              )}
-              {/* Output */}
-              <div>
-                <div className="text-[10px] text-[var(--text-muted)] uppercase font-medium mb-0.5">Output</div>
-                <div className="p-2 rounded bg-[var(--bg)] border border-[var(--border)] max-h-40 overflow-y-auto">
-                  <Md content={r.actual_output || "—"} />
-                </div>
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {/* Radar score comparison chart */}
-      {(allQualityKeys.length > 0 || allDeepEvalKeys.length > 0) && (() => {
-        const qMetrics = allQualityKeys.map(k => ({ key: k, label: k.replace(/_/g, " ") }));
-        const deMetrics = allDeepEvalKeys;
-        const allMetrics = [...qMetrics, ...deMetrics];
-        const scoresA = { ...(rA.quality_scores || {}), ...(rA.deepeval_scores || {}) };
-        const scoresB = { ...(rB.quality_scores || {}), ...(rB.deepeval_scores || {}) };
-        return (
-          <div className="p-3 rounded border border-[var(--border)] bg-[var(--bg)]">
-            <div className="text-[10px] text-[var(--text-muted)] uppercase mb-2 font-medium flex items-center gap-2">
-              Score Comparison — Radar View
-              <span className="text-[9px] font-normal normal-case text-blue-600">● Run A</span>
-              <span className="text-[9px] font-normal normal-case text-orange-500">● Run B</span>
-            </div>
-            <DiffRadarChart
-              scoresA={scoresA}
-              scoresB={scoresB}
-              metrics={allMetrics}
-              labelA="Run A"
-              labelB="Run B"
-            />
-          </div>
-        );
-      })()}
-
-      {/* RCA */}
-      {regRCA && (
-        <div>
-          <div className="text-[10px] text-[var(--text-muted)] uppercase mb-1">Root Cause Analysis</div>
-          <div className="p-3 rounded bg-amber-50 border border-amber-200 text-xs">
-            <Md content={typeof regRCA === "string" ? regRCA : JSON.stringify(regRCA, null, 2)} />
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}

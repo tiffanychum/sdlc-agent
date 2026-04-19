@@ -47,6 +47,7 @@ class Agent(Base):
     system_prompt = Column(Text, default="")
     model = Column(String, default="")
     decision_strategy = Column(String, default="react")
+    prompt_version = Column(String, default="v1")          # active prompt version from PromptRegistry
     created_at = Column(DateTime, default=datetime.utcnow)
 
     team = relationship("Team", back_populates="agents")
@@ -222,6 +223,8 @@ class RegressionResult(Base):
     # Strategy fields: what was configured vs what was actually executed
     expected_strategy = Column(String, nullable=True)
     actual_strategy = Column(String, nullable=True)
+    # Routing prompt versions used for this run
+    router_prompt_version = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     eval_run = relationship("EvalRun", back_populates="regression_results")
@@ -247,6 +250,7 @@ class RagConfig(Base):
     mmr_lambda = Column(Float, default=0.5)
     multi_query_n = Column(Integer, default=3)
     system_prompt = Column(Text, nullable=True)
+    reranker = Column(String, default="none")  # none | bge-reranker-base | bge-reranker-large | bge-reranker-v2-m3
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -302,6 +306,7 @@ class RagQuery(Base):
 # ── Prompt Versioning ────────────────────────────────────────────
 
 class PromptVersion(Base):
+    """Legacy snapshot model — kept for backward compat. Use PromptVersionEntry instead."""
     __tablename__ = "prompt_versions"
 
     id = Column(String, primary_key=True, default=_uuid)
@@ -310,4 +315,50 @@ class PromptVersion(Base):
     agent_prompts = Column(JSON, default=dict)
     team_strategy = Column(String, default="")
     is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class PromptVersionEntry(Base):
+    """Per-role, per-version prompt registry entry.
+
+    Each row represents one version of one agent's system prompt.
+    Versions are numbered sequentially per role (v1, v2, v3, …).
+    The optimizer writes new rows here; the orchestrator reads the
+    latest active version for each agent at startup.
+    """
+    __tablename__ = "prompt_version_entries"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    role = Column(String, nullable=False, index=True)       # e.g. "coder"
+    version = Column(String, nullable=False)                # e.g. "v1", "v2"
+    prompt_text = Column(Text, nullable=False)
+    cot_enhanced = Column(Boolean, default=False)           # True for v2+ with CoT headers
+    parent_version = Column(String, nullable=True)          # version this was derived from
+    rationale = Column(Text, default="")                    # why this version was created
+    # Metric scores measured after this version was tested (populated by optimizer loop)
+    metric_scores = Column(JSON, default=dict)              # {metric: avg_score}
+    created_by = Column(String, default="seed")             # seed | optimizer | human
+    is_active = Column(Boolean, default=True)
+    notes = Column(Text, default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class PromptFeedback(Base):
+    """FeedbackStore entry: one (role, version, tool_trace, scores) triple.
+
+    Archived after each regression run so the PromptOptimizer agent can
+    retrieve semantically similar past failures as few-shot context.
+    """
+    __tablename__ = "prompt_feedback"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    role = Column(String, nullable=False, index=True)
+    prompt_version = Column(String, nullable=False)
+    golden_id = Column(String, default="")
+    tool_trace_summary = Column(Text, default="")           # compact repr of tool calls made
+    quality_scores = Column(JSON, default=dict)             # {metric: score}
+    deepeval_scores = Column(JSON, default=dict)
+    failure_types = Column(JSON, default=list)              # ["low_step_efficiency", …]
+    overall_pass = Column(Boolean, default=True)
+    embedding_text = Column(Text, default="")               # text indexed in ChromaDB
     created_at = Column(DateTime, default=datetime.utcnow)

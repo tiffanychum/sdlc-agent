@@ -207,18 +207,30 @@ class TestRAGToolRegistry:
     def test_rag_tools_available(self):
         from src.tools.registry import get_rag_tools
         tools = get_rag_tools()
-        assert len(tools) == 1
-        assert tools[0].name == "rag_search"
+        tool_names = [t.name for t in tools]
+        # get_rag_tools returns both rag_search (general) and perf_search (performance KB)
+        assert "rag_search" in tool_names
+        assert "perf_search" in tool_names
+        assert len(tools) == 2
 
     def test_rag_tool_has_description(self):
         from src.tools.registry import get_rag_tools
         tools = get_rag_tools()
-        assert "knowledge base" in tools[0].description.lower()
+        rag_tool = next(t for t in tools if t.name == "rag_search")
+        assert "knowledge base" in rag_tool.description.lower()
+
+    def test_perf_search_tool_available(self):
+        from src.tools.registry import get_rag_tools
+        tools = get_rag_tools()
+        perf_tool = next((t for t in tools if t.name == "perf_search"), None)
+        assert perf_tool is not None
+        assert "performance" in perf_tool.description.lower()
 
     def test_researcher_has_rag_tool_group(self):
         from src.agents.prompts import AGENT_DEFINITIONS
         researcher = next(a for a in AGENT_DEFINITIONS if a["id"] == "researcher")
         assert "rag" in researcher["tools"]
+        assert "perf_kb" in researcher["tools"]
 
     def test_coder_has_rag_tool_group(self):
         from src.agents.prompts import AGENT_DEFINITIONS

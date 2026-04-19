@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -34,6 +34,20 @@ from src.tracing.collector import TraceCollector, _flush_pending_spans, estimate
 
 orchestrators: dict = {}
 
+# System / internal node names to exclude from agent_start/agent_end detection.
+# Includes orchestrator system nodes AND inner create_react_agent node names.
+_GRAPH_SYSTEM_NODES = frozenset({
+    # Orchestrator system nodes
+    "supervisor", "supervisor_router", "router", "route_request",
+    "_merge", "_synthesize", "_seq_synthesize", "_sup_synthesize",
+    "LangGraph", "__start__", "__end__", "START", "END",
+    # LangGraph / LangChain inner nodes (from create_react_agent internals)
+    "agent", "call_model", "should_continue", "tools",
+    # LangChain runnable nodes
+    "RunnableSequence", "RunnableLambda", "RunnableParallel",
+    "Prompt", "ChatPromptTemplate", "BaseChatModel",
+})
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -43,7 +57,56 @@ async def lifespan(app: FastAPI):
     from src.evaluation.golden import sync_golden_to_db
     sync_golden_to_db()
     orchestrators["default"] = await build_orchestrator_from_team("default")
+    # Seed the Performance Knowledge Base in the background (idempotent).
+    # This ensures perf_search is ready without blocking server startup.
+    import asyncio
+    async def _seed_perf_kb():
+        try:
+            from src.rag.performance_kb import seed_performance_kb
+            result = await seed_performance_kb()
+            if not result.get("skipped"):
+                import logging
+                logging.getLogger(__name__).info(
+                    "Performance KB seeded: %d chunks from %d documents.",
+                    result.get("chunks_ingested", 0), result.get("documents", 0),
+                )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Performance KB seed failed: %s", e)
+    asyncio.create_task(_seed_perf_kb())
     yield
+
+
+async def _build_fresh_orchestrator(team_id: str, user_message: str | None = None):
+    """Build orchestrator with the team's CURRENT strategy from DB.
+
+    If the team's strategy is 'auto' and a user message is provided, the
+    meta-router resolves the concrete strategy before building.  Returns
+    (graph, resolved_strategy_or_None).
+    """
+    from src.db.database import get_session
+    from src.db.models import Team, Agent
+
+    session = get_session()
+    try:
+        team_obj = session.query(Team).filter_by(id=team_id).first()
+        team_strategy = (team_obj.decision_strategy if team_obj else None) or "router_decides"
+        if team_strategy == "auto" and user_message:
+            agents_db = session.query(Agent).filter_by(team_id=team_id).all()
+            agents_cfg = [{"role": a.role, "description": a.description or ""} for a in agents_db]
+    finally:
+        session.close()
+
+    resolved_strategy = None
+    strategy_override = None
+
+    if team_strategy == "auto" and user_message:
+        from src.orchestrator import select_strategy_auto
+        resolved_strategy = await select_strategy_auto(user_message, agents_cfg)
+        strategy_override = resolved_strategy
+
+    graph = await build_orchestrator_from_team(team_id, strategy_override=strategy_override)
+    return graph, resolved_strategy
 
 
 app = FastAPI(title="SDLC Agent Platform", version="0.2.0", lifespan=lifespan)
@@ -79,6 +142,7 @@ class AgentUpdate(BaseModel):
     tool_groups: Optional[list[str]] = None
     model: Optional[str] = None
     decision_strategy: Optional[str] = None
+    prompt_version: Optional[str] = None
 
 class SkillCreate(BaseModel):
     name: str
@@ -153,13 +217,11 @@ class RegressionRunRequest(BaseModel):
     case_ids: Optional[list[str]] = None
     model: Optional[str] = None
     prompt_version: str = "v1"
+    prompt_versions_by_role: Optional[dict] = None  # e.g. {"coder": "v3", "planner": "v2"}
     baseline_run_id: Optional[str] = None
 
 
-class RCARequest(BaseModel):
-    run_id: str
-    case_id: str
-    baseline_run_id: Optional[str] = None
+# RCARequest removed — RCA tab deleted, replaced by A/B Comparison
 
 
 class PromptVersionCreate(BaseModel):
@@ -178,26 +240,23 @@ class PromptVersionUpdate(BaseModel):
 
 AVAILABLE_MODELS = [
     # ── OpenAI ──────────────────────────────────────────────────
-    {"id": "gpt-4o-mini",              "name": "GPT-4o Mini",                "provider": "OpenAI",     "tier": "router", "thinking": False},
-    {"id": "gpt-4o",                   "name": "GPT-4o",                     "provider": "OpenAI",     "tier": "agent",  "thinking": False},
-    {"id": "gpt-5",                    "name": "GPT-5",                      "provider": "OpenAI",     "tier": "agent",  "thinking": False},
-    {"id": "gpt-5-mini",               "name": "GPT-5 Mini",                 "provider": "OpenAI",     "tier": "agent",  "thinking": False},
-    {"id": "gpt-5-mini-2025-08-07",    "name": "GPT-5 Mini (2025-08-07)",    "provider": "OpenAI",     "tier": "agent",  "thinking": False},
-    {"id": "gpt-5.3-codex",            "name": "GPT-5.3 Codex",              "provider": "OpenAI",     "tier": "agent",  "thinking": False},
-    # ── Anthropic ───────────────────────────────────────────────
-    {"id": "claude-haiku-3",           "name": "Claude Haiku 3",             "provider": "Anthropic",  "tier": "agent",  "thinking": False},
-    {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4",            "provider": "Anthropic",  "tier": "agent",  "thinking": False},
-    {"id": "claude-sonnet-4.6",        "name": "Claude Sonnet 4.6 (thinks)", "provider": "Anthropic",  "tier": "agent",  "thinking": True},
-    {"id": "claude-opus-4.5",          "name": "Claude Opus 4.5 (thinks)",   "provider": "Anthropic",  "tier": "agent",  "thinking": True},
-    {"id": "claude-opus-4.6",          "name": "Claude Opus 4.6 (thinks)",   "provider": "Anthropic",  "tier": "agent",  "thinking": True},
+    {"id": "gpt-4o-mini",             "name": "GPT-4o Mini",            "provider": "OpenAI",     "tier": "router", "thinking": False},
+    {"id": "gpt-4o",                  "name": "GPT-4o",                 "provider": "OpenAI",     "tier": "agent",  "thinking": False},
+    {"id": "gpt-5-mini",              "name": "GPT-5 Mini",             "provider": "OpenAI",     "tier": "agent",  "thinking": False},
+    {"id": "gpt-5.3-codex",           "name": "GPT-5.3 Codex",         "provider": "OpenAI",     "tier": "agent",  "thinking": False},
+    # ── Anthropic — use Poe model names (not Anthropic-native IDs) ──
+    {"id": "claude-haiku-3",          "name": "Claude Haiku 3",        "provider": "Anthropic",  "tier": "agent",  "thinking": False},
+    {"id": "Claude-Haiku-3.5",        "name": "Claude Haiku 3.5",      "provider": "Anthropic",  "tier": "agent",  "thinking": False},
+    {"id": "Claude-Sonnet-4",         "name": "Claude Sonnet 4",       "provider": "Anthropic",  "tier": "agent",  "thinking": False},
+    {"id": "claude-opus-4.5",         "name": "Claude Opus 4.5",       "provider": "Anthropic",  "tier": "agent",  "thinking": False},
+    {"id": "Claude-Opus-4",           "name": "Claude Opus 4",         "provider": "Anthropic",  "tier": "agent",  "thinking": False},
     # ── Google — ⚠️ may trigger safety blocks ──────────────────
-    {"id": "gemini-2.5-flash-lite",    "name": "Gemini 2.5 Flash Lite ⚠️",  "provider": "Google",     "tier": "agent",  "thinking": False, "unstable": True},
-    {"id": "gemini-3-flash",           "name": "Gemini 3 Flash ⚠️",         "provider": "Google",     "tier": "agent",  "thinking": False, "unstable": True},
+    {"id": "gemini-2.5-flash-lite",   "name": "Gemini 2.5 Flash Lite ⚠️", "provider": "Google", "tier": "agent",  "thinking": False, "unstable": True},
+    {"id": "gemini-3-flash",          "name": "Gemini 3 Flash ⚠️",     "provider": "Google",     "tier": "agent",  "thinking": False, "unstable": True},
     # ── Other providers ─────────────────────────────────────────
-    {"id": "deepseek-r1",              "name": "DeepSeek R1",                "provider": "DeepSeek",   "tier": "judge",  "thinking": False},
-    {"id": "llama-3.1-8b-cs",          "name": "Llama 3.1 8B",               "provider": "Meta",       "tier": "agent",  "thinking": False},
-    {"id": "mistral-small-3",          "name": "Mistral Small 3",            "provider": "Mistral",    "tier": "agent",  "thinking": False},
-    {"id": "grok-4.1-fast-reasoning",  "name": "Grok 4.1 Fast",              "provider": "xAI",        "tier": "agent",  "thinking": False},
+    {"id": "llama-3.1-8b-cs",         "name": "Llama 3.1 8B",          "provider": "Meta",       "tier": "agent",  "thinking": False},
+    {"id": "grok-4.1-fast-reasoning", "name": "Grok 4.1 Fast",         "provider": "xAI",        "tier": "agent",  "thinking": False},
+    {"id": "Grok-3-Mini",             "name": "Grok 3 Mini",            "provider": "xAI",        "tier": "agent",  "thinking": False},
 ]
 
 
@@ -250,6 +309,7 @@ def get_team(team_id: str):
             "tool_groups": tools, "skills": skills,
             "model": getattr(a, "model", "") or "",
             "decision_strategy": getattr(a, "decision_strategy", "react") or "react",
+            "prompt_version": getattr(a, "prompt_version", None) or "v1",
         })
     result = {
         "id": team.id, "name": team.name, "description": team.description,
@@ -318,6 +378,11 @@ def update_agent(agent_id: str, data: AgentUpdate):
     if data.system_prompt is not None: agent.system_prompt = data.system_prompt
     if data.model is not None: agent.model = data.model
     if data.decision_strategy is not None: agent.decision_strategy = data.decision_strategy
+    if data.prompt_version is not None:
+        try:
+            agent.prompt_version = data.prompt_version
+        except Exception:
+            pass  # column may not exist in old schema
     if data.tool_groups is not None:
         session.query(AgentToolMapping).filter_by(agent_id=agent_id).delete()
         for tg in data.tool_groups:
@@ -474,6 +539,14 @@ async def chat(team_id: str, request: ChatRequest):
             agent_name = entry.get("agent", "unknown")
             if agent_name not in all_agents_used:
                 all_agents_used.append(agent_name)
+
+            # Use per-agent timing from the orchestrator when available, otherwise
+            # fall back to a synthetic span (start≈end) that at least names the agent.
+            entry_latency_ms = entry.get("latency_ms")
+            entry_tokens_in = entry.get("tokens_in") or 0
+            entry_tokens_out = entry.get("tokens_out") or 0
+            entry_model = entry.get("model") or llm_model or ""
+
             agent_span = collector.start_span(f"agent:{agent_name}", "agent_execution",
                                               input_data={"agent": agent_name})
             for tc in entry.get("tool_calls", []):
@@ -481,8 +554,21 @@ async def chat(team_id: str, request: ChatRequest):
                 span_id = collector.start_span(f"tool:{tc['tool']}", "tool_call",
                                                input_data={"args": str(tc.get("args", {}))[:200], "agent": agent_name})
                 collector.end_span(span_id, output_data={"result": "completed"})
-            collector.end_span(agent_span, output_data={"tool_calls": len(entry.get("tool_calls", []))},
-                               model=llm_model, tokens_in=total_prompt_tokens, tokens_out=total_completion_tokens)
+
+            # Patch the span's start_time so it reflects actual agent latency.
+            # This makes per-agent latency percentiles accurate in TraceAnalyzer.
+            if entry_latency_ms and entry_latency_ms > 0:
+                from datetime import datetime as _dt, timedelta as _td
+                _end_t = _dt.utcnow()
+                _start_t = _end_t - _td(milliseconds=entry_latency_ms)
+                if agent_span in collector._span_data:
+                    collector._span_data[agent_span]["start_time"] = _start_t
+
+            collector.end_span(agent_span,
+                               output_data={"tool_calls": len(entry.get("tool_calls", []))},
+                               model=entry_model,
+                               tokens_in=entry_tokens_in or total_prompt_tokens,
+                               tokens_out=entry_tokens_out or total_completion_tokens)
         elif entry.get("step") == "routing":
             pass  # already captured above
         elif entry.get("step") == "supervisor":
@@ -502,7 +588,21 @@ async def chat(team_id: str, request: ChatRequest):
 
     collector.save()
 
-    # Save full agent_trace + quick rule-based eval
+    # Always persist agent_used and agent_response — this must not be gated on eval success
+    _session = get_session()
+    try:
+        _tr = _session.query(Trace).filter_by(id=collector.trace_id).first()
+        if _tr:
+            _tr.agent_used = agents_label
+            _tr.agent_response = response[:2000]
+            _tr.tool_calls_json = agent_trace
+            _session.commit()
+    except Exception:
+        pass
+    finally:
+        _session.close()
+
+    # Save quick rule-based eval scores (best-effort — does not block agent_used)
     try:
         from src.evaluation.metrics import TaskMetric, ToolCallMetric
         quick_task = TaskMetric(
@@ -528,9 +628,6 @@ async def chat(team_id: str, request: ChatRequest):
         session = get_session()
         tr = session.query(Trace).filter_by(id=collector.trace_id).first()
         if tr:
-            tr.agent_used = agents_label
-            tr.agent_response = response[:2000]
-            tr.tool_calls_json = agent_trace
             tr.eval_scores = quick_scores
             tr.eval_status = "quick"
             session.commit()
@@ -573,9 +670,22 @@ async def chat_stream(team_id: str, request: ChatStreamRequest):
 
     Streams real-time events: agent_start, tool_start, tool_end, trace_span,
     hitl_request, response, done. Supports LangGraph interrupt/resume via thread_id.
+
+    On every NEW conversation (no thread_id supplied) the orchestrator is rebuilt
+    from the DB so Studio changes take effect without a server restart.
+    For 'auto' strategy teams, the meta-router resolves the concrete strategy
+    using the first message and emits a 'strategy_selected' SSE event.
     """
-    if team_id not in orchestrators:
-        orchestrators[team_id] = await build_orchestrator_from_team(team_id)
+    is_new_thread = not request.thread_id
+
+    resolved_strategy = None
+    if is_new_thread:
+        # Always rebuild for new conversations — picks up latest Studio config.
+        graph, resolved_strategy = await _build_fresh_orchestrator(team_id, request.message)
+        orchestrators[team_id] = graph
+    elif team_id not in orchestrators:
+        graph, _ = await _build_fresh_orchestrator(team_id)
+        orchestrators[team_id] = graph
 
     graph = orchestrators[team_id]
     thread_id = request.thread_id or uuid.uuid4().hex[:12]
@@ -601,18 +711,29 @@ async def chat_stream(team_id: str, request: ChatStreamRequest):
     async def event_generator():
         yield _sse_event("thread_id", {"thread_id": thread_id})
 
+        # Emit resolved strategy immediately so the frontend can show it.
+        if resolved_strategy:
+            yield _sse_event("strategy_selected", {
+                "strategy": resolved_strategy, "from": "auto",
+            })
+
         current_agent = ""
         try:
             async for event in graph.astream_events(initial_input, config=config, version="v2"):
                 kind = event.get("event", "")
                 name = event.get("name", "")
-                tags = event.get("tags", [])
                 data = event.get("data", {})
 
-                if kind == "on_chain_start" and "agent" in name.lower():
-                    agent_name = name.replace("agent:", "").replace("Agent", "").strip() or name
-                    current_agent = agent_name
-                    yield _sse_event("agent_start", {"agent": agent_name})
+                # Detect agent node start.  Use langgraph_node from metadata which
+                # always reflects the *actual graph node name*, avoiding noise from
+                # inner chain/tool events fired within the same node.
+                meta = event.get("metadata", {})
+                lg_node = meta.get("langgraph_node", "")
+                if kind == "on_chain_start" and lg_node and lg_node not in _GRAPH_SYSTEM_NODES and not lg_node.startswith("_") and name == lg_node:
+                    # name == lg_node ensures we only fire once for the node entry point,
+                    # not for every inner chain invocation within that node.
+                    current_agent = lg_node
+                    yield _sse_event("agent_start", {"agent": lg_node})
 
                 elif kind == "on_tool_start":
                     tool_input = data.get("input", {})
@@ -641,8 +762,14 @@ async def chat_stream(team_id: str, request: ChatStreamRequest):
                                 "agent": current_agent, "token": content,
                             })
 
-                elif kind == "on_chain_end" and "agent" in name.lower():
-                    yield _sse_event("agent_end", {"agent": current_agent})
+                elif kind == "on_chain_end" and lg_node and lg_node not in _GRAPH_SYSTEM_NODES and not lg_node.startswith("_") and name == lg_node:
+                    output = data.get("output", {})
+                    ended_agent = (
+                        (output.get("selected_agent") if isinstance(output, dict) else None)
+                        or current_agent
+                    )
+                    if ended_agent and ended_agent != "__done__":
+                        yield _sse_event("agent_end", {"agent": ended_agent})
 
                 while not span_queue.empty():
                     sq = span_queue.get_nowait()
@@ -749,9 +876,11 @@ async def chat_resume(team_id: str, request: ChatResumeRequest):
                 name = event.get("name", "")
                 data = event.get("data", {})
 
-                if kind == "on_chain_start" and "agent" in name.lower():
-                    current_agent = name.replace("agent:", "").strip() or name
-                    yield _sse_event("agent_start", {"agent": current_agent})
+                meta = event.get("metadata", {})
+                lg_node = meta.get("langgraph_node", "")
+                if kind == "on_chain_start" and lg_node and lg_node not in _GRAPH_SYSTEM_NODES and not lg_node.startswith("_") and name == lg_node:
+                    current_agent = lg_node
+                    yield _sse_event("agent_start", {"agent": lg_node})
                 elif kind == "on_tool_start":
                     tool_input = data.get("input", {})
                     safe_input = {k: str(v)[:200] for k, v in tool_input.items()} if isinstance(tool_input, dict) else {"input": str(tool_input)[:200]}
@@ -764,8 +893,11 @@ async def chat_resume(team_id: str, request: ChatResumeRequest):
                         content = getattr(chunk, "content", "")
                         if content and isinstance(content, str):
                             yield _sse_event("llm_token", {"agent": current_agent, "token": content})
-                elif kind == "on_chain_end" and "agent" in name.lower():
-                    yield _sse_event("agent_end", {"agent": current_agent})
+                elif kind == "on_chain_end" and lg_node and lg_node not in _GRAPH_SYSTEM_NODES and not lg_node.startswith("_") and name == lg_node:
+                    output = data.get("output", {})
+                    ended_agent = (output.get("selected_agent") if isinstance(output, dict) else None) or current_agent
+                    if ended_agent and ended_agent != "__done__":
+                        yield _sse_event("agent_end", {"agent": ended_agent})
 
                 while not span_queue.empty():
                     sq = span_queue.get_nowait()
@@ -924,6 +1056,548 @@ def trace_stats(days: int = 30, team_id: str = None):
     }
     session.close()
     return result
+
+
+# ── Prompt Registry API ─────────────────────────────────────────
+
+@app.get("/api/prompts/versions")
+async def prompt_versions(role: str = None):
+    """List all prompt versions. Optionally filter by role."""
+    try:
+        from src.prompts.registry import get_registry
+        reg = get_registry()
+        if role:
+            return {"role": role, "versions": reg.list_versions(role)}
+        roles = reg.list_all_roles()
+        return {
+            "roles": {r: reg.list_versions(r) for r in roles}
+        }
+    except Exception as e:
+        return {"error": str(e), "roles": {}}
+
+
+@app.get("/api/prompts/routing")
+async def get_routing_prompts():
+    """Return current routing prompt versions and text for supervisor, meta_router, and router."""
+    try:
+        from src.prompts.registry import get_registry
+        reg = get_registry()
+        routing_roles = ("supervisor", "meta_router", "router")
+        result = {}
+        for role in routing_roles:
+            versions = reg.list_versions(role)
+            latest_ver = reg.latest_version(role) if versions else None
+            text_val = reg.get_prompt(role, "latest") if latest_ver else None
+            result[role] = {
+                "versions": versions,
+                "active_version": latest_ver,
+                "text": text_val or "",
+            }
+        return {"routing": result}
+    except Exception as e:
+        return {"error": str(e), "routing": {}}
+
+
+@app.put("/api/prompts/routing/{role}")
+async def set_routing_prompt_version(role: str, data: dict):
+    """Set the active version for a routing prompt role (supervisor/meta_router/router)."""
+    try:
+        from src.prompts.registry import get_registry
+        reg = get_registry()
+        version = data.get("version")
+        if not version:
+            raise HTTPException(400, "version is required")
+        if role not in ("supervisor", "meta_router", "router"):
+            raise HTTPException(400, f"Unknown routing role: {role}")
+        # Deactivate all versions for this role and activate the selected one
+        from src.db.models import PromptVersionEntry
+        from src.db.database import get_session
+        session = get_session()
+        try:
+            entries = session.query(PromptVersionEntry).filter_by(role=role).all()
+            for e in entries:
+                e.is_active = (e.version == version)
+            session.commit()
+        finally:
+            session.close()
+        return {"status": "updated", "role": role, "version": version}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/prompts/text")
+async def prompt_text(role: str, version: str = "latest"):
+    """Return the full prompt text for a given role + version."""
+    try:
+        from src.prompts.registry import get_registry
+        reg = get_registry()
+        text_val = reg.get_prompt(role, version)
+        if text_val is None:
+            return {"error": f"No prompt found for role={role} version={version}", "text": ""}
+        return {"role": role, "version": version, "text": text_val}
+    except Exception as e:
+        return {"error": str(e), "text": ""}
+
+
+@app.get("/api/prompts/ab-compare")
+async def prompt_ab_compare(role: str, version_a: str = "v1", version_b: str = "v2"):
+    """
+    Compare two prompt versions across ALL golden tests using stored regression results.
+    Returns per-test pass/fail, metric scores, cost, and latency for both versions,
+    plus aggregate metric deltas and a recommendation.
+    """
+    try:
+        from src.db.database import get_session
+        from sqlalchemy import text
+        import json as _json
+
+        session = get_session()
+        try:
+            def fetch_results(version: str) -> dict:
+                rows = session.execute(text("""
+                    SELECT golden_case_id, golden_case_name, overall_pass,
+                           quality_scores, deepeval_scores,
+                           actual_latency_ms, actual_cost, actual_tool_calls,
+                           actual_agent
+                    FROM regression_results
+                    WHERE actual_agent LIKE :role
+                      AND prompt_version = :version
+                    ORDER BY created_at DESC
+                """), {"role": f"%{role}%", "version": version}).fetchall()
+
+                by_test: dict[str, dict] = {}
+                for r in rows:
+                    gid = r[0]
+                    if gid in by_test:
+                        continue  # keep most recent
+                    try:
+                        qs = _json.loads(r[3]) if isinstance(r[3], str) else (r[3] or {})
+                    except Exception:
+                        qs = {}
+                    try:
+                        ds = _json.loads(r[4]) if isinstance(r[4], str) else (r[4] or {})
+                    except Exception:
+                        ds = {}
+                    by_test[gid] = {
+                        "name": r[1] or gid,
+                        "pass": bool(r[2]),
+                        "quality_scores": qs,
+                        "deepeval_scores": ds,
+                        "all_scores": {**qs, **ds},
+                        "latency_ms": r[5] or 0,
+                        "cost": r[6] or 0.0,
+                        "tool_calls": r[7] or 0,
+                        "agent": r[8] or "",
+                    }
+                return by_test
+
+            data_a = fetch_results(version_a)
+            data_b = fetch_results(version_b)
+        finally:
+            session.close()
+
+        # All test IDs in either version
+        all_ids = sorted(set(data_a.keys()) | set(data_b.keys()))
+        if not all_ids:
+            return {"error": f"No regression data for role={role} with versions {version_a} and {version_b}"}
+
+        # Per-test comparison
+        test_rows = []
+        for gid in all_ids:
+            ra = data_a.get(gid)
+            rb = data_b.get(gid)
+            row: dict = {"golden_case_id": gid, "name": (ra or rb or {}).get("name", gid)}
+            row["a_pass"] = ra["pass"] if ra else None
+            row["b_pass"] = rb["pass"] if rb else None
+            row["a_latency_ms"] = ra["latency_ms"] if ra else None
+            row["b_latency_ms"] = rb["latency_ms"] if rb else None
+            row["a_cost"] = ra["cost"] if ra else None
+            row["b_cost"] = rb["cost"] if rb else None
+            row["a_tool_calls"] = ra["tool_calls"] if ra else None
+            row["b_tool_calls"] = rb["tool_calls"] if rb else None
+            # Per-metric scores for this test
+            all_metric_keys = set()
+            if ra:
+                all_metric_keys.update(ra["all_scores"].keys())
+            if rb:
+                all_metric_keys.update(rb["all_scores"].keys())
+            row["metrics"] = {}
+            for m in all_metric_keys:
+                row["metrics"][m] = {
+                    "a": ra["all_scores"].get(m) if ra else None,
+                    "b": rb["all_scores"].get(m) if rb else None,
+                }
+            test_rows.append(row)
+
+        # Aggregate metric deltas across all shared tests
+        shared = [gid for gid in all_ids if gid in data_a and gid in data_b]
+        metric_agg: dict[str, dict] = {}
+        for gid in shared:
+            all_m = set(data_a[gid]["all_scores"].keys()) | set(data_b[gid]["all_scores"].keys())
+            for m in all_m:
+                va = data_a[gid]["all_scores"].get(m)
+                vb = data_b[gid]["all_scores"].get(m)
+                if va is not None and vb is not None:
+                    try:
+                        va_f, vb_f = float(va), float(vb)
+                    except (TypeError, ValueError):
+                        continue
+                    entry = metric_agg.setdefault(m, {"a_vals": [], "b_vals": []})
+                    entry["a_vals"].append(va_f)
+                    entry["b_vals"].append(vb_f)
+
+        metric_summary: dict[str, dict] = {}
+        for m, vals in metric_agg.items():
+            a_avg = sum(vals["a_vals"]) / len(vals["a_vals"])
+            b_avg = sum(vals["b_vals"]) / len(vals["b_vals"])
+            delta = b_avg - a_avg
+            metric_summary[m] = {
+                "a_avg": round(a_avg, 3),
+                "b_avg": round(b_avg, 3),
+                "delta": round(delta, 3),
+                "delta_pct": round(delta / a_avg * 100, 1) if a_avg else 0,
+                "improved": delta > 0.005,
+                "regressed": delta < -0.005,
+            }
+
+        # Pass rate comparison
+        a_pass = sum(1 for d in data_a.values() if d["pass"]) / len(data_a) if data_a else 0
+        b_pass = sum(1 for d in data_b.values() if d["pass"]) / len(data_b) if data_b else 0
+        a_avg_cost = sum(d["cost"] for d in data_a.values()) / len(data_a) if data_a else 0
+        b_avg_cost = sum(d["cost"] for d in data_b.values()) / len(data_b) if data_b else 0
+        a_avg_lat = sum(d["latency_ms"] for d in data_a.values()) / len(data_a) if data_a else 0
+        b_avg_lat = sum(d["latency_ms"] for d in data_b.values()) / len(data_b) if data_b else 0
+
+        # Recommendation
+        improved_metrics = sum(1 for v in metric_summary.values() if v["improved"])
+        regressed_metrics = sum(1 for v in metric_summary.values() if v["regressed"])
+        pass_delta_pp = (b_pass - a_pass) * 100
+        if pass_delta_pp >= 5 or (improved_metrics > regressed_metrics and pass_delta_pp >= 0):
+            rec = f"✓ {version_b} is better: pass rate {a_pass*100:.1f}% → {b_pass*100:.1f}% (+{pass_delta_pp:.1f}pp), {improved_metrics} metrics improved"
+        elif pass_delta_pp <= -5:
+            rec = f"✗ {version_b} is worse: pass rate dropped {pass_delta_pp:.1f}pp. Revert to {version_a}."
+        else:
+            rec = f"≈ Inconclusive: pass rate Δ{pass_delta_pp:+.1f}pp, {improved_metrics} better / {regressed_metrics} worse metrics. Manual review suggested."
+
+        return {
+            "role": role,
+            "version_a": version_a,
+            "version_b": version_b,
+            "summary": {
+                "a_tests": len(data_a),
+                "b_tests": len(data_b),
+                "shared_tests": len(shared),
+                "a_pass_rate": round(a_pass, 3),
+                "b_pass_rate": round(b_pass, 3),
+                "pass_rate_delta_pp": round(pass_delta_pp, 1),
+                "a_avg_cost": round(a_avg_cost, 6),
+                "b_avg_cost": round(b_avg_cost, 6),
+                "a_avg_latency_ms": round(a_avg_lat, 0),
+                "b_avg_latency_ms": round(b_avg_lat, 0),
+                "improved_metrics": improved_metrics,
+                "regressed_metrics": regressed_metrics,
+            },
+            "recommendation": rec,
+            "metrics": metric_summary,
+            "tests": test_rows,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/prompts/diff")
+async def prompt_diff(role: str, version_old: str = "v1", version_new: str = "v2"):
+    """Return a unified diff between two prompt versions for a role."""
+    try:
+        import difflib
+        from src.prompts.registry import get_registry
+        reg = get_registry()
+        old_p = reg.get_prompt(role, version_old) or ""
+        new_p = reg.get_prompt(role, version_new) or ""
+        if not old_p:
+            return {"error": f"Version {version_old} not found for role={role}"}
+        if not new_p:
+            return {"error": f"Version {version_new} not found for role={role}"}
+        diff = list(difflib.unified_diff(
+            old_p.splitlines(keepends=True),
+            new_p.splitlines(keepends=True),
+            fromfile=f"{role}/{version_old}",
+            tofile=f"{role}/{version_new}",
+            n=3,
+        ))
+        return {
+            "role": role,
+            "version_old": version_old,
+            "version_new": version_new,
+            "diff": "".join(diff),
+            "lines_added": sum(1 for l in diff if l.startswith("+")),
+            "lines_removed": sum(1 for l in diff if l.startswith("-")),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/prompts/optimize")
+async def prompt_optimize(request: Request):
+    """
+    Non-streaming optimization endpoint (kept for backward compat).
+    Prefer /api/prompts/optimize/stream for real-time trajectory.
+    """
+    try:
+        body = await request.json()
+        role = body.get("role", "coder")
+        metric = body.get("metric", "step_efficiency")
+        threshold = float(body.get("threshold", 0.7))
+        model = body.get("model", "claude-sonnet-4.6")
+        version = body.get("version")  # target prompt version to optimize (optional)
+
+        prompt = _build_optimize_prompt(role, metric, threshold, version)
+
+        from src.orchestrator import build_orchestrator_from_team
+        orchestrator = await build_orchestrator_from_team(
+            team_id="default", model_override=model
+        )
+        result = await orchestrator.ainvoke({
+            "messages": [{"role": "user", "content": prompt}],
+            "agent_trace": [],
+            "completed_steps": [],
+            "supervisor_iterations": 0,
+        })
+        last_msg = result["messages"][-1]
+        response_text = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+        agents = list(dict.fromkeys([
+            e.get("agent") for e in result.get("agent_trace", [])
+            if e.get("step") == "execution"
+        ]))
+        return {
+            "status": "completed",
+            "role": role,
+            "metric": metric,
+            "agents_used": agents,
+            "response": response_text[:4000],
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def _build_optimize_prompt(role: str, metric: str, threshold: float, version: str | None) -> str:
+    """Build the user prompt for the PromptOptimizer agent."""
+    version_clause = f"target prompt version: {version}" if version else "the latest available version"
+    return (
+        f"Run a full prompt optimization loop for the **{role}** agent ({version_clause}). "
+        f"Target metric: **{metric}** (improvement threshold: {threshold}). "
+        f"Follow the SETUP → LOOP (up to 3 cycles) → FINAL OUTPUT protocol exactly as specified in your instructions. "
+        f"Bootstrap note: if there are no regression records yet for role={role} version={version or 'latest'}, "
+        f"run a baseline regression first using golden_ids=['golden_001','golden_004','golden_005','golden_006','golden_021'] "
+        f"before starting the analysis. "
+        f"Report the full iteration summary, root cause, changes per cycle, and final diff."
+    )
+
+
+@app.post("/api/prompts/optimize/stream")
+async def prompt_optimize_stream(request: Request):
+    """
+    SSE streaming version of the PromptOptimizer.
+    Emits real-time events: agent_start, tool_start, tool_end, thinking, version_registered,
+    regression_result, response, done.
+
+    Body: {"role": "coder", "metric": "step_efficiency", "threshold": 0.7,
+           "model": "claude-sonnet-4.6", "version": "v4" (optional)}
+    """
+    body = await request.json()
+    role = body.get("role", "coder")
+    metric = body.get("metric", "step_efficiency")
+    threshold = float(body.get("threshold", 0.7))
+    model = body.get("model", "claude-sonnet-4.6")
+    version = body.get("version")
+
+    user_prompt = _build_optimize_prompt(role, metric, threshold, version)
+
+    from src.orchestrator import build_orchestrator_from_team
+    from langgraph.graph.state import CompiledStateGraph
+
+    orchestrator = await build_orchestrator_from_team(
+        team_id="default", model_override=model
+    )
+    thread_id = uuid.uuid4().hex[:12]
+    config = get_graph_config(thread_id)
+    initial_input = {
+        "messages": [{"role": "user", "content": user_prompt}],
+        "agent_trace": [],
+        "completed_steps": [],
+        "supervisor_iterations": 0,
+    }
+
+    async def event_generator():
+        yield _sse_event("thread_id", {"thread_id": thread_id})
+        yield _sse_event("optimize_start", {
+            "role": role, "metric": metric, "threshold": threshold,
+            "version": version or "latest", "model": model,
+        })
+
+        current_agent = ""
+        token_buf = ""
+        try:
+            async for event in orchestrator.astream_events(
+                initial_input, config=config, version="v2"
+            ):
+                kind = event.get("event", "")
+                name = event.get("name", "")
+                data = event.get("data", {})
+                meta = event.get("metadata", {})
+                lg_node = meta.get("langgraph_node", "")
+
+                if kind == "on_chain_start" and lg_node and lg_node not in _GRAPH_SYSTEM_NODES and not lg_node.startswith("_") and name == lg_node:
+                    current_agent = lg_node
+                    yield _sse_event("agent_start", {"agent": lg_node})
+
+                elif kind == "on_tool_start":
+                    tool_input = data.get("input", {})
+                    safe_input = {k: str(v)[:300] for k, v in (tool_input.items() if isinstance(tool_input, dict) else {}.items())}
+                    yield _sse_event("tool_start", {
+                        "agent": current_agent, "tool": name, "args": safe_input,
+                    })
+                    # Special event for version registration so UI can highlight it
+                    if name == "register_prompt_version":
+                        yield _sse_event("version_registering", {
+                            "role": safe_input.get("role", role),
+                            "rationale": safe_input.get("rationale", "")[:200],
+                        })
+
+                elif kind == "on_tool_end":
+                    output = str(data.get("output", ""))
+                    yield _sse_event("tool_end", {
+                        "agent": current_agent, "tool": name,
+                        "output_preview": output[:400],
+                    })
+                    # Special event when regression subset completes
+                    if name == "run_regression_subset":
+                        yield _sse_event("regression_result", {
+                            "tool_output": output[:600],
+                        })
+                    elif name == "register_prompt_version":
+                        # Extract version label from tool output e.g. "✓ Registered coder prompt as v5."
+                        import re
+                        m = re.search(r'as\s+(v\d+)', output)
+                        if m:
+                            yield _sse_event("version_registered", {
+                                "role": role, "version": m.group(1),
+                            })
+
+                elif kind == "on_chat_model_stream":
+                    chunk = data.get("chunk")
+                    if chunk:
+                        token = chunk.content if hasattr(chunk, "content") else ""
+                        if token:
+                            token_buf += token
+                            if len(token_buf) >= 40 or token.endswith(("\n", ".")):
+                                yield _sse_event("thinking", {"delta": token_buf, "agent": current_agent})
+                                token_buf = ""
+
+        except Exception as e:
+            yield _sse_event("error", {"message": str(e)})
+            return
+
+        if token_buf:
+            yield _sse_event("thinking", {"delta": token_buf, "agent": current_agent})
+
+        yield _sse_event("done", {"status": "completed", "role": role, "metric": metric})
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── TraceAnalyzer Performance Report ────────────────────────────
+# IMPORTANT: these specific routes must be declared BEFORE the
+# /api/traces/{trace_id} wildcard, otherwise FastAPI matches
+# "performance-report" as a trace_id (route ordering matters).
+
+@app.get("/api/traces/performance-report")
+async def traces_performance_report(days: int = 7, team_id: str = None):
+    """
+    Deep performance analytics computed by TraceAnalyzer.
+
+    Returns per-agent and per-tool latency percentiles (p50/p95/p99), tool
+    failure rates, context window utilisation trend, cost breakdown by agent
+    and model, and z-score-based anomaly detection on historical spans.
+
+    Query params:
+        days     — look-back window (default: 7)
+        team_id  — filter to a specific team (default: all teams)
+    """
+    try:
+        from src.tracing.analyzer import TraceAnalyzer
+        analyzer = TraceAnalyzer(team_id=team_id or None)
+        report = analyzer.full_report(days=days)
+        return report
+    except Exception as e:
+        return {"error": str(e), "agent_latency_percentiles": {}, "tool_failure_rates": {},
+                "cost_breakdown": {"summary": {}}, "performance_anomalies": []}
+
+
+@app.get("/api/traces/performance-report/anomalies")
+async def traces_anomalies(days: int = 7, z_threshold: float = 2.5, team_id: str = None):
+    """
+    Return only the z-score anomaly list from TraceAnalyzer.
+    Useful for surfacing as alerts in the monitoring dashboard.
+    """
+    try:
+        from src.tracing.analyzer import TraceAnalyzer
+        analyzer = TraceAnalyzer(team_id=team_id or None)
+        return {"anomalies": analyzer.performance_anomalies(days=days, z_threshold=z_threshold)}
+    except Exception as e:
+        return {"anomalies": [], "error": str(e)}
+
+
+@app.get("/api/traces/performance-report/regression-insights")
+async def regression_insights(days: int = 30):
+    """
+    Aggregate DeepEval + G-Eval scores across all RegressionResult rows.
+
+    Returns: worst-scoring metrics, costliest/slowest golden tests, agent
+    roles that appear most in failed delegation patterns, and per-test
+    pass rates. Intended for the Performance Analysis dashboard.
+    """
+    try:
+        from src.tracing.analyzer import TraceAnalyzer
+        analyzer = TraceAnalyzer()
+        return analyzer.regression_metric_insights(days=days)
+    except Exception as e:
+        return {
+            "metric_averages": {}, "worst_metrics": [], "costliest_tests": [],
+            "slowest_tests": [], "failed_agent_patterns": {},
+            "pass_rate_by_test": {}, "summary": {"total_runs": 0},
+            "error": str(e),
+        }
+
+
+@app.get("/api/traces/performance-report/ab-compare")
+async def ab_compare_runs(run_a: str, run_b: str):
+    """
+    Side-by-side comparison of two eval runs (A/B analysis).
+
+    Computes per-metric deltas, flags significant changes (>=0.1 DeepEval,
+    >=0.3 G-Eval), and returns radar-chart-ready normalised data plus a
+    plain-English recommendation.
+
+    Query params:
+        run_a  — ID of the baseline eval run
+        run_b  — ID of the new eval run
+    """
+    try:
+        from src.tracing.analyzer import TraceAnalyzer
+        analyzer = TraceAnalyzer()
+        return analyzer.ab_compare(run_a, run_b)
+    except Exception as e:
+        return {
+            "run_a": {"id": run_a}, "run_b": {"id": run_b},
+            "metrics": {}, "performance": {}, "radar_data": [],
+            "recommendation": "Error running comparison.",
+            "test_comparison": [], "error": str(e),
+        }
+
 
 @app.get("/api/traces/{trace_id}")
 def get_trace(trace_id: str):
@@ -1274,18 +1948,80 @@ def get_llm_config():
 
 @app.get("/api/prompt-versions")
 def list_prompt_versions():
+    """
+    Return all prompt versions from the PromptRegistry (PromptVersionEntry rows).
+    Groups entries by version label so the regression page dropdown shows one option
+    per version label (e.g. v1, v2, v3) with a description of which roles changed.
+    Also falls back to legacy PromptVersion snapshot rows if any exist.
+    """
+    from src.db.models import PromptVersionEntry
     session = get_session()
-    pvs = session.query(PromptVersion).order_by(PromptVersion.created_at.desc()).all()
-    result = [{
-        "id": p.id, "version_label": p.version_label,
-        "description": p.description,
-        "agent_prompts": p.agent_prompts or {},
-        "team_strategy": p.team_strategy,
-        "is_active": p.is_active,
-        "created_at": p.created_at.isoformat() if p.created_at else None,
-    } for p in pvs]
-    session.close()
-    return result
+    try:
+        # Collect all PromptVersionEntry rows grouped by version label
+        entries = (
+            session.query(PromptVersionEntry)
+            .order_by(PromptVersionEntry.version, PromptVersionEntry.created_at)
+            .all()
+        )
+
+        # Group by version label across roles → one dropdown option per version
+        from collections import defaultdict
+        by_version: dict[str, dict] = defaultdict(lambda: {
+            "roles": [], "cot_roles": [], "optimizer_roles": [],
+            "created_at": None, "latest_rationale": "",
+        })
+        for e in entries:
+            v = by_version[e.version]
+            v["roles"].append(e.role)
+            if e.cot_enhanced:
+                v["cot_roles"].append(e.role)
+            if e.created_by == "optimizer":
+                v["optimizer_roles"].append(e.role)
+            if v["created_at"] is None or (e.created_at and e.created_at.isoformat() > v["created_at"]):
+                v["created_at"] = e.created_at.isoformat() if e.created_at else None
+            if e.rationale:
+                v["latest_rationale"] = e.rationale[:120]
+
+        result = []
+        for version_label, info in sorted(by_version.items()):
+            roles_str = ", ".join(sorted(set(info["roles"])))
+            tags = []
+            if info["cot_roles"]:
+                tags.append("CoT")
+            if info["optimizer_roles"]:
+                tags.append("optimizer")
+            tag_str = f" [{', '.join(tags)}]" if tags else ""
+            desc = f"{len(set(info['roles']))} roles ({roles_str}){tag_str}"
+            if info["latest_rationale"]:
+                desc += f" — {info['latest_rationale']}"
+            result.append({
+                "id": version_label,
+                "version_label": version_label,
+                "description": desc,
+                "roles": sorted(set(info["roles"])),
+                "cot_enhanced_roles": info["cot_roles"],
+                "optimizer_generated_roles": info["optimizer_roles"],
+                "is_active": True,
+                "created_at": info["created_at"],
+            })
+
+        # Also include legacy PromptVersion snapshot rows if any
+        legacy = session.query(PromptVersion).order_by(PromptVersion.created_at.desc()).all()
+        legacy_labels = {r["version_label"] for r in result}
+        for p in legacy:
+            if p.version_label not in legacy_labels:
+                result.append({
+                    "id": p.id,
+                    "version_label": p.version_label,
+                    "description": p.description or "(legacy snapshot)",
+                    "roles": [],
+                    "is_active": p.is_active,
+                    "created_at": p.created_at.isoformat() if p.created_at else None,
+                })
+
+        return result
+    finally:
+        session.close()
 
 
 @app.post("/api/prompt-versions")
@@ -1471,16 +2207,115 @@ def _sync_db_to_json():
 @app.post("/api/regression/run")
 async def run_regression(request: RegressionRunRequest):
     from src.evaluation.regression import RegressionRunner
+
+    # If no per-role prompt versions are explicitly provided, fall back to
+    # whatever versions are currently set on each agent in Studio (DB).
+    # This ensures regression tests use the same prompt versions as the UI.
+    effective_versions = request.prompt_versions_by_role
+    if not effective_versions:
+        session = get_session()
+        try:
+            agents = session.query(Agent).filter_by(team_id=request.team_id or "default").all()
+            studio_versions = {
+                a.role: (getattr(a, "prompt_version", None) or "v1")
+                for a in agents
+                if (getattr(a, "prompt_version", None) or "v1") != "v1"
+            }
+            if studio_versions:
+                effective_versions = studio_versions
+        finally:
+            session.close()
+
     runner = RegressionRunner(
         model=request.model,
         prompt_version=request.prompt_version,
         team_id=request.team_id,
+        prompt_versions_by_role=effective_versions,
     )
     result = await runner.run(
         case_ids=request.case_ids,
         baseline_run_id=request.baseline_run_id,
     )
     return result
+
+
+@app.post("/api/regression/run/stream")
+async def run_regression_stream(request: RegressionRunRequest):
+    """SSE endpoint that streams live trajectory events as each test case executes.
+
+    Events (all tagged with case_id):
+      run_start   — { run_id, num_cases }
+      case_start  — { case_id, case_label, index, total, prompt }
+      agent_start — { case_id, agent }
+      tool_start  — { case_id, agent, tool, args }
+      tool_end    — { case_id, agent, tool, output_preview }
+      agent_end   — { case_id, agent }
+      case_done   — { case_id, passed, verdict, latency_ms, trajectory,
+                      actual_output, trace_assertions, deepeval_scores,
+                      semantic_similarity, actual_cost, error? }
+      run_done    — { run_id, model, num_cases, summary }
+      error       — { message }
+    """
+    import asyncio
+    from src.evaluation.regression import RegressionRunner
+
+    effective_versions = request.prompt_versions_by_role
+    if not effective_versions:
+        session = get_session()
+        try:
+            agents = session.query(Agent).filter_by(team_id=request.team_id or "default").all()
+            studio_versions = {
+                a.role: (getattr(a, "prompt_version", None) or "v1")
+                for a in agents
+                if (getattr(a, "prompt_version", None) or "v1") != "v1"
+            }
+            if studio_versions:
+                effective_versions = studio_versions
+        finally:
+            session.close()
+
+    runner = RegressionRunner(
+        model=request.model,
+        prompt_version=request.prompt_version,
+        team_id=request.team_id,
+        prompt_versions_by_role=effective_versions,
+    )
+
+    # Use an asyncio Queue to bridge the async generator from run_streaming
+    # with the SSE StreamingResponse generator.
+    queue: asyncio.Queue = asyncio.Queue()
+    SENTINEL = object()
+
+    async def _producer():
+        async def emit(event_type: str, data: dict):
+            await queue.put((event_type, data))
+
+        try:
+            await runner.run_streaming(emit=emit, case_ids=request.case_ids,
+                                       baseline_run_id=request.baseline_run_id)
+        except Exception as e:
+            await queue.put(("error", {"message": str(e)[:500]}))
+        finally:
+            await queue.put(SENTINEL)
+
+    async def event_generator():
+        task = asyncio.create_task(_producer())
+        try:
+            while True:
+                item = await queue.get()
+                if item is SENTINEL:
+                    break
+                evt_type, data = item
+                yield _sse_event(evt_type, data)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/regression/runs")
@@ -1540,6 +2375,7 @@ def get_regression_results(run_id: str):
         "model_used": r.model_used, "prompt_version": r.prompt_version,
         "expected_strategy": getattr(r, "expected_strategy", None),
         "actual_strategy": getattr(r, "actual_strategy", None),
+        "router_prompt_version": getattr(r, "router_prompt_version", None),
         "created_at": r.created_at.isoformat() if r.created_at else None,
     } for r in rows]
     session.close()
@@ -1597,134 +2433,179 @@ def get_regression_case_detail(run_id: str, case_id: str):
             "model_used": r.model_used, "prompt_version": r.prompt_version,
             "expected_strategy": getattr(r, "expected_strategy", None),
             "actual_strategy": getattr(r, "actual_strategy", None),
+            "router_prompt_version": getattr(r, "router_prompt_version", None),
         },
     }
     session.close()
     return result
 
 
-@app.get("/api/regression/diff/{run_a}/{run_b}/{case_id}")
-def regression_trace_diff(run_a: str, run_b: str, case_id: str):
-    """Side-by-side trace comparison for a specific golden test case across two runs."""
+@app.get("/api/regression/ab/options")
+def regression_ab_options(golden_id: str):
+    """
+    Returns distinct regression runs available for a given golden test case,
+    ordered newest-first. Each entry includes run_id, model, prompt_version,
+    created_at, and overall_pass so the UI can populate two run-picker dropdowns.
+    """
     session = get_session()
-    r_a = session.query(RegressionResult).filter_by(run_id=run_a, golden_case_id=case_id).first()
-    r_b = session.query(RegressionResult).filter_by(run_id=run_b, golden_case_id=case_id).first()
-    session.close()
-    if not r_a or not r_b:
-        raise HTTPException(404, "One or both case results not found")
+    try:
+        rows = (
+            session.query(RegressionResult)
+            .filter(RegressionResult.golden_case_id == golden_id)
+            .order_by(RegressionResult.created_at.desc())
+            .all()
+        )
+        # Deduplicate by run_id (keep first = most recent per run)
+        seen = set()
+        options = []
+        for r in rows:
+            if r.run_id in seen:
+                continue
+            seen.add(r.run_id)
+            options.append({
+                "run_id": r.run_id,
+                "model": r.model_used or "unknown",
+                "prompt_version": r.prompt_version or "v1",
+                "router_prompt_version": getattr(r, "router_prompt_version", None),
+                "actual_strategy": getattr(r, "actual_strategy", None),
+                "overall_pass": r.overall_pass,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            })
+        return {"golden_id": golden_id, "options": options}
+    finally:
+        session.close()
 
-    from src.evaluation.rca import RootCauseAnalyzer
-    analyzer = RootCauseAnalyzer()
-    trace_diff = analyzer._compute_trace_diff(
-        r_b.full_trace or [],
-        r_a.full_trace or [],
-    )
-    cost_diff = analyzer._compute_cost_diff(
-        {"actual_tokens_in": r_b.actual_tokens_in, "actual_tokens_out": r_b.actual_tokens_out,
-         "actual_cost": r_b.actual_cost, "actual_latency_ms": r_b.actual_latency_ms,
-         "actual_llm_calls": r_b.actual_llm_calls, "actual_tool_calls": r_b.actual_tool_calls},
-        {"actual_tokens_in": r_a.actual_tokens_in, "actual_tokens_out": r_a.actual_tokens_out,
-         "actual_cost": r_a.actual_cost, "actual_latency_ms": r_a.actual_latency_ms,
-         "actual_llm_calls": r_a.actual_llm_calls, "actual_tool_calls": r_a.actual_tool_calls},
-    )
 
-    def _result_dict(r):
+@app.get("/api/regression/ab")
+def regression_ab_compare(
+    golden_id: str,
+    run_id_a: Optional[str] = None,
+    run_id_b: Optional[str] = None,
+    model_a: Optional[str] = None,
+    model_b: Optional[str] = None,
+    version_a: Optional[str] = None,
+    version_b: Optional[str] = None,
+):
+    """
+    A/B comparison for a golden test case.
+    Prefer run_id_a / run_id_b (exact run selection); falls back to
+    model_a/b + version_a/b filters to pick the most recent matching result.
+    """
+    import json as _json
+    session = get_session()
+    try:
+        golden = session.query(GoldenTestCase).filter_by(id=golden_id).first()
+        expected_output = golden.reference_output if golden else ""
+        golden_prompt = golden.prompt if golden else ""
+        golden_name = golden.name if golden else golden_id
+
+        def fetch_side(run_id: Optional[str], model: Optional[str], version: Optional[str]):
+            q = session.query(RegressionResult).filter(
+                RegressionResult.golden_case_id == golden_id
+            )
+            if run_id:
+                q = q.filter(RegressionResult.run_id == run_id)
+            else:
+                if model:
+                    q = q.filter(RegressionResult.model_used == model)
+                if version:
+                    q = q.filter(RegressionResult.prompt_version == version)
+            r = q.order_by(RegressionResult.created_at.desc()).first()
+            if not r:
+                return None
+            # Build per-agent trajectory from full_trace
+            trace = r.full_trace or []
+            per_agent: dict[str, dict] = {}
+            for ev in trace:
+                agent = ev.get("agent", "unknown")
+                if agent not in per_agent:
+                    per_agent[agent] = {"tools": [], "llm_calls": 0, "tool_calls": 0}
+                step = ev.get("step", "")
+                if step == "tool_call":
+                    per_agent[agent]["tools"].append(ev.get("tool", ev.get("name", "")))
+                    per_agent[agent]["tool_calls"] += 1
+                elif step == "execution":
+                    per_agent[agent]["llm_calls"] += 1
+
+            # DeepEval scores + reasons split
+            ds_raw = r.deepeval_scores or {}
+            de_scores: dict[str, dict] = {}
+            for k, v in ds_raw.items():
+                if k.endswith("_reason"):
+                    metric = k[: -len("_reason")]
+                    de_scores.setdefault(metric, {})["reason"] = v
+                else:
+                    de_scores.setdefault(k, {})["score"] = v
+
+            return {
+                "run_id": r.run_id,
+                "model": r.model_used,
+                "prompt_version": r.prompt_version,
+                "actual_strategy": getattr(r, "actual_strategy", None),
+                "actual_output": r.actual_output or "",
+                "actual_agent": r.actual_agent or "",
+                "actual_delegation_pattern": r.actual_delegation_pattern or [],
+                "actual_tools": r.actual_tools or [],
+                "actual_llm_calls": r.actual_llm_calls,
+                "actual_tool_calls": r.actual_tool_calls,
+                "actual_latency_ms": r.actual_latency_ms,
+                "actual_cost": r.actual_cost,
+                "semantic_similarity": r.semantic_similarity,
+                "overall_pass": r.overall_pass,
+                "per_agent": per_agent,
+                "deepeval": de_scores,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+
+        side_a = fetch_side(run_id_a, model_a, version_a)
+        side_b = fetch_side(run_id_b, model_b, version_b)
+    finally:
+        session.close()
+
+    if not side_a and not side_b:
         return {
-            "actual_output": r.actual_output, "actual_agent": r.actual_agent,
-            "actual_tools": r.actual_tools or [], "actual_delegation_pattern": r.actual_delegation_pattern or [],
-            "actual_llm_calls": r.actual_llm_calls, "actual_tool_calls": r.actual_tool_calls,
-            "actual_tokens_in": r.actual_tokens_in, "actual_tokens_out": r.actual_tokens_out,
-            "actual_latency_ms": r.actual_latency_ms, "actual_cost": r.actual_cost,
-            "semantic_similarity": r.semantic_similarity,
-            "quality_scores": r.quality_scores or {},
-            "deepeval_scores": r.deepeval_scores or {},
-            "trace_assertions": r.trace_assertions or {},
-            "eval_reasoning": r.eval_reasoning or {},
-            "overall_pass": r.overall_pass,
-            "model_used": r.model_used,
-            "expected_strategy": getattr(r, "expected_strategy", None),
-            "actual_strategy": getattr(r, "actual_strategy", None),
+            "golden_id": golden_id,
+            "golden_name": golden_name,
+            "golden_prompt": golden_prompt,
+            "expected_output": expected_output,
+            "error": "No regression results found for these filters. Run the tests first.",
+            "side_a": None, "side_b": None,
+        }
+
+    # Compute DeepEval metric diffs
+    all_metrics = set()
+    if side_a:
+        all_metrics.update(side_a["deepeval"].keys())
+    if side_b:
+        all_metrics.update(side_b["deepeval"].keys())
+
+    metric_diff: dict[str, dict] = {}
+    for m in sorted(all_metrics):
+        a_score = (side_a["deepeval"].get(m, {}) or {}).get("score") if side_a else None
+        b_score = (side_b["deepeval"].get(m, {}) or {}).get("score") if side_b else None
+        a_reason = (side_a["deepeval"].get(m, {}) or {}).get("reason", "") if side_a else ""
+        b_reason = (side_b["deepeval"].get(m, {}) or {}).get("reason", "") if side_b else ""
+        try:
+            delta = round(float(b_score) - float(a_score), 3) if a_score is not None and b_score is not None else None
+        except (TypeError, ValueError):
+            delta = None
+        metric_diff[m] = {
+            "a_score": a_score, "b_score": b_score,
+            "delta": delta,
+            "improved": delta is not None and delta > 0.02,
+            "regressed": delta is not None and delta < -0.02,
+            "a_reason": a_reason, "b_reason": b_reason,
         }
 
     return {
-        "case_id": case_id,
-        "run_a": {"id": run_a, **_result_dict(r_a)},
-        "run_b": {"id": run_b, **_result_dict(r_b)},
-        "trace_diff": trace_diff,
-        "cost_diff": cost_diff,
+        "golden_id": golden_id,
+        "golden_name": golden_name,
+        "golden_prompt": golden_prompt,
+        "expected_output": expected_output,
+        "side_a": side_a,
+        "side_b": side_b,
+        "metric_diff": metric_diff,
     }
-
-
-@app.post("/api/regression/rca")
-async def run_rca(request: RCARequest):
-    session = get_session()
-    result = session.query(RegressionResult).filter_by(
-        run_id=request.run_id, golden_case_id=request.case_id
-    ).first()
-    if not result:
-        session.close()
-        raise HTTPException(404, "Case result not found")
-
-    failing = {
-        "golden_case_id": result.golden_case_id,
-        "golden_case_name": result.golden_case_name,
-        "prompt": "",
-        "actual_output": result.actual_output,
-        "actual_agent": result.actual_agent,
-        "actual_tools": result.actual_tools or [],
-        "actual_tokens_in": result.actual_tokens_in,
-        "actual_tokens_out": result.actual_tokens_out,
-        "actual_cost": result.actual_cost,
-        "actual_latency_ms": result.actual_latency_ms,
-        "actual_llm_calls": result.actual_llm_calls,
-        "actual_tool_calls": result.actual_tool_calls,
-        "quality_scores": result.quality_scores or {},
-        "trace_assertions": result.trace_assertions or {},
-        "full_trace": result.full_trace or [],
-        "model_used": result.model_used,
-    }
-
-    golden = session.query(GoldenTestCase).filter_by(id=request.case_id).first()
-    if golden:
-        failing["prompt"] = golden.prompt
-        failing["expected_agent"] = golden.expected_agent
-        failing["expected_tools"] = golden.expected_tools or []
-
-    baseline = None
-    if request.baseline_run_id:
-        b = session.query(RegressionResult).filter_by(
-            run_id=request.baseline_run_id, golden_case_id=request.case_id
-        ).first()
-        if b:
-            baseline = {
-                "actual_output": b.actual_output, "actual_agent": b.actual_agent,
-                "actual_tools": b.actual_tools or [],
-                "actual_tokens_in": b.actual_tokens_in, "actual_tokens_out": b.actual_tokens_out,
-                "actual_cost": b.actual_cost, "actual_latency_ms": b.actual_latency_ms,
-                "actual_llm_calls": b.actual_llm_calls, "actual_tool_calls": b.actual_tool_calls,
-                "quality_scores": b.quality_scores or {},
-                "trace_assertions": b.trace_assertions or {},
-                "full_trace": b.full_trace or [],
-            }
-
-    session.close()
-
-    from src.evaluation.rca import RootCauseAnalyzer
-    analyzer = RootCauseAnalyzer()
-    rca_result = await analyzer.analyze(failing, baseline)
-
-    session = get_session()
-    r = session.query(RegressionResult).filter_by(
-        run_id=request.run_id, golden_case_id=request.case_id
-    ).first()
-    if r:
-        r.rca_analysis = rca_result
-        from sqlalchemy.orm.attributes import flag_modified
-        flag_modified(r, "rca_analysis")
-        session.commit()
-    session.close()
-
-    return rca_result
 
 
 # ── WebSocket (fallback with HITL support) ──────────────────────
@@ -1817,6 +2698,7 @@ class RagConfigCreate(BaseModel):
     mmr_lambda: float = 0.5
     multi_query_n: int = 3
     system_prompt: Optional[str] = None
+    reranker: str = "none"
 
 
 class RagSourceCreate(BaseModel):
@@ -1829,6 +2711,7 @@ class RagChatRequest(BaseModel):
     query: str
     config_id: str
     auto_evaluate: bool = False
+    reranker_override: Optional[str] = None   # override reranker for this query only
 
 
 class RagEvalRequest(BaseModel):
@@ -1837,7 +2720,7 @@ class RagEvalRequest(BaseModel):
     thresholds: Optional[dict] = None
 
 
-def _cfg_to_pipeline_config(cfg_row: RagConfigModel):
+def _cfg_to_pipeline_config(cfg_row: RagConfigModel, reranker_override: str | None = None):
     from src.rag.pipeline import RAGConfig
     return RAGConfig(
         config_id=cfg_row.id,
@@ -1853,6 +2736,7 @@ def _cfg_to_pipeline_config(cfg_row: RagConfigModel):
         mmr_lambda=cfg_row.mmr_lambda or 0.5,
         multi_query_n=cfg_row.multi_query_n or 3,
         system_prompt=cfg_row.system_prompt,
+        reranker=reranker_override if reranker_override is not None else (cfg_row.reranker or "none"),
     )
 
 
@@ -1872,6 +2756,7 @@ def _cfg_row_to_dict(r: RagConfigModel) -> dict:
         "mmr_lambda": r.mmr_lambda,
         "multi_query_n": r.multi_query_n,
         "system_prompt": r.system_prompt,
+        "reranker": r.reranker or "none",
         "is_active": r.is_active,
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "sources": [
@@ -1893,14 +2778,16 @@ def _cfg_row_to_dict(r: RagConfigModel) -> dict:
 
 @app.get("/api/rag/models")
 def list_rag_models():
-    """Return available embedding models and vector store options."""
+    """Return available embedding models, vector store options, and reranker models."""
     from src.rag.embeddings import EMBEDDING_MODELS
     from src.rag.vectorstore import VECTOR_STORES
+    from src.rag.reranker import RERANKER_MODELS
     return {
         "embedding_models": {k: v for k, v in EMBEDDING_MODELS.items()},
         "vector_stores": VECTOR_STORES,
         "chunk_strategies": ["recursive", "fixed", "semantic", "code"],
         "retrieval_strategies": ["similarity", "mmr", "multi_query", "hybrid"],
+        "reranker_models": RERANKER_MODELS,
     }
 
 
@@ -1932,6 +2819,7 @@ def create_rag_config(body: RagConfigCreate):
             mmr_lambda=body.mmr_lambda,
             multi_query_n=body.multi_query_n,
             system_prompt=body.system_prompt,
+            reranker=body.reranker,
         )
         session.add(row)
         session.commit()
@@ -2063,7 +2951,15 @@ async def rag_chat(body: RagChatRequest):
     finally:
         session.close()
 
-    from src.rag.pipeline import get_pipeline
+    # Apply reranker override: update config in-place (keeps same config_id/collection)
+    if body.reranker_override is not None:
+        import dataclasses as _dc
+        cfg_config = _dc.replace(cfg_config, reranker=body.reranker_override)
+
+    from src.rag.pipeline import get_pipeline, evict_pipeline
+    # If reranker override differs from cached pipeline, rebuild temporarily
+    if body.reranker_override is not None:
+        evict_pipeline(cfg_config.config_id)
     pipeline = get_pipeline(cfg_config)
     if pipeline.chunk_count() == 0:
         raise HTTPException(400, "No documents ingested yet. Please add data sources first.")
@@ -2169,6 +3065,133 @@ async def rag_chat(body: RagChatRequest):
         "tokens_out": response.tokens_out,
         "latency_ms": response.latency_ms,
     }
+
+
+# ── A/B Compare endpoint ────────────────────────────────────────────────────
+
+
+class RagComparePane(BaseModel):
+    config_id: str
+    retrieval_strategy_override: Optional[str] = None
+    reranker_override: Optional[str] = None
+    llm_model_override: Optional[str] = None
+
+
+class RagCompareRequest(BaseModel):
+    query: str
+    pane_a: RagComparePane
+    pane_b: RagComparePane
+    auto_evaluate: bool = True
+
+
+async def _run_pane_query(
+    pane: RagComparePane,
+    query: str,
+    run_eval: bool,
+) -> dict:
+    """Run a single RAG query for one compare pane and return result + eval scores."""
+    session = get_session()
+    try:
+        cfg_row = session.query(RagConfigModel).filter_by(id=pane.config_id).first()
+        if not cfg_row:
+            return {"error": f"Config {pane.config_id} not found"}
+        cfg_config = _cfg_to_pipeline_config(
+            cfg_row,
+            reranker_override=pane.reranker_override,
+        )
+        if pane.retrieval_strategy_override:
+            import dataclasses as _dc
+            cfg_config = _dc.replace(cfg_config, retrieval_strategy=pane.retrieval_strategy_override)
+        if pane.llm_model_override:
+            import dataclasses as _dc
+            cfg_config = _dc.replace(cfg_config, llm_model=pane.llm_model_override)
+    finally:
+        session.close()
+
+    from src.rag.pipeline import get_pipeline, evict_pipeline
+    # Evict cache if any override changes the effective config
+    if pane.reranker_override is not None or pane.retrieval_strategy_override:
+        evict_pipeline(cfg_config.config_id)
+    pipeline = get_pipeline(cfg_config)
+    if pipeline.chunk_count() == 0:
+        return {"error": "No documents ingested for this config."}
+
+    response = await pipeline.query(query)
+
+    eval_scores: dict = {}
+    if run_eval:
+        try:
+            from deepeval.test_case import LLMTestCase
+            from deepeval.metrics import (
+                AnswerRelevancyMetric, FaithfulnessMetric,
+                ContextualRelevancyMetric, ContextualPrecisionMetric,
+                ContextualRecallMetric,
+            )
+            from src.evaluation.integrations import _get_deepeval_model
+            judge = _get_deepeval_model()
+            ctx = [c.snippet for c in response.citations]
+            tc = LLMTestCase(
+                input=query,
+                actual_output=response.answer,
+                expected_output=response.answer,
+                retrieval_context=ctx,
+            )
+            metrics_to_run = [
+                ("answer_relevancy",     AnswerRelevancyMetric(threshold=0.5, model=judge, include_reason=True)),
+                ("faithfulness",         FaithfulnessMetric(threshold=0.5, model=judge, include_reason=True)),
+                ("contextual_relevancy", ContextualRelevancyMetric(threshold=0.5, model=judge, include_reason=True)),
+                ("contextual_precision", ContextualPrecisionMetric(threshold=0.5, model=judge, include_reason=True)),
+                ("contextual_recall",    ContextualRecallMetric(threshold=0.5, model=judge, include_reason=True)),
+            ]
+            for name, metric in metrics_to_run:
+                for attempt in range(2):
+                    try:
+                        await metric.a_measure(tc)
+                        eval_scores[name] = {
+                            "score": float(metric.score or 0),
+                            "passed": bool(metric.is_successful()),
+                            "reason": metric.reason or "",
+                        }
+                        break
+                    except Exception as me:
+                        if attempt == 1:
+                            eval_scores[name] = {"score": 0.0, "passed": False, "reason": f"ERROR: {me}"}
+        except Exception as e:
+            eval_scores = {"error": str(e)}
+
+    return {
+        "answer": response.answer,
+        "citations": [
+            {"source": c.source, "chunk_index": c.chunk_index, "score": c.score, "snippet": c.snippet}
+            for c in response.citations
+        ],
+        "strategy_used": response.strategy_used,
+        "reranker_used": cfg_config.reranker,
+        "chunks_retrieved": response.chunks_retrieved,
+        "tokens_in": response.tokens_in,
+        "tokens_out": response.tokens_out,
+        "latency_ms": response.latency_ms,
+        "eval_scores": eval_scores,
+    }
+
+
+@app.post("/api/rag/compare")
+async def rag_compare(body: RagCompareRequest):
+    """Run the same query on two pipeline configurations in parallel.
+
+    Returns answers, citations, latency, and optionally DeepEval metrics for
+    each pane so the frontend can render a side-by-side radar comparison.
+    """
+    result_a, result_b = await asyncio.gather(
+        _run_pane_query(body.pane_a, body.query, body.auto_evaluate),
+        _run_pane_query(body.pane_b, body.query, body.auto_evaluate),
+        return_exceptions=True,
+    )
+    if isinstance(result_a, Exception):
+        result_a = {"error": str(result_a)}
+    if isinstance(result_b, Exception):
+        result_b = {"error": str(result_b)}
+    return {"pane_a": result_a, "pane_b": result_b, "query": body.query}
 
 
 async def _run_rag_eval_for_query(query_id: str, cfg_config, rag_response) -> None:
@@ -2566,7 +3589,8 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,
-        reload_dirs=["src"],
+        reload_dirs=["src", "."],   # watch both src/ and server.py itself
+        reload_includes=["*.py"],
         reload_excludes=[
             "tests/*", "*.pyc", "__pycache__/*",
             "*.db", "*.sqlite", "*.log",

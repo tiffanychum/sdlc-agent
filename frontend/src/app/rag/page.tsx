@@ -13,11 +13,13 @@ interface EmbeddingModelMeta {
   cost_per_1m_tokens: number; description: string; recommended?: boolean;
 }
 interface VectorStoreMeta { label: string; description: string; }
+interface RerankerMeta { label: string; description: string; hf_id: string | null; }
 interface RagModels {
   embedding_models: Record<string, EmbeddingModelMeta>;
   vector_stores: Record<string, VectorStoreMeta>;
   chunk_strategies: string[];
   retrieval_strategies: string[];
+  reranker_models?: Record<string, RerankerMeta>;
 }
 interface RagSource {
   id: string; source_type: string; content: string; label: string;
@@ -29,8 +31,8 @@ interface RagConfig {
   embedding_model: string; vector_store: string; llm_model?: string;
   chunk_size: number; chunk_overlap: number; chunk_strategy: string;
   retrieval_strategy: string; top_k: number; mmr_lambda: number;
-  multi_query_n: number; system_prompt?: string; is_active: boolean;
-  created_at?: string; sources: RagSource[];
+  multi_query_n: number; system_prompt?: string; reranker: string;
+  is_active: boolean; created_at?: string; sources: RagSource[];
 }
 interface Citation {
   source: string; chunk_index: number; total_chunks: number;
@@ -927,155 +929,232 @@ function DataSources({ config, onRefresh }: { config: RagConfig; onRefresh: () =
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Compare tab — side-by-side with inline config editing
+// Compare tab — side-by-side with inline config editing + DeepEval radar chart
 // ─────────────────────────────────────────────────────────────────────────────
 
 type PaneConfig = {
   pipeline_id: string;
-  // overrides (empty = use pipeline defaults)
   retrieval_strategy: string;
-  top_k: number;
+  reranker: string;
   llm_model: string;
 };
 
-function ComparePane({ pane, allConfigs, llmModels, messages, loading }: {
-  pane: PaneConfig;
-  allConfigs: RagConfig[];
-  llmModels: LLMModel[];
-  messages: Array<{ q: string; a: string; citations: Citation[]; ms: number }>;
-  loading: boolean;
+interface PaneResult {
+  answer: string;
+  citations: Citation[];
+  strategy_used: string;
+  reranker_used: string;
+  chunks_retrieved: number;
+  latency_ms: number;
+  eval_scores: Record<string, { score: number; passed: boolean; reason: string }> | null;
+  error?: string;
+}
+
+const EVAL_METRIC_LABELS: Record<string, string> = {
+  answer_relevancy: "Relevancy",
+  faithfulness: "Faithfulness",
+  contextual_relevancy: "Ctx Relevancy",
+  contextual_precision: "Ctx Precision",
+  contextual_recall: "Ctx Recall",
+};
+
+function CompareRadar({ resultA, resultB, labelA, labelB }: {
+  resultA: PaneResult | null; resultB: PaneResult | null;
+  labelA: string; labelB: string;
 }) {
-  const cfg = allConfigs.find((c) => c.id === pane.pipeline_id);
+  const { RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Legend, ResponsiveContainer } =
+    require("recharts");
+
+  const metrics = Object.keys(EVAL_METRIC_LABELS);
+  const data = metrics.map((k) => ({
+    metric: EVAL_METRIC_LABELS[k],
+    A: resultA?.eval_scores?.[k]?.score ?? 0,
+    B: resultB?.eval_scores?.[k]?.score ?? 0,
+  }));
 
   return (
-    <div className="flex flex-col h-full border border-zinc-200 rounded-xl overflow-hidden">
-      {/* Config summary */}
-      <div className="px-4 py-3 border-b border-zinc-100 bg-zinc-50">
-        <p className="text-sm font-medium text-zinc-800 truncate">{cfg?.name ?? "—"}</p>
-        <div className="flex gap-1.5 mt-1.5 flex-wrap">
-          <Badge>{pane.retrieval_strategy || cfg?.retrieval_strategy}</Badge>
-          <Badge>top-{pane.top_k || cfg?.top_k}</Badge>
-          <Badge>{cfg?.vector_store}</Badge>
-          <Badge>{cfg?.embedding_model.split("/").pop()}</Badge>
-          {(pane.llm_model || cfg?.llm_model) && (
-            <Badge variant="blue">{(pane.llm_model || (cfg?.llm_model ?? "")).split("/").pop()}</Badge>
-          )}
-        </div>
+    <div className="border border-zinc-200 rounded-xl p-4 bg-white">
+      <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-3">DeepEval Comparison</p>
+      <ResponsiveContainer width="100%" height={220}>
+        <RadarChart data={data} margin={{ top: 10, right: 30, bottom: 10, left: 30 }}>
+          <PolarGrid stroke="#e4e4e7" />
+          <PolarAngleAxis dataKey="metric" tick={{ fontSize: 10, fill: "#71717a" }} />
+          <PolarRadiusAxis angle={90} domain={[0, 1]} tick={{ fontSize: 9, fill: "#a1a1aa" }} tickCount={3} />
+          <Radar name={labelA} dataKey="A" stroke="#2563eb" fill="#2563eb" fillOpacity={0.15} strokeWidth={2} />
+          <Radar name={labelB} dataKey="B" stroke="#16a34a" fill="#16a34a" fillOpacity={0.15} strokeWidth={2} />
+          <Legend iconSize={8} wrapperStyle={{ fontSize: 11 }} />
+        </RadarChart>
+      </ResponsiveContainer>
+      {/* Numeric comparison table */}
+      <div className="mt-3 space-y-1">
+        {metrics.map((k) => {
+          const aScore = resultA?.eval_scores?.[k]?.score ?? null;
+          const bScore = resultB?.eval_scores?.[k]?.score ?? null;
+          const winner = aScore !== null && bScore !== null
+            ? aScore > bScore ? "A" : bScore > aScore ? "B" : "tie"
+            : null;
+          return (
+            <div key={k} className="flex items-center gap-2 text-[11px]">
+              <span className="w-28 text-zinc-400 truncate">{EVAL_METRIC_LABELS[k]}</span>
+              <span className={`w-10 text-right font-mono ${winner === "A" ? "text-blue-600 font-semibold" : "text-zinc-500"}`}>
+                {aScore !== null ? (aScore * 100).toFixed(0) + "%" : "—"}
+              </span>
+              <span className="text-zinc-200">vs</span>
+              <span className={`w-10 font-mono ${winner === "B" ? "text-emerald-600 font-semibold" : "text-zinc-500"}`}>
+                {bScore !== null ? (bScore * 100).toFixed(0) + "%" : "—"}
+              </span>
+              {winner && winner !== "tie" && (
+                <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-medium
+                  ${winner === "A" ? "bg-blue-50 text-blue-600" : "bg-emerald-50 text-emerald-600"}`}>
+                  {winner} wins
+                </span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ComparePane({ cfg, result, loading, label, color }: {
+  cfg: PaneConfig; result: PaneResult | null; loading: boolean;
+  label: string; color: "blue" | "green";
+}) {
+  const borderCls = color === "blue" ? "border-blue-200" : "border-emerald-200";
+  const headerCls = color === "blue" ? "bg-blue-50 border-blue-100" : "bg-emerald-50 border-emerald-100";
+  const dotCls = color === "blue" ? "bg-blue-500" : "bg-emerald-500";
+
+  return (
+    <div className={`flex flex-col border ${borderCls} rounded-xl overflow-hidden`}>
+      <div className={`px-4 py-3 border-b ${headerCls} flex items-center gap-2`}>
+        <span className={`h-2.5 w-2.5 rounded-full ${dotCls} flex-shrink-0`} />
+        <p className="text-sm font-medium text-zinc-800">{label}</p>
       </div>
 
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-3 bg-white min-h-0">
-        {messages.map((m, i) => (
-          <div key={i} className="space-y-1.5">
-            <div className="flex justify-end">
-              <div className="bg-zinc-900 text-white rounded-xl px-3 py-2 max-w-full text-sm">{m.q}</div>
-            </div>
-            <div className="bg-zinc-50 border border-zinc-100 rounded-xl px-4 py-3">
-              {!m.a ? (
-                <div className="flex items-center gap-1.5 py-1">
-                  {[0, 150, 300].map((d) => (
-                    <span key={d} className="w-1.5 h-1.5 rounded-full bg-zinc-300 animate-bounce"
-                      style={{ animationDelay: `${d}ms` }} />
-                  ))}
-                </div>
-              ) : (
-              <div className="prose prose-sm prose-zinc max-w-none
-                [&_p]:leading-relaxed [&_code]:bg-white [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-xs">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.a}</ReactMarkdown>
-              </div>
-              )}
-              {m.citations.length > 0 && (
-                <div className="mt-2 flex flex-wrap gap-1">
-                  {m.citations.map((c, ci) => (
-                    isUrl(c.source) ? (
-                      <a key={ci} href={c.source} target="_blank" rel="noopener noreferrer"
-                        className="text-[10px] text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full border border-blue-100 hover:bg-blue-100 font-medium">
-                        [{ci + 1}] {domainOf(c.source)} ↗
-                      </a>
-                    ) : (
-                      <span key={ci} className="text-[10px] text-zinc-500 bg-zinc-100 px-2 py-0.5 rounded-full font-medium">
-                        [{ci + 1}] {c.source.split("/").pop()}
-                      </span>
-                    )
-                  ))}
-                </div>
-              )}
-              <p className="text-[10px] text-zinc-400 mt-1.5">{m.ms}ms · {m.citations.length} sources</p>
-            </div>
-          </div>
-        ))}
-        {loading && (
-          <div className="flex items-center gap-1.5 p-2">
+      <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-white min-h-0">
+        {loading && !result && (
+          <div className="flex items-center gap-1.5 py-4 justify-center">
             {[0, 150, 300].map((d) => (
-              <span key={d} className="w-1.5 h-1.5 rounded-full bg-zinc-300 animate-bounce"
+              <span key={d} className="w-2 h-2 rounded-full bg-zinc-300 animate-bounce"
                 style={{ animationDelay: `${d}ms` }} />
             ))}
           </div>
+        )}
+        {result?.error && (
+          <div className="text-sm text-red-500 bg-red-50 border border-red-100 rounded-lg p-3">{result.error}</div>
+        )}
+        {result && !result.error && (
+          <>
+            {/* Answer */}
+            <div className="prose prose-sm prose-zinc max-w-none text-[13px]
+              [&_p]:leading-relaxed [&_code]:bg-zinc-50 [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-xs">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{result.answer}</ReactMarkdown>
+            </div>
+            {/* Citations */}
+            {result.citations.length > 0 && (
+              <div className="flex flex-wrap gap-1 pt-1">
+                {result.citations.map((c, ci) => (
+                  isUrl(c.source) ? (
+                    <a key={ci} href={c.source} target="_blank" rel="noopener noreferrer"
+                      className="text-[10px] text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full border border-blue-100 hover:bg-blue-100 font-medium">
+                      [{ci + 1}] {domainOf(c.source)} ↗
+                    </a>
+                  ) : (
+                    <span key={ci} className="text-[10px] text-zinc-500 bg-zinc-100 px-2 py-0.5 rounded-full font-medium">
+                      [{ci + 1}] {c.source.split("/").pop()}
+                    </span>
+                  )
+                ))}
+              </div>
+            )}
+            {/* Stats */}
+            <div className="flex flex-wrap gap-2 pt-1">
+              <Badge>{result.strategy_used}</Badge>
+              {result.reranker_used && result.reranker_used !== "none" && (
+                <Badge variant="blue">↑ {result.reranker_used}</Badge>
+              )}
+              <Badge>{result.latency_ms}ms</Badge>
+              <Badge>{result.chunks_retrieved} chunks</Badge>
+            </div>
+          </>
         )}
       </div>
     </div>
   );
 }
 
-function CompareTab({ configs, llmModels }: { configs: RagConfig[]; llmModels: LLMModel[] }) {
+function CompareTab({ configs, llmModels, models }: {
+  configs: RagConfig[]; llmModels: LLMModel[]; models: RagModels;
+}) {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [paneA, setPaneA] = useState<PaneConfig>({
     pipeline_id: configs[0]?.id ?? "",
-    retrieval_strategy: "", top_k: 0, llm_model: "",
+    retrieval_strategy: "", reranker: "none", llm_model: "",
   });
   const [paneB, setPaneB] = useState<PaneConfig>({
     pipeline_id: configs[1]?.id ?? configs[0]?.id ?? "",
-    retrieval_strategy: "mmr", top_k: 0, llm_model: "",
+    retrieval_strategy: "", reranker: "bge-reranker-base", llm_model: "",
   });
-  const [msgA, setMsgA] = useState<Array<{ q: string; a: string; citations: Citation[]; ms: number }>>([]);
-  const [msgB, setMsgB] = useState<Array<{ q: string; a: string; citations: Citation[]; ms: number }>>([]);
+  const [resultA, setResultA] = useState<PaneResult | null>(null);
+  const [resultB, setResultB] = useState<PaneResult | null>(null);
+  const [history, setHistory] = useState<Array<{ q: string; a: PaneResult; b: PaneResult }>>([]);
 
   const strategies = ["", "similarity", "mmr", "multi_query", "hybrid"];
+  const rerankers = Object.keys(models.reranker_models ?? { none: {} });
 
   async function sendBoth() {
     const q = query.trim();
     if (!q || loading) return;
     setLoading(true);
     setQuery("");
-    // Show user message immediately in both panes
-    const placeholder = { q, a: "", citations: [] as Citation[], ms: 0 };
-    setMsgA((m) => [...m, placeholder]);
-    setMsgB((m) => [...m, placeholder]);
-    await Promise.all([
-      (async () => {
-        try {
-          const r = await apiPost<{ answer: string; citations: Citation[]; latency_ms: number }>(
-            "/api/rag/chat", {
-              query: q, config_id: paneA.pipeline_id,
-              ...(paneA.retrieval_strategy && { retrieval_strategy_override: paneA.retrieval_strategy }),
-            }
-          );
-          setMsgA((m) => m.map((x) => x.q === q && x.a === "" ? { q, a: r.answer, citations: r.citations, ms: r.latency_ms } : x));
-        } catch (e: unknown) {
-          setMsgA((m) => m.map((x) => x.q === q && x.a === "" ? { q, a: `Error: ${e instanceof Error ? e.message : String(e)}`, citations: [], ms: 0 } : x));
+    setResultA(null);
+    setResultB(null);
+
+    try {
+      const res = await apiPost<{ pane_a: PaneResult; pane_b: PaneResult }>(
+        "/api/rag/compare",
+        {
+          query: q,
+          pane_a: {
+            config_id: paneA.pipeline_id,
+            ...(paneA.retrieval_strategy && { retrieval_strategy_override: paneA.retrieval_strategy }),
+            reranker_override: paneA.reranker || null,
+            ...(paneA.llm_model && { llm_model_override: paneA.llm_model }),
+          },
+          pane_b: {
+            config_id: paneB.pipeline_id,
+            ...(paneB.retrieval_strategy && { retrieval_strategy_override: paneB.retrieval_strategy }),
+            reranker_override: paneB.reranker || null,
+            ...(paneB.llm_model && { llm_model_override: paneB.llm_model }),
+          },
+          auto_evaluate: true,
         }
-      })(),
-      (async () => {
-        try {
-          const r = await apiPost<{ answer: string; citations: Citation[]; latency_ms: number }>(
-            "/api/rag/chat", {
-              query: q, config_id: paneB.pipeline_id,
-              ...(paneB.retrieval_strategy && { retrieval_strategy_override: paneB.retrieval_strategy }),
-            }
-          );
-          setMsgB((m) => m.map((x) => x.q === q && x.a === "" ? { q, a: r.answer, citations: r.citations, ms: r.latency_ms } : x));
-        } catch (e: unknown) {
-          setMsgB((m) => m.map((x) => x.q === q && x.a === "" ? { q, a: `Error: ${e instanceof Error ? e.message : String(e)}`, citations: [], ms: 0 } : x));
-        }
-      })(),
-    ]);
+      );
+      setResultA(res.pane_a);
+      setResultB(res.pane_b);
+      setHistory(h => [{ q, a: res.pane_a, b: res.pane_b }, ...h.slice(0, 9)]);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setResultA({ answer: "", citations: [], strategy_used: "", reranker_used: "", chunks_retrieved: 0, latency_ms: 0, eval_scores: null, error: msg });
+      setResultB({ answer: "", citations: [], strategy_used: "", reranker_used: "", chunks_retrieved: 0, latency_ms: 0, eval_scores: null, error: msg });
+    }
     setLoading(false);
   }
 
-  function PaneSettings({ pane, setPane, label }: { pane: PaneConfig; setPane: (p: PaneConfig) => void; label: string }) {
+  const cfgA = configs.find((c) => c.id === paneA.pipeline_id);
+  const cfgB = configs.find((c) => c.id === paneB.pipeline_id);
+  const labelA = `A: ${cfgA?.name ?? "—"}${paneA.reranker && paneA.reranker !== "none" ? ` + ${paneA.reranker}` : ""}`;
+  const labelB = `B: ${cfgB?.name ?? "—"}${paneB.reranker && paneB.reranker !== "none" ? ` + ${paneB.reranker}` : ""}`;
+
+  function PaneSettings({ pane, setPane, label, color }: {
+    pane: PaneConfig; setPane: (p: PaneConfig) => void;
+    label: string; color: "blue" | "green";
+  }) {
+    const accentBorder = color === "blue" ? "border-blue-200 bg-blue-50/30" : "border-emerald-200 bg-emerald-50/30";
     return (
-      <div className="border border-zinc-200 rounded-xl p-4 space-y-3 bg-zinc-50/50">
+      <div className={`border ${accentBorder} rounded-xl p-4 space-y-3`}>
         <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">{label}</p>
         <div>
           <label className="block text-xs text-zinc-500 mb-1">Pipeline</label>
@@ -1084,21 +1163,29 @@ function CompareTab({ configs, llmModels }: { configs: RagConfig[]; llmModels: L
             {configs.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
           </select>
         </div>
-        <div className="grid grid-cols-2 gap-2">
+        <div className="grid grid-cols-3 gap-2">
           <div>
-            <label className="block text-xs text-zinc-500 mb-1">Retrieval override</label>
+            <label className="block text-xs text-zinc-500 mb-1">Retrieval</label>
             <select value={pane.retrieval_strategy}
               onChange={(e) => setPane({ ...pane, retrieval_strategy: e.target.value })}
               className="w-full border border-zinc-200 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-zinc-400 bg-white">
-              {strategies.map((s) => <option key={s} value={s}>{s || "— pipeline default —"}</option>)}
+              {strategies.map((s) => <option key={s} value={s}>{s || "default"}</option>)}
             </select>
           </div>
           <div>
-            <label className="block text-xs text-zinc-500 mb-1">LLM override</label>
+            <label className="block text-xs text-zinc-500 mb-1">Reranker</label>
+            <select value={pane.reranker}
+              onChange={(e) => setPane({ ...pane, reranker: e.target.value })}
+              className="w-full border border-zinc-200 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-zinc-400 bg-white">
+              {rerankers.map((r) => <option key={r} value={r}>{r === "none" ? "none" : r.replace("bge-reranker-", "bge-")}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs text-zinc-500 mb-1">LLM</label>
             <select value={pane.llm_model}
               onChange={(e) => setPane({ ...pane, llm_model: e.target.value })}
               className="w-full border border-zinc-200 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-zinc-400 bg-white">
-              <option value="">— default —</option>
+              <option value="">default</option>
               {llmModels.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
             </select>
           </div>
@@ -1107,20 +1194,37 @@ function CompareTab({ configs, llmModels }: { configs: RagConfig[]; llmModels: L
     );
   }
 
+  const hasEval = !!(resultA?.eval_scores && resultB?.eval_scores);
+  const hasResults = !!(resultA || resultB);
+
   return (
-    <div className="flex flex-col h-[calc(100vh-200px)] gap-4">
-      {/* Config panels */}
+    <div className="flex flex-col gap-4 h-[calc(100vh-200px)]">
+      {/* Config settings */}
       <div className="grid grid-cols-2 gap-4 shrink-0">
-        <PaneSettings pane={paneA} setPane={setPaneA} label="Pipeline A" />
-        <PaneSettings pane={paneB} setPane={setPaneB} label="Pipeline B" />
+        <PaneSettings pane={paneA} setPane={setPaneA} label="Pipeline A" color="blue" />
+        <PaneSettings pane={paneB} setPane={setPaneB} label="Pipeline B" color="green" />
       </div>
 
-      {/* Chat panes */}
-      <div className="grid grid-cols-2 gap-4 flex-1 min-h-0">
-        <ComparePane pane={paneA} allConfigs={configs} llmModels={llmModels}
-          messages={msgA} loading={loading} />
-        <ComparePane pane={paneB} allConfigs={configs} llmModels={llmModels}
-          messages={msgB} loading={loading} />
+      {/* Current question */}
+      {history.length > 0 && (
+        <div className="shrink-0 px-1 text-sm text-zinc-500">
+          <span className="font-medium text-zinc-800">Q: </span>{history[0].q}
+        </div>
+      )}
+
+      {/* Results area — answers + radar */}
+      <div className={`flex-1 min-h-0 grid gap-4 ${hasEval ? "grid-cols-5" : "grid-cols-2"}`}>
+        <div className={hasEval ? "col-span-2" : "col-span-1"}>
+          <ComparePane cfg={paneA} result={resultA} loading={loading} label={labelA} color="blue" />
+        </div>
+        <div className={hasEval ? "col-span-2" : "col-span-1"}>
+          <ComparePane cfg={paneB} result={resultB} loading={loading} label={labelB} color="green" />
+        </div>
+        {hasEval && (
+          <div className="col-span-1 overflow-y-auto">
+            <CompareRadar resultA={resultA} resultB={resultB} labelA="A" labelB="B" />
+          </div>
+        )}
       </div>
 
       {/* Shared input */}
@@ -1132,10 +1236,27 @@ function CompareTab({ configs, llmModels }: { configs: RagConfig[]; llmModels: L
                      focus:border-zinc-400 placeholder:text-zinc-300 bg-white" />
         <button onClick={sendBoth} disabled={loading || !query.trim()}
           className="px-5 py-3 text-sm font-medium bg-zinc-900 text-white rounded-xl
-                     hover:bg-zinc-700 disabled:opacity-30 transition-colors">
-          Compare
+                     hover:bg-zinc-700 disabled:opacity-30 transition-colors flex items-center gap-2">
+          {loading && <Spinner size={14} />}
+          {loading ? "Running…" : "Compare"}
         </button>
       </div>
+
+      {/* History list */}
+      {history.length > 1 && (
+        <div className="shrink-0 border-t border-zinc-100 pt-3">
+          <p className="text-xs text-zinc-400 mb-2">Previous comparisons</p>
+          <div className="space-y-1 max-h-24 overflow-y-auto">
+            {history.slice(1).map((h, i) => (
+              <button key={i}
+                onClick={() => { setResultA(h.a); setResultB(h.b); }}
+                className="w-full text-left text-xs text-zinc-500 hover:text-zinc-800 truncate px-2 py-1 rounded hover:bg-zinc-50">
+                {h.q}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1238,12 +1359,13 @@ type FormState = {
   name: string; description: string; embedding_model: string; vector_store: string;
   llm_model: string; chunk_size: number; chunk_overlap: number; chunk_strategy: string;
   retrieval_strategy: string; top_k: number; mmr_lambda: number; multi_query_n: number;
-  system_prompt: string;
+  system_prompt: string; reranker: string;
 };
 const DEFAULT_FORM: FormState = {
   name: "", description: "", embedding_model: "qwen/qwen3-embedding-8b", vector_store: "chroma",
   llm_model: "", chunk_size: 1000, chunk_overlap: 200, chunk_strategy: "recursive",
   retrieval_strategy: "similarity", top_k: 5, mmr_lambda: 0.5, multi_query_n: 3, system_prompt: "",
+  reranker: "none",
 };
 
 function ConfigWizard({ models, llmModels, onCreated }: {
@@ -1402,6 +1524,25 @@ function ConfigWizard({ models, llmModels, onCreated }: {
             <input type="range" min={1} max={20} value={form.top_k}
               onChange={(e) => set("top_k", Number(e.target.value))} className="w-full accent-zinc-900" />
           </div>
+          {/* Reranker */}
+          <div>
+            <label className="block text-sm font-medium text-zinc-700 mb-2">
+              Reranker <span className="text-zinc-400 font-normal text-xs">(BGE cross-encoder, CPU)</span>
+            </label>
+            <div className="space-y-2">
+              {Object.entries(models.reranker_models ?? {}).map(([k, v]) => (
+                <label key={k} className={`flex items-start gap-3 p-3 border rounded-lg cursor-pointer transition-colors
+                  ${form.reranker === k ? "border-zinc-900 bg-zinc-50" : "border-zinc-200 hover:border-zinc-300"}`}>
+                  <input type="radio" name="reranker" className="mt-0.5 accent-zinc-900"
+                    checked={form.reranker === k} onChange={() => set("reranker", k)} />
+                  <div>
+                    <p className="text-sm font-medium text-zinc-800">{v.label}</p>
+                    <p className="text-xs text-zinc-400">{v.description}</p>
+                  </div>
+                </label>
+              ))}
+            </div>
+          </div>
         </div>
       )}
 
@@ -1463,7 +1604,7 @@ function EditModal({ config, models, llmModels, onSave, onClose }: {
     chunk_overlap: config.chunk_overlap, chunk_strategy: config.chunk_strategy,
     retrieval_strategy: config.retrieval_strategy, top_k: config.top_k,
     mmr_lambda: config.mmr_lambda, multi_query_n: config.multi_query_n,
-    system_prompt: config.system_prompt ?? "",
+    system_prompt: config.system_prompt ?? "", reranker: config.reranker ?? "none",
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -1730,8 +1871,8 @@ export default function RAGPage() {
           {selected && !showWizard && tab === "chat" && (
             <ChatTab config={selected} />
           )}
-          {selected && !showWizard && tab === "compare" && (
-            <CompareTab configs={configs} llmModels={llmModels} />
+          {selected && !showWizard && tab === "compare" && ragModels && (
+            <CompareTab configs={configs} llmModels={llmModels} models={ragModels} />
           )}
           {selected && !showWizard && tab === "evaluate" && (
             <EvaluateTab config={selected} />

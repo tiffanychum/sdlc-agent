@@ -12,7 +12,7 @@ class LLMConfig:
     model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "gpt-5.3-codex"))
     judge_model: str = field(default_factory=lambda: os.getenv("LLM_JUDGE_MODEL", "gpt-4o"))
     rca_model: str = field(default_factory=lambda: os.getenv("LLM_RCA_MODEL", "gpt-4o"))
-    router_model: str = field(default_factory=lambda: os.getenv("LLM_ROUTER_MODEL", "gpt-4o-mini"))
+    router_model: str = field(default_factory=lambda: os.getenv("LLM_ROUTER_MODEL", "claude-sonnet-4-6"))
     temperature: float = 0.0
     max_tokens: int = 4096
 

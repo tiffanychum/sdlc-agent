@@ -90,6 +90,14 @@ class TracingCallbackHandler(BaseCallbackHandler):
         if not model:
             model = model_at_start
 
+        # Deduplicate model name (guard against recording bug that doubles the string)
+        if model:
+            for n in range(2, 7):
+                chunk = len(model) // n
+                if chunk > 0 and model == model[:chunk] * n:
+                    model = model[:chunk]
+                    break
+
         self.collector.end_span(
             span_id, tokens_in=tokens_in, tokens_out=tokens_out, model=model,
             output_data={

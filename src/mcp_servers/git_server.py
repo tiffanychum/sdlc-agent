@@ -1,18 +1,25 @@
 """
-MCP Server for Git operations.
+MCP Server for Git operations (FastMCP).
 
 Enables agents to understand and manipulate version control — check status,
 view diffs, create commits, manage branches. Essential for any coding agent
 that modifies files.
+
+Transports:
+  stdio (default):  python -m src.mcp_servers.git_server
+  HTTP:             MCP_TRANSPORT=http MCP_PORT=8003 python -m src.mcp_servers.git_server
 """
 
 import asyncio
+import logging
 import os
 from dataclasses import dataclass, field
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from typing import Optional
 
+from fastmcp import FastMCP
+from mcp.types import TextContent
+
+logger = logging.getLogger(__name__)
 
 WORKSPACE_ROOT = os.getenv("AGENT_WORKSPACE", os.getcwd())
 
@@ -23,17 +30,20 @@ class GitState:
 
     def record(self, tool: str, args: dict, result: str, success: bool) -> None:
         self.tool_calls.append({
-            "tool": tool, "args": args,
-            "result": result[:500], "success": success,
+            "tool": tool, "args": args, "result": result[:500], "success": success,
         })
 
 
-server = Server("git-mcp-server")
+mcp = FastMCP(
+    "git-mcp-server",
+    instructions="Git version control operations in the agent workspace.",
+)
 state = GitState()
 
 
+# ── Git helper ────────────────────────────────────────────────────
+
 async def _git(command: str, cwd: str = WORKSPACE_ROOT) -> str:
-    """Execute a git command and return output."""
     proc = await asyncio.create_subprocess_shell(
         f"git {command}",
         stdout=asyncio.subprocess.PIPE,
@@ -43,161 +53,100 @@ async def _git(command: str, cwd: str = WORKSPACE_ROOT) -> str:
     stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
     stdout_str = stdout.decode("utf-8", errors="replace").strip()
     stderr_str = stderr.decode("utf-8", errors="replace").strip()
+    combined = stderr_str or stdout_str
 
     if proc.returncode != 0:
-        raise RuntimeError(f"git {command} failed (exit {proc.returncode}): {stderr_str or stdout_str}")
+        # "nothing to commit" is idempotent — treat as success so the agent can continue.
+        if "nothing to commit" in combined or "nothing added to commit" in combined:
+            return f"Nothing to commit — working tree already clean. {combined}"
+        # Paths outside the workspace git repo (e.g. /tmp/calc-app/) are a common
+        # pattern for standalone scratch projects built by Coder. Return a soft
+        # informational message instead of crashing the supervisor flow — the
+        # agent can acknowledge that git is not applicable and move on.
+        if "is outside repository" in combined or "outside of repository" in combined:
+            return (
+                "NOTE: target path is outside the main repository — git operations "
+                "do not apply to standalone scratch projects. Skip git and continue. "
+                f"(raw: {combined[:200]})"
+            )
+        if "not a git repository" in combined.lower():
+            return (
+                "NOTE: working directory is not a git repository. Skip git and "
+                f"continue without committing. (raw: {combined[:200]})"
+            )
+        raise RuntimeError(f"git {command} failed (exit {proc.returncode}): {combined}")
     return stdout_str
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
-    return [
-        Tool(
-            name="git_status",
-            description="Show the working tree status — modified, staged, and untracked files.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        Tool(
-            name="git_diff",
-            description="Show changes between working tree and index, or between commits.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "target": {
-                        "type": "string",
-                        "description": "What to diff against (e.g., 'HEAD', 'main', a commit SHA). Default: unstaged changes.",
-                        "default": "",
-                    },
-                    "file": {"type": "string", "description": "Optional: diff a specific file"},
-                    "staged": {"type": "boolean", "description": "Show staged changes (--cached)", "default": False},
-                },
-            },
-        ),
-        Tool(
-            name="git_log",
-            description="Show commit history.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "count": {"type": "integer", "description": "Number of commits to show", "default": 10},
-                    "oneline": {"type": "boolean", "description": "One-line format", "default": True},
-                    "file": {"type": "string", "description": "Show history for a specific file"},
-                },
-            },
-        ),
-        Tool(
-            name="git_commit",
-            description="Stage all changes and create a commit.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "message": {"type": "string", "description": "Commit message"},
-                    "files": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Specific files to stage (default: all changes)",
-                    },
-                },
-                "required": ["message"],
-            },
-        ),
-        Tool(
-            name="git_branch",
-            description="List, create, or switch branches.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["list", "create", "switch"],
-                        "description": "Branch operation",
-                        "default": "list",
-                    },
-                    "name": {"type": "string", "description": "Branch name (for create/switch)"},
-                },
-            },
-        ),
-        Tool(
-            name="git_show",
-            description="Show the contents of a specific commit.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string", "description": "Commit hash or ref (default: HEAD)", "default": "HEAD"},
-                },
-            },
-        ),
-    ]
+# ── Tool implementations ──────────────────────────────────────────
+
+@mcp.tool()
+async def git_status() -> str:
+    """Show the working tree status — modified, staged, and untracked files."""
+    return await _git("status --short")
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    try:
-        result = await _dispatch(name, arguments)
-        state.record(name, arguments, result, success=True)
-        return [TextContent(type="text", text=result)]
-    except Exception as e:
-        error_msg = f"Error in {name}: {str(e)}"
-        state.record(name, arguments, error_msg, success=False)
-        return [TextContent(type="text", text=error_msg)]
+@mcp.tool()
+async def git_diff(target: str = "", file: Optional[str] = None, staged: bool = False) -> str:
+    """Show changes between working tree and index, or between commits.
 
-
-async def _dispatch(name: str, args: dict) -> str:
-    match name:
-        case "git_status":
-            return await _git("status --short")
-        case "git_diff":
-            return await _git_diff(args)
-        case "git_log":
-            return await _git_log(args)
-        case "git_commit":
-            return await _git_commit(args)
-        case "git_branch":
-            return await _git_branch(args)
-        case "git_show":
-            ref = args.get("ref", "HEAD")
-            return await _git(f"show --stat {ref}")
-        case _:
-            raise ValueError(f"Unknown tool: {name}")
-
-
-async def _git_diff(args: dict) -> str:
+    Args:
+        target: What to diff against (e.g. 'HEAD', 'main', a commit SHA). Default: unstaged changes.
+        file: Diff a specific file (optional).
+        staged: Show staged changes (--cached).
+    """
     cmd = "diff"
-    if args.get("staged"):
+    if staged:
         cmd += " --cached"
-    if target := args.get("target"):
+    if target:
         cmd += f" {target}"
-    if file := args.get("file"):
+    if file:
         cmd += f" -- {file}"
     result = await _git(cmd)
     return result or "No changes."
 
 
-async def _git_log(args: dict) -> str:
-    count = args.get("count", 10)
-    fmt = "--oneline" if args.get("oneline", True) else '--format="%h %an %s (%ar)"'
+@mcp.tool()
+async def git_log(count: int = 10, oneline: bool = True, file: Optional[str] = None) -> str:
+    """Show commit history.
+
+    Args:
+        count: Number of commits to show (default: 10).
+        oneline: One-line format (default: True).
+        file: Show history for a specific file (optional).
+    """
+    fmt = "--oneline" if oneline else '--format="%h %an %s (%ar)"'
     cmd = f"log -{count} {fmt}"
-    if file := args.get("file"):
+    if file:
         cmd += f" -- {file}"
     return await _git(cmd)
 
 
-async def _git_commit(args: dict) -> str:
-    files = args.get("files")
+@mcp.tool()
+async def git_commit(message: str, files: Optional[list] = None) -> str:
+    """Stage all changes and create a commit.
+
+    Args:
+        message: Commit message.
+        files: Specific files to stage (default: all changes).
+    """
     if files:
         for f in files:
             await _git(f"add {f}")
     else:
         await _git("add -A")
+    message_escaped = message.replace('"', '\\"')
+    return await _git(f'commit -m "{message_escaped}"')
 
-    message = args["message"].replace('"', '\\"')
-    return await _git(f'commit -m "{message}"')
 
+@mcp.tool()
+async def git_branch(action: str = "list", name: str = "") -> str:
+    """List, create, or switch branches.
 
-async def _git_branch(args: dict) -> str:
-    action = args.get("action", "list")
-    name = args.get("name", "")
-
+    Args:
+        action: Branch operation: 'list', 'create', or 'switch' (default: 'list').
+        name: Branch name (required for create/switch).
+    """
     match action:
         case "list":
             return await _git("branch -a")
@@ -210,13 +159,44 @@ async def _git_branch(args: dict) -> str:
                 raise ValueError("Branch name required for switch")
             return await _git(f"checkout {name}")
         case _:
-            raise ValueError(f"Unknown branch action: {action}")
+            raise ValueError(f"Unknown branch action: {action}. Use 'list', 'create', or 'switch'.")
 
 
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+@mcp.tool()
+async def git_show(ref: str = "HEAD") -> str:
+    """Show the contents of a specific commit.
 
+    Args:
+        ref: Commit hash or ref (default: HEAD).
+    """
+    return await _git(f"show --stat {ref}")
+
+
+# ── Backward-compatible shims ─────────────────────────────────────
+
+async def list_tools():
+    tools = await mcp.list_tools()
+    return [t.to_mcp_tool() for t in tools]
+
+
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    try:
+        result = await mcp.call_tool(name, arguments)
+        text = result.content[0].text if result.content else "Done"
+        state.record(name, arguments, text, success=True)
+        return list(result.content)
+    except Exception as e:
+        error_msg = f"Error in {name}: {str(e)}"
+        state.record(name, arguments, error_msg, success=False)
+        return [TextContent(type="text", text=error_msg)]
+
+
+# ── Entry point ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport == "http":
+        import asyncio as _asyncio
+        _asyncio.run(mcp.run_http_async(host="0.0.0.0", port=int(os.getenv("MCP_PORT", "8003"))))
+    else:
+        mcp.run()

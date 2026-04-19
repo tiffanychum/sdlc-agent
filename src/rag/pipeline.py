@@ -54,6 +54,7 @@ class RAGConfig:
     embedding_api_key: Optional[str] = None
     embedding_base_url: Optional[str] = None
     persist_dir: str = "./data/vectorstore"
+    reranker: str = "none"                   # none | bge-reranker-base | bge-reranker-large | bge-reranker-v2-m3
 
 
 @dataclass
@@ -355,6 +356,19 @@ class RAGPipeline:
                 logger.warning("Unknown retrieval strategy '%s', falling back to similarity", strategy)
                 results = await self._retriever.ainvoke(query)
 
+            # Optional BGE cross-encoder reranking pass
+            if self.config.reranker and self.config.reranker != "none" and results:
+                with _tracer.start_as_current_span("rag.rerank") as rerank_span:
+                    rerank_span.set_attribute("rag.reranker", self.config.reranker)
+                    rerank_span.set_attribute("rag.candidates", len(results))
+                    from src.rag.reranker import rerank
+                    results = await rerank(
+                        query, results,
+                        model=self.config.reranker,
+                        top_k=self.config.top_k,
+                    )
+                    rerank_span.set_attribute("rag.reranked_count", len(results))
+
             duration_ms = (time.monotonic() - t0) * 1000
             span.set_attribute("rag.results_count", len(results))
             span.set_attribute("rag.retrieve_ms", duration_ms)
@@ -362,14 +376,86 @@ class RAGPipeline:
                 span.set_attribute("rag.top_score", results[0].score)
             return results
 
+    # ── Contextual Compression ────────────────────────────────────────────────
+
+    async def _contextual_compress(
+        self,
+        query: str,
+        results: list[SearchResult],
+    ) -> list[SearchResult]:
+        """
+        Apply LLM-based contextual compression (LangChain ContextualCompressionRetriever
+        pattern) to filter out irrelevant sentences within each retrieved chunk.
+
+        For each chunk, an LLM extracts only the sentences directly relevant to the
+        query, reducing hallucination risk when chunks are large or only partially
+        relevant. Chunks that have NO relevant content are dropped entirely.
+
+        Falls back to original results on any LLM error.
+        """
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from src.llm.client import get_llm
+
+        if not results:
+            return results
+
+        compress_system = (
+            "You are a document compression assistant. Given a query and a document chunk, "
+            "extract ONLY the sentences directly relevant to the query. "
+            "Return the extracted text verbatim (no paraphrasing). "
+            "If NO part of the chunk is relevant, return exactly: NO_RELEVANT_CONTENT"
+        )
+
+        llm = get_llm(model=self.config.llm_model, temperature=0.0)
+        compressed: list[SearchResult] = []
+
+        with _tracer.start_as_current_span("rag.contextual_compress") as span:
+            span.set_attribute("rag.compress_candidates", len(results))
+            for r in results:
+                prompt = (
+                    f"Query: {query}\n\n"
+                    f"Document chunk (source: {r.source}):\n{r.text}\n\n"
+                    "Extract only the relevant sentences:"
+                )
+                try:
+                    resp = await llm.ainvoke([
+                        SystemMessage(content=compress_system),
+                        HumanMessage(content=prompt),
+                    ])
+                    extracted = resp.content.strip() if isinstance(resp.content, str) else str(resp.content).strip()
+                    if extracted and extracted != "NO_RELEVANT_CONTENT":
+                        import copy
+                        compressed_r = copy.copy(r)
+                        compressed_r.text = extracted
+                        compressed.append(compressed_r)
+                except Exception as e:
+                    logger.warning("Contextual compression failed for chunk from %s: %s", r.source, e)
+                    compressed.append(r)  # keep original on error
+
+            span.set_attribute("rag.compress_kept", len(compressed))
+            dropped = len(results) - len(compressed)
+            if dropped:
+                logger.info("Contextual compression: dropped %d irrelevant chunks", dropped)
+
+        return compressed if compressed else results  # never return empty
+
     # ── Generate ──────────────────────────────────────────────────────────────
 
-    async def query(self, user_query: str) -> RAGResponse:
-        """Full RAG pipeline: retrieve context → generate answer with citations."""
+    async def query(self, user_query: str, use_compression: bool = False) -> RAGResponse:
+        """Full RAG pipeline: retrieve context → (optionally compress) → generate answer.
+
+        Args:
+            user_query: The question to answer.
+            use_compression: If True, apply LLM-based contextual compression
+                (LangChain ContextualCompressionRetriever pattern) to filter
+                irrelevant sentences from retrieved chunks before generation.
+                Reduces hallucination on partially-relevant chunks; adds ~1-2 LLM calls.
+        """
         t0 = time.monotonic()
         with _tracer.start_as_current_span("rag.generate") as span:
             span.set_attribute("rag.query", user_query[:200])
             span.set_attribute("rag.config_id", self.config.config_id)
+            span.set_attribute("rag.use_compression", use_compression)
 
             results = await self.retrieve(user_query)
             if not results:
@@ -381,6 +467,10 @@ class RAGPipeline:
                     chunks_retrieved=0,
                     latency_ms=(time.monotonic() - t0) * 1000,
                 )
+
+            # Apply contextual compression if configured
+            if use_compression:
+                results = await self._contextual_compress(user_query, results)
 
             context_parts = []
             for i, r in enumerate(results):
