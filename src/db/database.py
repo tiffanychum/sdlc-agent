@@ -248,7 +248,7 @@ def update_agent_data():
     # Seed PromptRegistry with v1 and v2 prompts (idempotent)
     try:
         from src.prompts.registry import get_registry
-        from src.agents.prompts import AGENT_DEFINITIONS
+        from src.agents.prompts import AGENT_DEFINITIONS, SDLC_2_0_AGENT_DEFINITIONS
         reg = get_registry()
         inserted_v1 = reg.seed_from_definitions(AGENT_DEFINITIONS)
         cot_roles = ["coder", "planner", "qa", "researcher"]
@@ -257,10 +257,138 @@ def update_agent_data():
         # has changed since the last registered version (e.g. after tester removal,
         # the Coder/DevOps prompts changed but the DB still held the stale v1).
         synced = reg.sync_from_definitions(AGENT_DEFINITIONS)
-        if inserted_v1 or inserted_v2 or synced:
+        # sdlc_2_0 team roles also get versioning so they appear in Studio + A/B.
+        inserted_v1_v2 = reg.seed_from_definitions(SDLC_2_0_AGENT_DEFINITIONS)
+        synced_v2 = reg.sync_from_definitions(SDLC_2_0_AGENT_DEFINITIONS)
+        if inserted_v1 or inserted_v2 or synced or inserted_v1_v2 or synced_v2:
             pass  # silently seeded / synced
     except Exception:
         pass  # best-effort; doesn't block startup
+
+    # Seed the sdlc_2_0 team alongside the default dev team.
+    try:
+        seed_sdlc_2_0_team()
+    except Exception:
+        pass  # best-effort; doesn't block startup
+
+
+def seed_sdlc_2_0_team():
+    """
+    Idempotently create the `sdlc_2_0` team (Cursor/OpenCode-style simplified roster).
+
+    The team is a separate row in the `teams` table with its own Agents (builder,
+    planner_v2). It reuses the existing skill library and golden dataset — the only
+    thing that differs is the agent roster and the supervisor routing logic (handled
+    in orchestrator._derive_required_steps based on team_id).
+
+    Safe to call on every startup: it upserts rows rather than wiping existing data,
+    so user edits in Studio (per-agent prompt_version) survive restarts.
+    """
+    from src.db.models import Team, Agent, AgentToolMapping, AgentSkillMapping, Skill
+    from src.agents.prompts import (
+        SDLC_2_0_AGENT_DEFINITIONS,
+        SDLC_2_0_SKILL_ASSIGNMENTS,
+        SKILL_DEFINITIONS,
+    )
+
+    team_id = "sdlc_2_0"
+    session = get_session()
+    try:
+        team = session.query(Team).filter_by(id=team_id).first()
+        if team is None:
+            team = Team(
+                id=team_id,
+                name="SDLC 2.0",
+                description=(
+                    "Simplified Cursor / OpenCode-style team with TWO agents: "
+                    "a Builder that owns end-to-end execution (code, tests, git, jira, "
+                    "research) and a Planner-2 invoked only for complex multi-concern "
+                    "tasks. Designed for direct A/B comparison against the Dev Team "
+                    "on the same golden dataset."
+                ),
+                decision_strategy="supervisor",
+            )
+            session.add(team)
+
+        canonical_ids = {ad["id"] for ad in SDLC_2_0_AGENT_DEFINITIONS}
+
+        # Detach any sdlc_2_0 agents that are no longer in the canonical list
+        # (defensive — keeps the team roster in sync if we rename roles later).
+        for agent in session.query(Agent).filter(Agent.team_id == team_id).all():
+            if agent.id not in canonical_ids:
+                agent.team_id = None  # soft-delete
+
+        for ad in SDLC_2_0_AGENT_DEFINITIONS:
+            agent = session.query(Agent).filter_by(id=ad["id"]).first()
+            if agent is None:
+                agent = Agent(
+                    id=ad["id"],
+                    team_id=team_id,
+                    name=ad["name"],
+                    role=ad["role"],
+                    description=ad["description"],
+                    system_prompt=ad["prompt"],
+                    decision_strategy=ad["decision_strategy"],
+                    model=ad.get("model", ""),
+                )
+                session.add(agent)
+            else:
+                # Reconcile — user-edited prompt_version / model survives because
+                # those columns are NOT overwritten here; everything else tracks
+                # the canonical definition.
+                agent.team_id = team_id
+                agent.name = ad["name"]
+                agent.role = ad["role"]
+                agent.description = ad["description"]
+                agent.system_prompt = ad["prompt"]
+                agent.decision_strategy = ad["decision_strategy"]
+                # Only set model if not yet set (preserves user overrides in Studio).
+                if not (getattr(agent, "model", None) or "").strip():
+                    agent.model = ad.get("model", "")
+
+            canonical_tools = set(ad["tools"])
+            existing = session.query(AgentToolMapping).filter_by(agent_id=ad["id"]).all()
+            existing_groups = {m.tool_group for m in existing}
+            for tg in canonical_tools - existing_groups:
+                session.add(AgentToolMapping(agent_id=ad["id"], tool_group=tg))
+            for m in existing:
+                if m.tool_group not in canonical_tools:
+                    session.delete(m)
+
+        # Upsert any SKILL_DEFINITIONS rows that the initial seed missed
+        # (e.g. skills added to code after the DB was first seeded). Without
+        # this, SDLC_2_0_SKILL_ASSIGNMENTS referencing newer skills silently
+        # drops them.
+        existing_skill_ids = {s.id for s in session.query(Skill).all()}
+        for sd in SKILL_DEFINITIONS:
+            if sd["id"] not in existing_skill_ids:
+                session.add(Skill(
+                    id=sd["id"],
+                    name=sd["name"],
+                    description=sd["description"],
+                    instructions=sd["instructions"],
+                    trigger_pattern=sd["trigger_pattern"],
+                ))
+
+        session.flush()
+
+        for agent_id, skill_ids in SDLC_2_0_SKILL_ASSIGNMENTS:
+            if session.query(Agent).filter_by(id=agent_id).first() is None:
+                continue
+            existing = {
+                m.skill_id
+                for m in session.query(AgentSkillMapping).filter_by(agent_id=agent_id).all()
+            }
+            for sid in skill_ids:
+                if session.query(Skill).filter_by(id=sid).first() and sid not in existing:
+                    session.add(AgentSkillMapping(agent_id=agent_id, skill_id=sid))
+
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 def _seed_skill_assignments(session):

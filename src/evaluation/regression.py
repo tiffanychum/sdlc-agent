@@ -816,12 +816,44 @@ Respond with ONLY JSON: {{"reasoning": "<step-by-step analysis>", "score": <1-5>
                 agent = entry.get("selected_agent", "")
                 if agent and (not actual_pattern or actual_pattern[-1] != agent):
                     actual_pattern.append(agent)
-        pattern_ok = not expected_pattern or all(a in actual_pattern for a in expected_pattern)
+
+        # Team-aware projection: the golden dataset is authored against the
+        # dev-team's 9-role roster, but the sdlc_2_0 team only exposes
+        # {builder, planner_v2}. We translate the expected pattern through a
+        # role mapping so the same goldens can assert correctness on either
+        # team without duplicating the dataset.
+        effective_expected = list(expected_pattern)
+        if getattr(self, "team_id", "default") == "sdlc_2_0":
+            _SDLC_2_0_ROLE_MAP = {
+                "planner": "planner_v2",
+                "project_manager": "builder",
+                "coder": "builder",
+                "qa": "builder",
+                "devops": "builder",
+                "researcher": "builder",
+                "reviewer": "builder",
+                "data_analyst": "builder",
+                "prompt_optimizer": "builder",
+            }
+            projected: list[str] = []
+            for role in expected_pattern:
+                mapped = _SDLC_2_0_ROLE_MAP.get(role, role)
+                # Collapse adjacent duplicates introduced by the many→one map.
+                if not projected or projected[-1] != mapped:
+                    projected.append(mapped)
+            effective_expected = projected
+
+        pattern_ok = not effective_expected or all(a in actual_pattern for a in effective_expected)
         assertions["delegation_pattern"] = {
             "passed": pattern_ok,
-            "expected": expected_pattern,
+            "expected": effective_expected,
+            "expected_original": expected_pattern,
             "actual": actual_pattern,
-            "reason": "Delegation matched" if pattern_ok else f"Expected {expected_pattern}, got {actual_pattern}",
+            "reason": (
+                "Delegation matched"
+                if pattern_ok
+                else f"Expected {effective_expected}, got {actual_pattern}"
+            ),
         }
 
         assertions["llm_call_budget"] = {
