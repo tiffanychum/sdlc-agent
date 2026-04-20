@@ -251,6 +251,7 @@ class RagConfig(Base):
     multi_query_n = Column(Integer, default=3)
     system_prompt = Column(Text, nullable=True)
     reranker = Column(String, default="none")  # none | bge-reranker-base | bge-reranker-large | bge-reranker-v2-m3
+    team_id = Column(String, nullable=True, index=True)  # None = legacy/shared across teams
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
