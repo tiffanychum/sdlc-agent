@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useTeam } from "@/contexts/TeamContext";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -32,6 +33,7 @@ interface RagConfig {
   chunk_size: number; chunk_overlap: number; chunk_strategy: string;
   retrieval_strategy: string; top_k: number; mmr_lambda: number;
   multi_query_n: number; system_prompt?: string; reranker: string;
+  team_id?: string | null;
   is_active: boolean; created_at?: string; sources: RagSource[];
 }
 interface Citation {
@@ -1368,8 +1370,9 @@ const DEFAULT_FORM: FormState = {
   reranker: "none",
 };
 
-function ConfigWizard({ models, llmModels, onCreated }: {
+function ConfigWizard({ models, llmModels, onCreated, teamId }: {
   models: RagModels; llmModels: LLMModel[]; onCreated: (c: RagConfig) => void;
+  teamId?: string;
 }) {
   const [step, setStep] = useState(0);
   const [form, setForm] = useState<FormState>(DEFAULT_FORM);
@@ -1380,7 +1383,14 @@ function ConfigWizard({ models, llmModels, onCreated }: {
   async function submit() {
     setLoading(true); setError("");
     try {
-      const body = { ...form, llm_model: form.llm_model || null, system_prompt: form.system_prompt || null };
+      // Tag the new pipeline with the currently-selected team so it stays
+      // scoped to that team going forward (and doesn't leak into others).
+      const body = {
+        ...form,
+        llm_model: form.llm_model || null,
+        system_prompt: form.system_prompt || null,
+        team_id: teamId || null,
+      };
       const cfg = await apiPost<RagConfig>("/api/rag/configs", body);
       onCreated(cfg);
     } catch (e: unknown) {
@@ -1741,6 +1751,9 @@ function Sidebar({ configs, selectedId, onSelect, onNew }: {
 type Tab = "sources" | "chat" | "compare" | "evaluate";
 
 export default function RAGPage() {
+  // Team scoping: only show pipelines belonging to the currently-selected
+  // team (plus legacy NULL-team rows, which the backend also returns).
+  const { teamId } = useTeam();
   const [ragModels, setRagModels] = useState<RagModels | null>(null);
   const [llmModels, setLlmModels] = useState<LLMModel[]>([]);
   const [configs, setConfigs] = useState<RagConfig[]>([]);
@@ -1754,9 +1767,16 @@ export default function RAGPage() {
 
   const load = useCallback(async () => {
     try {
+      // Scope the config list to the currently-selected team so sdlc_2_0's
+      // pipelines don't show up when the user is on the dev team (and vice
+      // versa). Pipelines with NULL team_id (pre-migration rows) still
+      // surface in every team — see the server-side filter.
+      const cfgsPath = teamId
+        ? `/api/rag/configs?team_id=${encodeURIComponent(teamId)}`
+        : "/api/rag/configs";
       const [m, cfgs, llms] = await Promise.all([
         apiGet<RagModels>("/api/rag/models"),
-        apiGet<RagConfig[]>("/api/rag/configs"),
+        apiGet<RagConfig[]>(cfgsPath),
         apiGet<LLMModel[]>("/api/models").catch(() => []),
       ]);
       setRagModels(m);
@@ -1766,13 +1786,21 @@ export default function RAGPage() {
       if (cfgs.length === 0) setShowWizard(true);
     } catch { /* ignore */ }
     finally { setLoading(false); }
-  }, [selectedId]);
+  }, [selectedId, teamId]);
 
   useEffect(() => {
     load();
     const t = setInterval(load, 10000);
     return () => clearInterval(t);
   }, [load]);
+
+  // Reset per-team view state whenever the team changes so we don't keep
+  // showing a pipeline that no longer belongs to the active team.
+  useEffect(() => {
+    setSelectedId(null);
+    setShowWizard(false);
+    setShowEdit(false);
+  }, [teamId]);
 
   async function deleteConfig(id: string) {
     if (!confirm("Delete pipeline and all its data?")) return;
@@ -1863,7 +1891,7 @@ export default function RAGPage() {
 
           {/* Content */}
           {(showWizard || !selected) && ragModels && (
-            <ConfigWizard models={ragModels} llmModels={llmModels} onCreated={handleCreated} />
+            <ConfigWizard models={ragModels} llmModels={llmModels} onCreated={handleCreated} teamId={teamId || undefined} />
           )}
           {selected && !showWizard && tab === "sources" && (
             <DataSources config={selected} onRefresh={load} />

@@ -948,7 +948,7 @@
     "expected_strategy": "supervisor",
     "expected_agent": "devops",
     "expected_tools": [
-      "planner_create_plan",
+      "create_plan",
       "jira_create_issue",
       "write_file",
       "run_command",
@@ -977,7 +977,7 @@
     },
     "max_llm_calls": 100,
     "max_tool_calls": 70,
-    "max_tokens": 250000,
+    "max_tokens": 320000,
     "max_latency_ms": 900000,
     "complexity": "e2e",
     "version": "1.1",

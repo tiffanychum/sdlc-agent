@@ -793,11 +793,43 @@ Respond with ONLY JSON: {{"reasoning": "<step-by-step analysis>", "score": <1-5>
 
         expected_tools = set(case.expected_tools or [])
         actual_tools_set = set()
+        actual_tool_args: list[dict] = []
         for entry in trace:
             if entry.get("step") == "execution":
                 for tc in entry.get("tool_calls", []):
-                    actual_tools_set.add(tc.get("tool", ""))
-        missing = expected_tools - actual_tools_set
+                    name = tc.get("tool", "")
+                    actual_tools_set.add(name)
+                    actual_tool_args.append({
+                        "tool": name,
+                        "args": tc.get("arguments", {}) or tc.get("args", {}) or {},
+                    })
+
+        # Tool-equivalence: sdlc_2_0's builder uses generic `run_command` with a
+        # `pytest …` / `python -m unittest …` invocation in place of the dev
+        # team's dedicated `run_tests` wrapper. Satisfy the `run_tests`
+        # requirement whenever we can see a pytest/unittest command being
+        # executed via run_command — the semantic intent is identical.
+        def _run_command_ran_tests() -> bool:
+            for tc in actual_tool_args:
+                if tc["tool"] != "run_command":
+                    continue
+                args = tc.get("args") or {}
+                if isinstance(args, dict):
+                    cmd = str(args.get("command") or args.get("cmd") or "")
+                elif isinstance(args, str):
+                    cmd = args
+                else:
+                    cmd = ""
+                low = cmd.lower()
+                if ("pytest" in low) or ("python -m unittest" in low) or ("unittest discover" in low):
+                    return True
+            return False
+
+        effective_actual = set(actual_tools_set)
+        if "run_tests" in expected_tools and "run_tests" not in actual_tools_set and _run_command_ran_tests():
+            effective_actual.add("run_tests")
+
+        missing = expected_tools - effective_actual
         assertions["required_tools_called"] = {
             "passed": len(missing) == 0,
             "expected": list(expected_tools),

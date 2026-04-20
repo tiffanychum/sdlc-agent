@@ -3,6 +3,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, SSEEvent } from "@/lib/api";
+import { useTeam } from "@/contexts/TeamContext";
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -206,8 +207,14 @@ function Md({ content }: { content: string }) {
 // ── Main Component ───────────────────────────────────────────────
 
 export default function ChatPage() {
-  const [teams, setTeams] = useState<any[]>([]);
-  const [teamId, setTeamId] = useState("default");
+  // Global team selection shared across pages. We keep a local `teamIdState`
+  // representing the CURRENT conversation's team (which can differ from the
+  // globally selected team while the user is viewing an older conversation),
+  // and sync it to globalTeamId on new chats.
+  const { teamId: globalTeamId, setTeamId: setGlobalTeamId, teams } = useTeam();
+  const [teamIdState, setTeamIdState] = useState<string>(globalTeamId || "default");
+  const teamId = teamIdState;
+  const setTeamId = (id: string) => { setTeamIdState(id); setGlobalTeamId(id); };
   const [hydrated, setHydrated] = useState(false);
   const [availableModels, setAvailableModels] = useState<any[]>([]);
   const [defaultModelName, setDefaultModelName] = useState("from .env");
@@ -255,7 +262,6 @@ export default function ChatPage() {
 
   // ── Hydration ──────────────────────────────────────────────
   useEffect(() => {
-    api.teams.list().then(setTeams);
     Promise.all([api.models.list(), api.config.llm()]).then(([models, llmCfg]) => {
       setAvailableModels(models);
       setDefaultModelName(llmCfg.default_model_name || llmCfg.default_model || "from .env");
@@ -266,11 +272,17 @@ export default function ChatPage() {
     const convos = loadConversations();
     setConversations(convos);
     if (convos.length > 0) {
-      const latest = convos[0];
+      // Try to honour the globally-selected team: prefer the most recent
+      // conversation on that team; fall back to the absolute latest.
+      const onTeam = globalTeamId ? convos.find(c => c.teamId === globalTeamId) : undefined;
+      const latest = onTeam || convos[0];
       setActiveConvoId(latest.id);
       setMessages(latest.messages);
       setThreadId(latest.threadId);
-      setTeamId(latest.teamId);
+      setTeamIdState(latest.teamId);
+    } else if (globalTeamId) {
+      // No conversations yet — start new chats against the currently-selected team.
+      setTeamIdState(globalTeamId);
     }
     try {
       const saved = localStorage.getItem(LAST_TRACE_KEY);
@@ -602,37 +614,46 @@ export default function ChatPage() {
           </button>
         </div>
         <div className="flex-1 overflow-y-auto">
-          {conversations.map(c => (
-            <div key={c.id}
-              className={`group flex items-center gap-1.5 px-3 py-2 cursor-pointer border-b border-[var(--border)] transition-colors ${
-                c.id === activeConvoId
-                  ? "bg-zinc-900 border-l-2 border-l-zinc-900"
-                  : "hover:bg-[var(--bg-hover)] border-l-2 border-l-transparent"
-              }`}
-              onClick={() => c.id !== activeConvoId && switchToConversation(c)}
-            >
-              <div className="flex-1 min-w-0">
-                <div className={`text-[12px] font-medium truncate ${c.id === activeConvoId ? "text-white" : ""}`}>{c.title}</div>
-                <div className={`text-[10px] ${c.id === activeConvoId ? "text-zinc-400" : "text-[var(--text-muted)]"}`}>
-                  {c.messages.length} msgs &middot; {new Date(c.updatedAt).toLocaleDateString()}
-                </div>
-              </div>
-              <button
-                onClick={e => { e.stopPropagation(); deleteConversation(c.id); }}
-                className="opacity-0 group-hover:opacity-100 p-0.5 text-[var(--text-muted)] hover:text-red-500 transition-all flex-shrink-0"
-                title="Delete"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14" />
-                </svg>
-              </button>
-            </div>
-          ))}
-          {conversations.length === 0 && hydrated && (
-            <div className="text-[11px] text-[var(--text-muted)] text-center py-6 px-3">
-              No conversations yet
-            </div>
-          )}
+          {(() => {
+            // Only show conversations that belong to the currently-selected
+            // team so dev-team and sdlc_2_0 histories stay visually isolated.
+            const visible = conversations.filter(c => !teamId || c.teamId === teamId);
+            return (
+              <>
+                {visible.map(c => (
+                  <div key={c.id}
+                    className={`group flex items-center gap-1.5 px-3 py-2 cursor-pointer border-b border-[var(--border)] transition-colors ${
+                      c.id === activeConvoId
+                        ? "bg-zinc-900 border-l-2 border-l-zinc-900"
+                        : "hover:bg-[var(--bg-hover)] border-l-2 border-l-transparent"
+                    }`}
+                    onClick={() => c.id !== activeConvoId && switchToConversation(c)}
+                  >
+                    <div className="flex-1 min-w-0">
+                      <div className={`text-[12px] font-medium truncate ${c.id === activeConvoId ? "text-white" : ""}`}>{c.title}</div>
+                      <div className={`text-[10px] ${c.id === activeConvoId ? "text-zinc-400" : "text-[var(--text-muted)]"}`}>
+                        {c.messages.length} msgs &middot; {new Date(c.updatedAt).toLocaleDateString()}
+                      </div>
+                    </div>
+                    <button
+                      onClick={e => { e.stopPropagation(); deleteConversation(c.id); }}
+                      className="opacity-0 group-hover:opacity-100 p-0.5 text-[var(--text-muted)] hover:text-red-500 transition-all flex-shrink-0"
+                      title="Delete"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14" />
+                      </svg>
+                    </button>
+                  </div>
+                ))}
+                {visible.length === 0 && hydrated && (
+                  <div className="text-[11px] text-[var(--text-muted)] text-center py-6 px-3">
+                    No conversations yet for this team
+                  </div>
+                )}
+              </>
+            );
+          })()}
         </div>
       </div>
 

@@ -1,6 +1,7 @@
 "use client";
 import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { api } from "@/lib/api";
+import { useTeam } from "@/contexts/TeamContext";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   Legend, BarChart, Bar, PieChart, Pie, Cell, AreaChart, Area,
@@ -33,8 +34,9 @@ const tip = { contentStyle: { background: "var(--bg-card)", border: "1px solid v
 
 export default function MonitoringPage() {
   const [activeTab, setActiveTab] = useState<"overview" | "otel">("overview");
-  const [teams, setTeams] = useState<any[]>([]);
-  const [teamId, setTeamId] = useState("");
+  // Team selection is shared across pages via <TeamProvider> in layout.tsx
+  // so switching here persists to Studio/Regression/Chat/RAG and vice versa.
+  const { teamId, setTeamId, teams, selectedTeam } = useTeam();
   const [stats, setStats] = useState<any>(null);
   const [traces, setTraces] = useState<any[]>([]);
   const [otelStats, setOtelStats] = useState<any>(null);
@@ -72,10 +74,6 @@ export default function MonitoringPage() {
   const [promptAbVersionB, setPromptAbVersionB] = useState("v2");
   const [promptAbResult, setPromptAbResult] = useState<any>(null);
   const [promptAbLoading, setPromptAbLoading] = useState(false);
-
-  useEffect(() => {
-    api.teams.list().then(t => { setTeams(t); if (t.length) setTeamId(t[0].id); });
-  }, []);
 
   const loadAll = useCallback(async () => {
     try { const s = await api.traces.stats(); setStats(s); } catch { /* ignore */ }
@@ -242,7 +240,7 @@ export default function MonitoringPage() {
     }
   }, [optimizeTrajectory]);
 
-  const selectedTeam = teams.find(t => t.id === teamId);
+  // `selectedTeam` is provided by useTeam() above.
   const totalRuns = stats?.total_runs || traces.length || 0;
   const failures = stats?.failures || traces.filter((t: any) => t.status === "error").length;
   const successRate = totalRuns > 0 ? ((totalRuns - failures) / totalRuns) : 0;

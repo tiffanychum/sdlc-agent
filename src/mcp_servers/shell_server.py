@@ -13,6 +13,7 @@ Transports:
 import asyncio
 import logging
 import os
+import re
 import shlex
 from dataclasses import dataclass, field
 from typing import Optional
@@ -25,7 +26,18 @@ logger = logging.getLogger(__name__)
 WORKSPACE_ROOT = os.getenv("AGENT_WORKSPACE", os.getcwd())
 DEFAULT_TIMEOUT = 30
 
-BLOCKED_COMMANDS = {"rm -rf /", "mkfs", "dd if=", ":(){ :|:&", "shutdown", "reboot"}
+# Dangerous commands we always refuse. Substring matching on "rm -rf /" was
+# too aggressive — `rm -rf /tmp/url-shortener/tests/qa` also contains
+# "rm -rf /" as a substring and would be incorrectly blocked, so we match
+# root-targeted deletions with a regex and keep the other destructive
+# commands as plain substrings.
+BLOCKED_SUBSTRINGS = {"mkfs", "dd if=", ":(){ :|:&", "shutdown", "reboot"}
+# `rm -rf /` or `rm -rf /*` where the next char is whitespace, end-of-string
+# or a shell glob — i.e. literally targeting root. Allows `rm -rf /tmp/...`,
+# `rm -rf /var/foo`, etc. because those have additional path segments.
+_RM_RF_ROOT_RE = re.compile(r"\brm\s+-[a-z]*r[a-z]*f[a-z]*\s+/(\s|$|\*|;|&|\|)", re.IGNORECASE)
+# Also catch the `-fr` ordering.
+_RM_FR_ROOT_RE = re.compile(r"\brm\s+-[a-z]*f[a-z]*r[a-z]*\s+/(\s|$|\*|;|&|\|)", re.IGNORECASE)
 
 
 @dataclass
@@ -54,7 +66,14 @@ state = ShellState()
 
 def _is_safe(command: str) -> bool:
     cmd_lower = command.lower().strip()
-    return not any(blocked in cmd_lower for blocked in BLOCKED_COMMANDS)
+    if any(blocked in cmd_lower for blocked in BLOCKED_SUBSTRINGS):
+        return False
+    # Reject only `rm -rf /` (root) style commands; allow deletions inside
+    # /tmp, /var/tmp, or agent-created scratch directories needed by QA
+    # cleanup steps.
+    if _RM_RF_ROOT_RE.search(cmd_lower) or _RM_FR_ROOT_RE.search(cmd_lower):
+        return False
+    return True
 
 
 async def _execute(command: str, cwd: str, timeout: int) -> str:
@@ -70,8 +89,21 @@ async def _execute(command: str, cwd: str, timeout: int) -> str:
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
-        return f"Command timed out after {timeout}s: {command}"
+        # On timeout we try to terminate cleanly. Under uvloop the process may
+        # already be reaped by the time we call .kill(), surfacing as
+        # ProcessLookupError; swallow it so we always return the informative
+        # "timed out" message instead of crashing the tool call.
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass  # uvloop already reaped the process
+        except Exception:
+            pass  # swallow any other kill-time errors rather than crash the tool
+        return (
+            f"Command timed out after {timeout}s: {command}\n"
+            f"Hint: long-running processes (uvicorn, flask run, etc.) must be "
+            f"backgrounded, e.g. `nohup <cmd> > /tmp/out.log 2>&1 & echo $!`."
+        )
 
     stdout_str = stdout.decode("utf-8", errors="replace").strip()
     stderr_str = stderr.decode("utf-8", errors="replace").strip()

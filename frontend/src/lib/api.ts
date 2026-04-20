@@ -136,10 +136,14 @@ export const api = {
       onEvent: SSECallback,
       signal?: AbortSignal,
     ) => consumeSSE("/api/regression/run/stream", params, onEvent, signal),
-    runs: () => fetchJSON("/api/regression/runs"),
+    runs: (team_id?: string) => fetchJSON(`/api/regression/runs${team_id ? `?team_id=${encodeURIComponent(team_id)}` : ""}`),
     results: (runId: string) => fetchJSON(`/api/regression/results/${runId}`),
     caseDetail: (runId: string, caseId: string) => fetchJSON(`/api/regression/results/${runId}/${caseId}`),
-    abOptions: (golden_id: string) => fetchJSON(`/api/regression/ab/options?golden_id=${encodeURIComponent(golden_id)}`),
+    abOptions: (golden_id: string, team_id?: string) => {
+      const q = new URLSearchParams({ golden_id });
+      if (team_id) q.append("team_id", team_id);
+      return fetchJSON(`/api/regression/ab/options?${q.toString()}`);
+    },
     ab: (params: { golden_id: string; run_id_a?: string; run_id_b?: string; model_a?: string; model_b?: string; version_a?: string; version_b?: string }) => {
       const q = new URLSearchParams();
       q.set("golden_id", params.golden_id);
