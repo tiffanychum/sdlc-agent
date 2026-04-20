@@ -977,12 +977,19 @@ Respond with ONLY JSON: {{"reasoning": "<step-by-step analysis>", "score": <1-5>
                         "args": tc.get("arguments", {}) or tc.get("args", {}) or {},
                     })
 
-        # Tool-equivalence: sdlc_2_0's builder uses generic `run_command` with a
-        # `pytest …` / `python -m unittest …` invocation in place of the dev
-        # team's dedicated `run_tests` wrapper. Satisfy the `run_tests`
-        # requirement whenever we can see a pytest/unittest command being
-        # executed via run_command — the semantic intent is identical.
-        def _run_command_ran_tests() -> bool:
+        # Tool-equivalence: some agents accomplish the same work via different
+        # tool names. We treat these as equivalent at the assertion layer so
+        # cross-team goldens don't false-fail on cosmetic tool choice.
+        #
+        #   run_tests          ≡  run_command "pytest ..." / "python -m unittest ..."
+        #   write_file         ≡  run_command "cat > path <<EOF ... EOF"
+        #                       ≡  run_command "echo ... > path"
+        #                       ≡  run_command "tee path ..."
+        #                       ≡  run_command "python -c 'open(..., 'w').write(...)'"
+        #
+        # The semantic intent is what we check — the tool name is implementation
+        # detail the agent is free to choose.
+        def _run_command_matches(needles: tuple[str, ...]) -> bool:
             for tc in actual_tool_args:
                 if tc["tool"] != "run_command":
                     continue
@@ -994,13 +1001,26 @@ Respond with ONLY JSON: {{"reasoning": "<step-by-step analysis>", "score": <1-5>
                 else:
                     cmd = ""
                 low = cmd.lower()
-                if ("pytest" in low) or ("python -m unittest" in low) or ("unittest discover" in low):
+                if any(n in low for n in needles):
                     return True
             return False
 
+        _EQUIV_VIA_RUN_COMMAND: dict[str, tuple[str, ...]] = {
+            "run_tests": ("pytest", "python -m unittest", "unittest discover"),
+            # write-file equivalence: common shell idioms that create/overwrite
+            # a file. Matches "cat > ", "cat >>", "tee ", ">> ", " > ", and
+            # the cat-heredoc pattern ("<<eof" / "<< 'eof'").
+            "write_file": ("cat >", "tee ", " > /", " > ./", " >> /", "<<eof", "<<'eof'", "<< eof", "<< 'eof'"),
+        }
+
         effective_actual = set(actual_tools_set)
-        if "run_tests" in expected_tools and "run_tests" not in actual_tools_set and _run_command_ran_tests():
-            effective_actual.add("run_tests")
+        for logical, needles in _EQUIV_VIA_RUN_COMMAND.items():
+            if (
+                logical in expected_tools
+                and logical not in actual_tools_set
+                and _run_command_matches(needles)
+            ):
+                effective_actual.add(logical)
 
         missing = expected_tools - effective_actual
         assertions["required_tools_called"] = {

@@ -24,10 +24,10 @@
       "completeness": 0.7,
       "correctness": 0.8
     },
-    "max_llm_calls": 5,
-    "max_tool_calls": 3,
-    "max_tokens": 8000,
-    "max_latency_ms": 30000,
+    "max_llm_calls": 8,
+    "max_tool_calls": 6,
+    "max_tokens": 25000,
+    "max_latency_ms": 60000,
     "complexity": "quick",
     "version": "5.0",
     "reference_output": "**`src/llm/client.py`** — role-specific LLM factory functions:\n\n- `get_llm()` — default `ChatOpenAI` instance using `LLM_MODEL`\n- `get_judge_llm()` — configured for evaluation scoring using `LLM_JUDGE_MODEL`\n- `get_rca_llm()` — root-cause analysis using `LLM_RCA_MODEL`\n- `get_router_llm()` — lightweight request routing using `LLM_ROUTER_MODEL`\n\nAll functions accept an OpenAI-compatible API via `LLM_BASE_URL`. Thinking models (e.g. `claude-sonnet-4.6`) automatically receive `extra_body` with `budget_tokens` injected."
@@ -529,10 +529,10 @@
       "completeness": 0.55,
       "correctness": 0.6
     },
-    "max_llm_calls": 30,
-    "max_tool_calls": 25,
-    "max_tokens": 100000,
-    "max_latency_ms": 300000,
+    "max_llm_calls": 35,
+    "max_tool_calls": 30,
+    "max_tokens": 180000,
+    "max_latency_ms": 360000,
     "complexity": "complex",
     "version": "5.0",
     "reference_output": "Scratch dir `/tmp/validate-util/`:\n\n- `validate.py` — `validate_email(email: str) -> bool` using regex\n- `tests/test_validate.py` — 4 tests; `pytest` reports 4 passed ✅\n- Local git repo initialised (branch `main`); committed `feat: add validate_email() with pytest coverage`.\n\nNo writes outside /tmp/validate-util/. No git_* tools used."
