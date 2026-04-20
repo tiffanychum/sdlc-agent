@@ -24,13 +24,29 @@ def load_golden_dataset() -> list[dict]:
 
 
 def sync_golden_to_db():
-    """Upsert golden dataset from JSON into the database."""
+    """Upsert golden dataset from JSON into the database.
+
+    Cases removed from the JSON (e.g. via v5 consolidation) are deactivated —
+    their DB rows remain for historical regression results to reference, but
+    they won't show up in `get_active_cases()` / the Studio picker.
+    """
     cases = load_golden_dataset()
     if not cases:
         return
 
+    json_ids = {c["id"] for c in cases}
+
     session = get_session()
     try:
+        # Deactivate rows for ids no longer present in the JSON source of truth.
+        stale = (
+            session.query(GoldenTestCase)
+            .filter(GoldenTestCase.is_active.is_(True))
+            .filter(~GoldenTestCase.id.in_(json_ids))
+            .all()
+        )
+        for row in stale:
+            row.is_active = False
         for c in cases:
             existing = session.query(GoldenTestCase).filter_by(id=c["id"]).first()
             if existing:

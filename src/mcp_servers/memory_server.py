@@ -89,7 +89,18 @@ async def memory_retrieve(key: str, category: str = "notes") -> str:
     entry = mem.get(category, {}).get(key)
     if not entry:
         return f"Key '{key}' not found in {category}"
-    return f"[{category}/{key}] {entry['value']} (updated: {entry.get('updated_at', '?')})"
+    # Tolerate legacy shapes: older rows stored either a bare string or a dict
+    # with different field names (e.g. "content" instead of "value"). Falling
+    # back instead of raising `KeyError` keeps the whole multi-agent run from
+    # crashing on a stale memory file.
+    if isinstance(entry, str):
+        value, updated = entry, "?"
+    elif isinstance(entry, dict):
+        value = entry.get("value") or entry.get("content") or entry.get("data") or str(entry)
+        updated = entry.get("updated_at", "?")
+    else:
+        value, updated = str(entry), "?"
+    return f"[{category}/{key}] {value} (updated: {updated})"
 
 
 @mcp.tool()

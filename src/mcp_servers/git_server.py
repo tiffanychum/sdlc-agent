@@ -23,6 +23,29 @@ logger = logging.getLogger(__name__)
 
 WORKSPACE_ROOT = os.getenv("AGENT_WORKSPACE", os.getcwd())
 
+# Agents must never run mutating git commands inside the sdlc-agent repo
+# itself — a single `git checkout feature/x` on a branch whose HEAD only has a
+# README can wipe tracked source files from disk. We detect the sdlc-agent
+# repo by the presence of a `server.py` + `src/orchestrator.py` pair at the
+# repo toplevel, and refuse destructive ops when that's where the command
+# would run. This is a belt-and-braces guard; tests should always pass an
+# explicit scratch path via the `cwd` kwarg of `_git`.
+def _is_sdlc_agent_repo(path: str) -> bool:
+    try:
+        return (
+            os.path.isfile(os.path.join(path, "server.py"))
+            and os.path.isfile(os.path.join(path, "src", "orchestrator.py"))
+        )
+    except Exception:
+        return False
+
+
+# Git sub-commands that can rewrite HEAD or blow away tracked files.
+_DESTRUCTIVE_GIT_SUBCOMMANDS = (
+    "checkout ", "switch ", "reset ", "clean ", "rebase ", "merge ",
+    "branch -d", "branch -D", "tag -d", "push --force", "push -f",
+)
+
 
 @dataclass
 class GitState:
@@ -44,6 +67,19 @@ state = GitState()
 # ── Git helper ────────────────────────────────────────────────────
 
 async def _git(command: str, cwd: str = WORKSPACE_ROOT) -> str:
+    # Safety: block destructive git sub-commands when we'd be running them
+    # inside the sdlc-agent repo itself. Agents should always operate in a
+    # scratch directory (/tmp/<project>, etc.); running `git checkout <branch>`
+    # here has catastrophically wiped the tree in the past.
+    cmd_stripped = command.strip().lower()
+    if _is_sdlc_agent_repo(cwd) and any(cmd_stripped.startswith(p) for p in _DESTRUCTIVE_GIT_SUBCOMMANDS):
+        return (
+            "REFUSED: destructive git operation blocked inside the sdlc-agent "
+            "repository itself. Always work in a scratch directory (e.g. "
+            "/tmp/<project-name>) via shell `cd`/`mkdir`/`git init`, then "
+            "re-run the git tool from there. "
+            f"(attempted: git {command[:80]})"
+        )
     proc = await asyncio.create_subprocess_shell(
         f"git {command}",
         stdout=asyncio.subprocess.PIPE,
@@ -153,7 +189,28 @@ async def git_branch(action: str = "list", name: str = "") -> str:
         case "create":
             if not name:
                 raise ValueError("Branch name required for create")
-            return await _git(f"checkout -b {name}")
+            try:
+                return await _git(f"checkout -b {name}")
+            except RuntimeError as e:
+                # Re-running a golden that creates a branch will hit
+                # "fatal: a branch named 'X' already exists". Degrade gracefully
+                # by switching to the existing branch so the flow can continue
+                # (same philosophy as github_create_repo returning existing
+                # repo metadata on HTTP 422).
+                msg = str(e)
+                if "already exists" in msg:
+                    try:
+                        switched = await _git(f"checkout {name}")
+                        return (
+                            f"Branch '{name}' already exists — switched to it "
+                            f"instead of creating a new one.\n{switched}"
+                        )
+                    except Exception:
+                        return (
+                            f"NOTE: branch '{name}' already exists; continuing on "
+                            f"the existing branch. Use git_status to verify."
+                        )
+                raise
         case "switch":
             if not name:
                 raise ValueError("Branch name required for switch")

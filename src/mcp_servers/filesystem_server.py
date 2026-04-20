@@ -202,7 +202,17 @@ async def list_directory(path: str = "", recursive: bool = False) -> str:
         # Path doesn't exist yet — treat it as an empty new directory rather than crashing.
         return f"(empty — '{path}' does not exist yet; use write_file to create files there)"
     if not dirpath.is_dir():
-        raise NotADirectoryError(f"Not a directory: {path or '.'}")
+        # Target exists but is a file (or socket/device). Treat as a soft listing
+        # with metadata rather than raising and killing the agent workflow —
+        # the caller can then read_file or choose a sibling directory.
+        try:
+            size = dirpath.stat().st_size
+        except Exception:
+            size = -1
+        return (
+            f"(not a directory — '{path}' is a file (~{size:,}B). Use read_file "
+            f"to read it, or list its parent directory instead.)"
+        )
 
     anchor = dirpath.resolve()
     entries = []

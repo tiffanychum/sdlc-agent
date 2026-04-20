@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import "./globals.css";
 import { RegressionRunProvider } from "@/contexts/RegressionRunContext";
+import { TeamProvider } from "@/contexts/TeamContext";
 import RegressionRunWidget from "@/components/RegressionRunWidget";
 
 const inter = Inter({ subsets: ["latin"] });
@@ -54,12 +55,14 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body className={`${inter.className} min-h-screen flex`}>
-        <RegressionRunProvider>
-          <NavBar />
-          <main className="ml-52 flex-1 p-7 min-h-screen bg-[var(--bg)]">{children}</main>
-          {/* Floating widget — persists across all pages */}
-          <RegressionRunWidget />
-        </RegressionRunProvider>
+        <TeamProvider>
+          <RegressionRunProvider>
+            <NavBar />
+            <main className="ml-52 flex-1 p-7 min-h-screen bg-[var(--bg)]">{children}</main>
+            {/* Floating widget — persists across all pages */}
+            <RegressionRunWidget />
+          </RegressionRunProvider>
+        </TeamProvider>
       </body>
     </html>
   );

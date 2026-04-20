@@ -1,6 +1,7 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import { useTeam } from "@/contexts/TeamContext";
 
 const TEAM_STRATEGIES = [
   { v: "router_decides", l: "Router", d: "LLM picks the best agent" },
@@ -251,7 +252,9 @@ type AgentDraft = {
 type PendingEdit = Partial<AgentDraft & { prompt_version: string }>;
 
 export default function StudioPage() {
-  const [teams, setTeams] = useState<any[]>([]);
+  // Teams list + selected-team ID are shared via <TeamProvider> in layout.tsx
+  // so changes made here propagate to Regression/Chat/Monitoring/RAG.
+  const { teamId: globalTeamId, setTeamId: setGlobalTeamId, teams, refreshTeams } = useTeam();
   const [team, setTeam] = useState<any>(null);
   const [skills, setSkills] = useState<any[]>([]);
   const [tools, setTools] = useState<any>({});
@@ -299,17 +302,22 @@ export default function StudioPage() {
 
   async function load() {
     const [t, s, tl, models, llmCfg, allVersions, routing] = await Promise.all([
-      api.teams.list(), api.skills.list(), api.tools.list(),
+      refreshTeams(), api.skills.list(), api.tools.list(),
       api.models.list(), api.config.llm(),
       api.prompts.versions().catch(() => ({ roles: {} })),
       fetch("/api/prompts/routing").then(r => r.json()).catch(() => ({ routing: {} })),
     ]);
-    setTeams(t); setSkills(s); setTools(tl);
+    setSkills(s); setTools(tl);
     setAvailableModels(models);
     setDefaultModelName(llmCfg.default_model_name || llmCfg.default_model || "from .env");
     if (allVersions?.roles) setAgentVersions(allVersions.roles);
     if (routing?.routing) setRoutingPrompts(routing.routing);
-    if (t.length > 0 && !team) setTeam(await api.teams.get(t[0].id));
+    if (t.length > 0 && !team) {
+      // Prefer whatever the global context was already showing so navigation
+      // from another page keeps the same team active here.
+      const preferred = (globalTeamId && t.find((x: any) => x.id === globalTeamId)) ? globalTeamId : t[0].id;
+      setTeam(await api.teams.get(preferred));
+    }
   }
 
   function modelOptions() {
@@ -350,30 +358,38 @@ export default function StudioPage() {
   }, []);
 
   // ── Team operations ──────────────────────────────────────────────
-  async function selectTeam(id: string) { setTeam(await api.teams.get(id)); }
+  async function selectTeam(id: string) {
+    setTeam(await api.teams.get(id));
+    setGlobalTeamId(id); // propagate to every other page
+  }
 
   async function createTeam() {
     if (!newTeam.trim()) return;
     const r = await api.teams.create({ name: newTeam });
     setNewTeam("");
-    const t = await api.teams.list(); setTeams(t);
+    await refreshTeams();
     setTeam(await api.teams.get(r.id));
+    setGlobalTeamId(r.id);
   }
 
   async function renameTeam(id: string) {
     if (!editName.trim()) { setEditingName(null); return; }
     await api.teams.update(id, { name: editName });
     setEditingName(null);
-    const t = await api.teams.list(); setTeams(t);
+    await refreshTeams();
     if (team?.id === id) setTeam(await api.teams.get(id));
   }
 
   async function deleteTeam(id: string) {
     if (!confirm("Delete this team and all its agents?")) return;
     await api.teams.delete(id);
-    const t = await api.teams.list(); setTeams(t);
-    if (t.length > 0) setTeam(await api.teams.get(t[0].id));
-    else setTeam(null);
+    const t = await refreshTeams();
+    if (t.length > 0) {
+      setTeam(await api.teams.get(t[0].id));
+      setGlobalTeamId(t[0].id);
+    } else {
+      setTeam(null);
+    }
   }
 
   async function updateStrategy(s: string) {

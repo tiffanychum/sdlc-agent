@@ -320,7 +320,10 @@ Respond with ONLY the agent name from: {agent_names}."""
 def _get_executor(role: str, built_agents: dict, exec_agents=None,
                    agent_model=None):
     """Return the planner HITL executor for planner roles, standard executor otherwise."""
-    if role == "planner":
+    # Both the dev-team "planner" and the sdlc_2_0 "planner_v2" use the
+    # plan-review HITL wrapper so users can approve / modify / reject the plan
+    # before it is handed to the execution agent.
+    if role in ("planner", "planner_v2"):
         exec_agent = (exec_agents or {}).get(role)
         return make_planner_executor(role, built_agents, exec_agent=exec_agent,
                                      agent_model=agent_model)
@@ -606,7 +609,7 @@ async def build_orchestrator_from_team(
         built_agents[ac["role"]] = create_react_agent(
             model=llm, tools=hitl_tools, prompt=final_prompt,
         )
-        if ac["role"] == "planner":
+        if ac["role"] in ("planner", "planner_v2"):
             exec_agents[ac["role"]] = create_react_agent(
                 model=llm, tools=list(agent_tools), prompt=final_prompt,
             )
@@ -853,6 +856,13 @@ def _build_supervisor_graph(agents_config, built_agents, checkpointer=None,
     router_llm = get_router_llm()
     valid_roles = {a["role"] for a in agents_config}
 
+    # Detect which team we are orchestrating based on the agent roster.
+    # sdlc_2_0 has a strict roster of {builder, planner_v2} — when we see that,
+    # switch to a concise 2-agent supervisor prompt + derive logic. Everything
+    # else falls through to the full 9-role dev-team pipeline.
+    _SDLC_2_0_ROLES = {"builder", "planner_v2"}
+    is_sdlc_2_0 = bool(valid_roles) and valid_roles.issubset(_SDLC_2_0_ROLES)
+
     def _tool_hint(a: dict) -> str:
         """Return a parenthetical hint listing the tool groups an agent has access to."""
         groups = a.get("tool_groups") or []
@@ -866,7 +876,25 @@ def _build_supervisor_graph(agents_config, built_agents, checkpointer=None,
     )
     agent_names = ", ".join(f'"{a["role"]}"' for a in agents_config)
 
-    supervisor_prompt = f"""You are a supervisor orchestrating a multi-agent workflow.
+    if is_sdlc_2_0:
+        supervisor_prompt = f"""You are the supervisor of a simplified 2-agent team (sdlc_2_0).
+
+Agents and their capabilities:
+{agent_descs}
+
+Routing rules (apply in order):
+1. If the task is simple / single-concern (fix a bug, add an endpoint, run tests,
+   answer a question) → "builder".
+2. If the task is complex (≥3 concerns: implement + test + deploy, OR mentions
+   "plan", "design", "architect", "audit") AND planner_v2 has NOT run yet →
+   "planner_v2" FIRST, then "builder".
+3. If planner_v2 has already produced an approved plan → "builder".
+4. If builder has finished and all deliverables are complete → "DONE".
+
+Reply with EXACTLY ONE of: "DONE" or an agent name (builder / planner_v2).
+Do NOT explain your reasoning."""
+    else:
+        supervisor_prompt = f"""You are a supervisor orchestrating a multi-agent workflow.
 
 Agents and their capabilities:
 {agent_descs}
@@ -921,6 +949,40 @@ Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
         """
         text = user_request.lower()
         steps: list[str] = []
+
+        # ── sdlc_2_0 team: simple keyword-driven complexity classifier ──────
+        # Goal: route simple tasks straight to builder, complex tasks through
+        # planner_v2 → builder. Keep the classifier conservative — when in
+        # doubt, prefer the builder-only path so we don't insert unnecessary
+        # planning overhead (users can still ask Planner-2 explicitly).
+        if is_sdlc_2_0:
+            # Strong "plan this" signals — user explicitly wants a planning phase.
+            wants_explicit_plan = any(
+                kw in text for kw in (
+                    "create a plan", "make a plan", "draft a plan", "devise a plan",
+                    "design a plan", "planner", "architect", "audit",
+                    "analyse the ", "analyze the ",
+                )
+            )
+            # Multi-concern complexity heuristic: tasks that mention several
+            # distinct verbs (implement + test + deploy + open a pr) benefit
+            # from a planning step even when the user didn't ask for one.
+            complex_signals = sum(
+                1
+                for kw in (
+                    "implement", "build", "create", "develop", "write", "code",
+                    "deploy", "release", "test", "pytest", "qa",
+                    "pr", "pull request", "push", "commit", "github", "jira",
+                    "research ", "investigate", "compare", "best practice",
+                )
+                if kw in text
+            )
+            is_complex = wants_explicit_plan or complex_signals >= 3
+
+            if is_complex:
+                steps.append("planner_v2")
+            steps.append("builder")
+            return steps
 
         # Full build/e2e tasks: infer the standard pipeline
         is_build_task = any(kw in text for kw in (

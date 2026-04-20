@@ -2,6 +2,7 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { api } from "@/lib/api";
 import { useRegressionRun } from "@/contexts/RegressionRunContext";
+import { useTeam } from "@/contexts/TeamContext";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -91,8 +92,10 @@ type SubTab = "golden" | "run" | "results" | "ab" | "perf" | "prompts";
 
 export default function RegressionPage() {
   const [subTab, setSubTab] = useState<SubTab>("run");
-  const [teams, setTeams] = useState<any[]>([]);
-  const [teamId, setTeamId] = useState("");
+  // Team selection is shared across pages via <TeamProvider> in layout.tsx so
+  // switching teams here (or anywhere) persists and doesn't snap back on
+  // navigation. Regression runs + A/B options are scoped by this teamId.
+  const { teamId, setTeamId, teams, selectedTeam } = useTeam();
 
   // golden dataset
   const [goldenCases, setGoldenCases] = useState<any[]>([]);
@@ -166,22 +169,25 @@ export default function RegressionPage() {
   // Per-role selected prompt version for the upcoming run
   const [rolePromptVerMap, setRolePromptVerMap] = useState<Record<string, string>>({});
 
-  const selectedTeam = teams.find(t => t.id === teamId);
+  // `selectedTeam` is provided by useTeam() above.
 
   useEffect(() => {
-    api.teams.list().then(t => { setTeams(t); if (t.length) setTeamId(t[0].id); });
     api.models.list().then(setAvailableModels).catch(() => {});
     api.promptVersions.list().then(setPromptVersions).catch(() => {});
-    // Load all roles' version lists from the registry, then auto-select latest per role.
-    // Also read the agent prompt_version from Studio (DB) so defaults match what's configured there.
+  }, []);
+
+  // Per-role prompt-version defaults depend on which team is selected — the
+  // dev team has {coder, qa, devops, …} whereas sdlc_2_0 has {builder,
+  // planner_v2}. Re-resolve whenever teamId changes so the Studio settings
+  // for the active team drive the per-role defaults on the Run Tests tab.
+  useEffect(() => {
+    if (!teamId) return;
     Promise.all([
       api.prompts.versions().catch(() => ({ roles: {} })),
-      api.teams.get("default").catch(() => ({ agents: [] })),
+      api.teams.get(teamId).catch(() => ({ agents: [] })),
     ]).then(([versionsRes, teamData]: [any, any]) => {
       const roles = versionsRes?.roles || {};
       setRoleVersionsMap(roles);
-      // Build default map: use Studio-configured version for each agent, falling back to
-      // the latest version in the registry, then v1.
       const studioVersions: Record<string, string> = {};
       for (const agent of (teamData?.agents || [])) {
         if (agent.role && agent.prompt_version) studioVersions[agent.role] = agent.prompt_version;
@@ -192,22 +198,34 @@ export default function RegressionPage() {
         if (studioVer && studioVer !== "v1") {
           defaults[role] = studioVer;
         } else {
-          // Pick the latest (first) non-v1 version if one exists
           const latest = (versions as any[]).find((v: any) => v.version !== "v1");
           if (latest) defaults[role] = latest.version;
         }
       }
       setRolePromptVerMap(defaults);
     });
-  }, []);
+  }, [teamId]);
+
+  // When the active team changes, reset the in-view run / A/B selection so
+  // we don't keep displaying a dev-team run while the user is on sdlc_2_0.
+  useEffect(() => {
+    setRegSelectedRunId("");
+    setRegResults(null);
+    setRegCaseDetail(null);
+    setAbGoldenId("");
+    setAbOptions([]);
+    setAbRunIdA("");
+    setAbRunIdB("");
+    setAbResult(null);
+  }, [teamId]);
 
   const loadGolden = useCallback(async () => {
     try { const c = await api.golden.list(); setGoldenCases(c); } catch { /* ignore */ }
   }, []);
 
   const loadRegRuns = useCallback(async () => {
-    try { const r = await api.regression.runs(); setRegRuns(r); } catch { /* ignore */ }
-  }, []);
+    try { const r = await api.regression.runs(teamId || undefined); setRegRuns(r); } catch { /* ignore */ }
+  }, [teamId]);
 
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -381,7 +399,7 @@ export default function RegressionPage() {
     if (!id) return;
     setAbOptionsLoading(true);
     try {
-      const d = await api.regression.abOptions(id);
+      const d = await api.regression.abOptions(id, teamId || undefined);
       const opts = d.options || [];
       setAbOptions(opts);
       // Auto-select: oldest as A, newest as B (if ≥2 distinct runs)

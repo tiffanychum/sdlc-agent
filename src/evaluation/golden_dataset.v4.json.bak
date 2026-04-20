@@ -1,0 +1,1195 @@
+[
+  {
+    "id": "golden_001",
+    "name": "Read and summarize a source file",
+    "prompt": "Read the file src/llm/client.py and explain what it does",
+    "expected_agent": "coder",
+    "expected_tools": [
+      "read_file"
+    ],
+    "expected_output_keywords": [
+      "ChatOpenAI",
+      "LLM",
+      "client",
+      "get_llm",
+      "get_judge_llm"
+    ],
+    "expected_delegation_pattern": [
+      "coder"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.8,
+      "completeness": 0.7,
+      "correctness": 0.8
+    },
+    "max_llm_calls": 5,
+    "max_tool_calls": 3,
+    "max_tokens": 8000,
+    "max_latency_ms": 30000,
+    "complexity": "quick",
+    "version": "3.0",
+    "reference_output": "**`src/llm/client.py`** — role-specific LLM factory functions:\n\n- `get_llm()` — default `ChatOpenAI` instance using `LLM_MODEL`\n- `get_judge_llm()` — configured for evaluation scoring using `LLM_JUDGE_MODEL`\n- `get_rca_llm()` — root-cause analysis using `LLM_RCA_MODEL`\n- `get_router_llm()` — lightweight request routing using `LLM_ROUTER_MODEL`\n\nAll functions accept an OpenAI-compatible API via `LLM_BASE_URL`. Thinking models (e.g. `claude-sonnet-4.6`) automatically receive `extra_body` with `budget_tokens` injected."
+  },
+  {
+    "id": "golden_002",
+    "name": "List project structure",
+    "prompt": "Show me the directory structure of the src/ folder",
+    "expected_agent": "coder",
+    "expected_tools": [
+      "list_directory"
+    ],
+    "expected_output_keywords": [
+      "src",
+      "directory",
+      "folder",
+      "mcp_servers",
+      "evaluation"
+    ],
+    "expected_delegation_pattern": [
+      "coder"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.65,
+      "completeness": 0.75,
+      "correctness": 0.85
+    },
+    "max_llm_calls": 5,
+    "max_tool_calls": 3,
+    "max_tokens": 8000,
+    "max_latency_ms": 30000,
+    "complexity": "quick",
+    "version": "3.0",
+    "reference_output": "The `src/` folder structure:\n\n| Directory | Purpose |\n|-----------|----------|\n| `db/` | SQLAlchemy models and database connection |\n| `evaluation/` | Metrics, G-Eval, DeepEval, regression, RCA |\n| `llm/` | LLM client factory (multi-model) |\n| `mcp_servers/` | 5 MCP tool servers (filesystem, shell, git, web, memory) |\n| `skills/` | Skill injection engine |\n| `tools/` | MCP → LangChain tool bridge |\n| `tracing/` | OTel trace collector and callbacks |\n\nEach subdirectory contains an `__init__.py` and one or more implementation files."
+  },
+  {
+    "id": "golden_003",
+    "name": "Search for pattern in code",
+    "prompt": "Search for all usages of 'get_judge_llm' in the Python files and tell me which files use it",
+    "expected_agent": "coder",
+    "expected_tools": [
+      "search_files"
+    ],
+    "expected_output_keywords": [
+      "get_judge_llm",
+      "import",
+      "regression",
+      "integrations",
+      "llm_judge"
+    ],
+    "expected_delegation_pattern": [
+      "coder"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.75,
+      "completeness": 0.7,
+      "correctness": 0.85
+    },
+    "max_llm_calls": 5,
+    "max_tool_calls": 3,
+    "max_tokens": 8000,
+    "max_latency_ms": 30000,
+    "complexity": "quick",
+    "version": "3.0",
+    "reference_output": "`get_judge_llm` is imported and called in **3 files**:\n\n- **`src/evaluation/regression.py`** — used for semantic similarity scoring and G-Eval quality scoring\n- **`src/evaluation/integrations.py`** — used for trace-based agentic metrics (DeepEval)\n- **`src/evaluation/llm_judge.py`** — used for G-Eval chain-of-thought criterion scoring"
+  },
+  {
+    "id": "golden_004",
+    "name": "Run test suite",
+    "prompt": "Run the test suite and report the results",
+    "expected_agent": "coder",
+    "expected_tools": [
+      "run_tests"
+    ],
+    "expected_output_keywords": [
+      "test",
+      "passed",
+      "failed",
+      "pytest"
+    ],
+    "expected_delegation_pattern": [
+      "coder"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.65,
+      "completeness": 0.75,
+      "correctness": 0.75
+    },
+    "max_llm_calls": 15,
+    "max_tool_calls": 10,
+    "max_tokens": 35000,
+    "max_latency_ms": 90000,
+    "complexity": "quick",
+    "version": "4.1",
+    "reference_output": "**Test suite executed** via `pytest`.\n\n- **Passed**: N tests completed successfully\n- **Failed**: M tests with error details\n- **Exit code**: `0` (all pass) or non-zero (failures present)\n\nAny failures are shown with the test name, assertion error, and short traceback."
+  },
+  {
+    "id": "golden_005",
+    "name": "Git status check",
+    "prompt": "Check the current git status and tell me what files have been modified",
+    "expected_agent": "devops",
+    "expected_tools": [
+      "git_status"
+    ],
+    "expected_output_keywords": [
+      "modified",
+      "git",
+      "status"
+    ],
+    "expected_delegation_pattern": [
+      "devops"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.7,
+      "completeness": 0.7,
+      "correctness": 0.9
+    },
+    "max_llm_calls": 5,
+    "max_tool_calls": 3,
+    "max_tokens": 8000,
+    "max_latency_ms": 30000,
+    "complexity": "quick",
+    "version": "3.0",
+    "reference_output": "**Git status** output:\n\n- **Branch**: current branch name\n- **Modified (unstaged)**: files with `M` prefix\n- **Staged**: files ready to commit with `A`/`M` in index\n- **Untracked**: new files not yet tracked by git\n\nEach file is listed by relative path."
+  },
+  {
+    "id": "golden_006",
+    "name": "Web research task",
+    "prompt": "Search the web for the latest best practices in LLM evaluation for 2026",
+    "expected_agent": "researcher",
+    "expected_tools": [
+      "web_search",
+      "fetch_url"
+    ],
+    "expected_output_keywords": [
+      "evaluation",
+      "LLM",
+      "metric",
+      "benchmark"
+    ],
+    "expected_delegation_pattern": [
+      "researcher"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.65,
+      "completeness": 0.6,
+      "correctness": 0.7
+    },
+    "max_llm_calls": 8,
+    "max_tool_calls": 6,
+    "max_tokens": 30000,
+    "max_latency_ms": 60000,
+    "complexity": "medium",
+    "version": "3.0",
+    "reference_output": "**LLM Evaluation Best Practices (2026)**\n\n- **Multi-layer assessment**: rule-based checks → LLM-as-judge → human evaluation\n- **Domain-specific benchmarks**: task-specific test suites over generic leaderboards\n- **Trajectory evaluation**: score agent action sequences, not just final output\n- **Golden dataset regression**: automated regression with expected outputs and budget constraints\n- **Model-as-judge quality**: G-Eval style chain-of-thought criterion scoring\n- **Agentic metrics**: tool correctness, plan quality, plan adherence, task completion\n\n*Sources cited with URLs.*"
+  },
+  {
+    "id": "golden_007",
+    "name": "Code review with recommendations",
+    "prompt": "Review the file src/orchestrator.py for code quality, potential bugs, and suggest improvements",
+    "expected_agent": "reviewer",
+    "expected_tools": [
+      "read_file"
+    ],
+    "expected_output_keywords": [
+      "orchestrator",
+      "agent",
+      "graph",
+      "improvement",
+      "quality"
+    ],
+    "expected_delegation_pattern": [
+      "reviewer"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.5,
+      "completeness": 0.6,
+      "correctness": 0.65
+    },
+    "max_llm_calls": 10,
+    "max_tool_calls": 8,
+    "max_tokens": 100000,
+    "max_latency_ms": 150000,
+    "complexity": "medium",
+    "version": "3.1",
+    "reference_output": "**SUMMARY**: `src/orchestrator.py` — LangGraph multi-agent orchestrator using 4 strategies (router_decides, sequential, parallel, supervisor). Verdict: **PASS** with improvements suggested.\n\n**FINDINGS**:\n\n| # | Location | Issue | Severity |\n|---|----------|-------|----------|\n| 1 | `_make_agent_executor` | Output messages not normalised; may fail with non-BaseMessage types | warning |\n| 2 | `_build_router_prompt` | Default falls back to `agents_config[0]` — may not be optimal | info |\n| 3 | `execute()` | No retry logic for LLM call failures | warning |\n\n**VERIFIED**:\n- HITL tool wrapping applied consistently\n- Per-agent model selection works correctly\n- MemorySaver checkpointer injected properly\n\n**RECOMMENDATIONS**:\n1. Add output message normalisation in `_make_agent_executor`\n2. Add retry/fallback logic for transient LLM errors\n3. Cache compiled graphs to reduce startup latency"
+  },
+  {
+    "id": "golden_008",
+    "name": "Verify test results and review code",
+    "prompt": "Locate the MCP communication test file, review its structure, and assess whether the assertions are comprehensive enough",
+    "expected_agent": "planner",
+    "expected_tools": [
+      "create_plan",
+      "find_files",
+      "read_file",
+      "update_plan_step"
+    ],
+    "expected_output_keywords": [
+      "test",
+      "MCP",
+      "assertion",
+      "coverage"
+    ],
+    "expected_delegation_pattern": [
+      "planner"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.6,
+      "completeness": 0.55,
+      "correctness": 0.6
+    },
+    "max_llm_calls": 20,
+    "max_tool_calls": 12,
+    "max_tokens": 150000,
+    "max_latency_ms": 150000,
+    "complexity": "medium",
+    "version": "3.2",
+    "reference_output": "**Plan**: locate → read → assess `tests/test_mcp_communication.py`.\n\n**File**: `tests/test_mcp_communication.py`\n\n**Coverage**:\n- Filesystem MCP tools (read, write, list, search, find)\n- Shell MCP tools (run_command, run_script, run_tests)\n- Web MCP tools (web_search, fetch_url, check_url)\n- Cross-server scenarios\n\n**Assertion gaps**:\n- Missing edge cases for concurrent access\n- Incomplete error message validation\n- Limited coverage of timeout/long-running command scenarios"
+  },
+  {
+    "id": "golden_009",
+    "name": "Create and execute analysis plan",
+    "prompt": "Create a plan to analyze the MCP server implementations and identify common patterns across all 5 servers",
+    "expected_agent": "planner",
+    "expected_tools": [
+      "create_plan",
+      "list_directory",
+      "read_file",
+      "update_plan_step"
+    ],
+    "expected_output_keywords": [
+      "MCP",
+      "server",
+      "pattern",
+      "tool",
+      "common"
+    ],
+    "expected_delegation_pattern": [
+      "planner"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.75,
+      "completeness": 0.7,
+      "correctness": 0.75
+    },
+    "max_llm_calls": 25,
+    "max_tool_calls": 20,
+    "max_tokens": 300000,
+    "max_latency_ms": 120000,
+    "complexity": "medium",
+    "version": "3.0",
+    "reference_output": "**Common patterns across all 5 MCP servers** (`filesystem`, `shell`, `git`, `web`, `memory`):\n\n| Pattern | Detail |\n|---------|--------|\n| Server init | `mcp.server.Server` with server name |\n| Tool registration | `@server.list_tools()` decorator |\n| Tool execution | `@server.call_tool()` handler |\n| State tracking | Dataclass-based state object |\n| Path safety | `_safe_path()` or equivalent sandboxing |\n| Return type | `TextContent` with string `text` field |"
+  },
+  {
+    "id": "golden_010",
+    "name": "Review git changes and validate quality",
+    "prompt": "Check recent git commits, review the diff of the latest changes, and assess whether the changes follow coding best practices",
+    "expected_agent": "reviewer",
+    "expected_tools": [
+      "git_log",
+      "git_diff"
+    ],
+    "expected_output_keywords": [
+      "commit",
+      "diff",
+      "change",
+      "review",
+      "quality"
+    ],
+    "expected_delegation_pattern": [
+      "reviewer"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.6,
+      "completeness": 0.55,
+      "correctness": 0.6
+    },
+    "max_llm_calls": 12,
+    "max_tool_calls": 8,
+    "max_tokens": 100000,
+    "max_latency_ms": 60000,
+    "complexity": "medium",
+    "version": "3.1",
+    "reference_output": "**SUMMARY**: Recent git commits reviewed via `git_log` and `git_diff`. Verdict: **PASS** / **NEEDS WORK** (based on findings).\n\n**Latest commit**: `<hash>` — `<message>`\n\n**ASSESSMENT**:\n\n| Criterion | Status |\n|-----------|--------|\n| Commit message clarity | ✅ / ⚠️ |\n| Modular, isolated changes | ✅ / ⚠️ |\n| Documentation updated | ✅ / ⚠️ |\n| No security issues introduced | ✅ / ⚠️ |\n\n**FINDINGS**: Specific `file:line` references with severity ratings (critical / warning / info) for any issues.\n\n**RECOMMENDATIONS**: Up to 3 actionable next steps."
+  },
+  {
+    "id": "golden_011",
+    "name": "Run command and analyze output",
+    "prompt": "Run 'python -m pytest tests/test_mcp_communication.py -v --tb=short' and explain which tests pass and which fail, and why",
+    "expected_agent": "coder",
+    "expected_tools": [
+      "run_command"
+    ],
+    "expected_output_keywords": [
+      "test",
+      "pass",
+      "fail",
+      "MCP",
+      "result"
+    ],
+    "expected_delegation_pattern": [
+      "coder"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.6,
+      "completeness": 0.65,
+      "correctness": 0.75
+    },
+    "max_llm_calls": 8,
+    "max_tool_calls": 5,
+    "max_tokens": 40000,
+    "max_latency_ms": 120000,
+    "complexity": "quick",
+    "version": "3.0",
+    "reference_output": "**Command**: `python -m pytest tests/test_mcp_communication.py -v --tb=short`\n\n**Results**:\n- Individual pass/fail status listed per test function\n- Coverage: filesystem, shell, web, and cross-server MCP tests\n- **Exit code**: `0` (all pass) or non-zero (failures)\n\nFor each failure:\n- Test name and assertion that failed\n- Short traceback (`--tb=short`)\n- Brief root-cause explanation"
+  },
+  {
+    "id": "golden_012",
+    "name": "Debug failing test scenario",
+    "prompt": "Read the test files in tests/, run the tests, and if any fail, read the relevant source code to understand why",
+    "expected_agent": "planner",
+    "expected_tools": [
+      "list_directory",
+      "read_file",
+      "run_tests"
+    ],
+    "expected_output_keywords": [
+      "test",
+      "result",
+      "source",
+      "cause"
+    ],
+    "expected_delegation_pattern": [
+      "planner"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.7,
+      "completeness": 0.6,
+      "correctness": 0.7
+    },
+    "max_llm_calls": 25,
+    "max_tool_calls": 20,
+    "max_tokens": 300000,
+    "max_latency_ms": 180000,
+    "complexity": "complex",
+    "version": "3.0",
+    "reference_output": "**Plan**: discover → run → debug.\n\n1. **Test discovery**: `tests/` contains `test_mcp_communication.py` and `test_evaluation.py`\n2. **Test execution**: pytest run with pass/fail counts\n3. **Failure analysis**: for each failing test, source code read and root cause identified\n\n**Outcome**:\n- All passing tests listed\n- Failing tests listed with root cause (e.g. missing mock, import error, logic bug)"
+  },
+  {
+    "id": "golden_013",
+    "name": "Full architecture audit",
+    "prompt": "Perform a comprehensive audit of the SDLC agent architecture. List all MCP servers, review the orchestrator strategy, check the evaluation pipeline, and provide recommendations for improvement.",
+    "expected_agent": "planner",
+    "expected_tools": [
+      "create_plan",
+      "list_directory",
+      "read_file",
+      "update_plan_step",
+      "memory_store"
+    ],
+    "expected_output_keywords": [
+      "orchestrator",
+      "MCP",
+      "evaluation",
+      "agent",
+      "recommendation"
+    ],
+    "expected_delegation_pattern": [
+      "planner"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.7,
+      "completeness": 0.6,
+      "correctness": 0.7
+    },
+    "max_llm_calls": 30,
+    "max_tool_calls": 25,
+    "max_tokens": 500000,
+    "max_latency_ms": 300000,
+    "complexity": "complex",
+    "version": "3.0",
+    "reference_output": "**SDLC Agent Architecture Audit**\n\n**MCP Servers (5)**:\n- `filesystem_server.py` — 6 tools (read, write, edit, search, find, list)\n- `shell_server.py` — 3 tools (command, script, tests)\n- `git_server.py` — 6 tools (status, diff, log, commit, branch, show)\n- `web_server.py` — 3 tools (fetch, search, check)\n- `memory_server.py` — 6 tools (store, retrieve, list, delete, plan, update)\n\n**Orchestrator**: LangGraph with 4 strategies — router_decides, sequential, parallel, supervisor. MemorySaver checkpointer for HITL.\n\n**Agents (5)**: Coder (ReAct), Runner (ReAct), Researcher (ReAct), Planner (Plan+Execute), Reviewer (Reflexion).\n\n**Evaluation Pipeline (3 layers)**:\n1. Rule-based (7 metrics) — deterministic, zero LLM cost\n2. G-Eval (5 criteria) — LLM-as-judge with chain-of-thought\n3. DeepEval (8 agentic metrics) — tool correctness, plan quality, task completion\n\n**Recommendations**:\n1. Add retry/fallback logic for transient LLM failures\n2. Improve context management to reduce token usage per task\n3. Cache compiled LangGraph graphs to reduce startup latency"
+  },
+  {
+    "id": "golden_014",
+    "name": "Security review of MCP servers",
+    "prompt": "Review the MCP server implementations in src/mcp_servers/ for security vulnerabilities — check path traversal, command injection, and input validation",
+    "expected_agent": "reviewer",
+    "expected_tools": [
+      "list_directory",
+      "read_file",
+      "search_files"
+    ],
+    "expected_output_keywords": [
+      "security",
+      "path",
+      "traversal",
+      "injection",
+      "validation"
+    ],
+    "expected_delegation_pattern": [
+      "reviewer"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.65,
+      "completeness": 0.6,
+      "correctness": 0.7
+    },
+    "max_llm_calls": 15,
+    "max_tool_calls": 10,
+    "max_tokens": 150000,
+    "max_latency_ms": 120000,
+    "complexity": "complex",
+    "version": "3.0",
+    "reference_output": "**SUMMARY**: Security review of `src/mcp_servers/`. Verdict: **NEEDS WORK**.\n\n**FINDINGS**:\n\n| File | Finding | Severity |\n|------|---------|----------|\n| `filesystem_server.py` | `_safe_path()` prevents directory traversal ✅ | pass |\n| `shell_server.py` | `BLOCKED_COMMANDS` allowlist in place ✅ | pass |\n| `web_server.py` | No URL validation — SSRF risk ⚠️ | warning |\n| All servers | Incomplete input sanitization | warning |\n\n**VERIFIED**: Path traversal protection in `filesystem_server.py` is functional.\n\n**RECOMMENDATIONS**:\n1. Add URL allowlisting/validation to `web_server.py` to prevent SSRF\n2. Add input sanitization to all tool argument handlers\n3. Implement rate limiting to prevent tool abuse"
+  },
+  {
+    "id": "golden_015",
+    "name": "GitHub repo management: list repos and get repo info",
+    "prompt": "List my GitHub repositories and get the details of the sdlc-agent-integration-test repo",
+    "expected_agent": "coder",
+    "expected_tools": [
+      "github_list_repos",
+      "github_get_repo"
+    ],
+    "expected_output_keywords": [
+      "tiffanychum",
+      "sdlc-agent-integration-test",
+      "github.com",
+      "private",
+      "main"
+    ],
+    "expected_delegation_pattern": [
+      "coder"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.75,
+      "completeness": 0.7,
+      "correctness": 0.8
+    },
+    "max_llm_calls": 5,
+    "max_tool_calls": 4,
+    "max_tokens": 10000,
+    "max_latency_ms": 30000,
+    "complexity": "quick",
+    "version": "3.0",
+    "reference_output": "Listed GitHub repositories for **tiffanychum**. Repository details for `sdlc-agent-integration-test`:\n- **URL**: https://github.com/tiffanychum/sdlc-agent-integration-test\n- **Visibility**: private\n- **Default branch**: main\n- **Clone URL**: https://github.com/tiffanychum/sdlc-agent-integration-test.git\n- **Open PRs**: 1 (feature/test-integration → main)"
+  },
+  {
+    "id": "golden_016",
+    "name": "List open PRs in GitHub repo",
+    "prompt": "List all open pull requests in the tiffanychum/sdlc-agent-integration-test GitHub repository",
+    "expected_agent": "coder",
+    "expected_tools": [
+      "github_list_prs"
+    ],
+    "expected_output_keywords": [
+      "PR",
+      "pull request",
+      "feature/test-integration",
+      "main",
+      "open"
+    ],
+    "expected_delegation_pattern": [
+      "coder"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.7,
+      "completeness": 0.7,
+      "correctness": 0.8
+    },
+    "max_llm_calls": 5,
+    "max_tool_calls": 3,
+    "max_tokens": 10000,
+    "max_latency_ms": 30000,
+    "complexity": "quick",
+    "version": "3.0",
+    "reference_output": "**Open Pull Requests** in `tiffanychum/sdlc-agent-integration-test`:\n\n- **PR #1**: feat: add test feature via SDLC Agent\n  - `feature/test-integration` → `main`\n  - URL: https://github.com/tiffanychum/sdlc-agent-integration-test/pull/1\n  - State: open"
+  },
+  {
+    "id": "golden_019",
+    "name": "Jira: create Workstream with Task and assign to developer",
+    "prompt": "In the existing SDLC Jira project, please create: 1) A Workstream (Epic) called 'Feature: User Authentication', 2) A Task under it called 'Implement JWT login endpoint' assigned to Tiffany Chum. Use project key SDLC.",
+    "expected_agent": "project_manager",
+    "expected_tools": [
+      "jira_get_project",
+      "jira_list_issue_types",
+      "jira_list_assignable_users",
+      "jira_create_issue"
+    ],
+    "expected_output_keywords": [
+      "SDLC",
+      "Workstream",
+      "Task",
+      "Tiffany",
+      "atlassian.net",
+      "Feature: User Authentication",
+      "JWT"
+    ],
+    "expected_delegation_pattern": [
+      "project_manager"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.55,
+      "completeness": 0.5,
+      "correctness": 0.55
+    },
+    "max_llm_calls": 40,
+    "max_tool_calls": 38,
+    "max_tokens": 160000,
+    "max_latency_ms": 360000,
+    "complexity": "complex",
+    "version": "3.0",
+    "reference_output": "Created the following Jira tickets in project SDLC:\n\n| Key | Type | Summary | Assignee | URL |\n|-----|------|---------|----------|-----|\n| SDLC-X | Workstream | Feature: User Authentication | Unassigned | https://makszelai.atlassian.net/browse/SDLC-X |\n| SDLC-Y | Task | Implement JWT login endpoint | Tiffany Chum | https://makszelai.atlassian.net/browse/SDLC-Y |\n\nAll tickets are visible in your Jira board at https://makszelai.atlassian.net/browse/SDLC."
+  },
+  {
+    "id": "golden_021",
+    "name": "End-to-end SDLC: fetch Jira task → implement → test → create PR (multi-agent)",
+    "prompt": "Fetch Jira task SDLC-11 from the SDLC project, implement what it asks — write both files to the tests/ subdirectory — run the tests locally to verify they pass, then push the code to a new branch 'feature/discount-util' in tiffanychum/sdlc-agent-integration-test and open a PR titled 'feat: implement discount_utils per SDLC-11'. Do a single pre-flight check with me before starting.",
+    "expected_agent": "coder",
+    "expected_tools": [],
+    "expected_output_keywords": [
+      "SDLC-11",
+      "discount",
+      "feature/discount-util",
+      "PR"
+    ],
+    "expected_delegation_pattern": [],
+    "quality_thresholds": {
+      "semantic_similarity": 0.5,
+      "completeness": 0.5,
+      "correctness": 0.5
+    },
+    "max_llm_calls": 120,
+    "max_tool_calls": 120,
+    "max_tokens": 800000,
+    "max_latency_ms": 900000,
+    "complexity": "complex",
+    "version": "4.4",
+    "reference_output": "Fetched Jira task SDLC-11 (Implement discount_utils.py with pytest coverage). Multi-agent workflow executed:\n\n**Coder** implemented:\n- `discount_utils.py` — `calculate_discount(price, discount_pct)` with ValueError guard\n\n**Tester** wrote and ran tests:\n- `tests/test_discount.py` — 4 pytest tests (normal, zero, full, invalid)\n- Test results: 4 passed in <1s ✅\n\n**DevOps** pushed to GitHub:\n- Branch: `feature/discount-util` created from `main`\n- Files pushed: `discount_utils.py`, `tests/test_discount.py`\n- PR: [feat: implement discount_utils per SDLC-11](https://github.com/tiffanychum/sdlc-agent-integration-test/pull/X)\n  - `feature/discount-util` → `main` | State: open",
+    "hitl_responses": {
+      "pre-flight": "Approved. SDLC-11 is confirmed in the SDLC Jira project. Python 3.11 + pytest. GitHub write access to tiffanychum/sdlc-agent-integration-test confirmed. Write both files (discount_utils.py and test_discount.py) to the tests/ subdirectory. Branch: feature/discount-util. PR title: feat: implement discount_utils per SDLC-11.",
+      "sdlc-11": "SDLC-11: Implement discount_utils.py with a calculate_discount(price, discount_pct) function plus pytest coverage in tests/test_discount.py.",
+      "which": "Use SDLC-11 from the SDLC Jira project.",
+      "epic": "Use SDLC-11 from the SDLC Jira project.",
+      "story": "Use SDLC-11 from the SDLC Jira project.",
+      "decompose": "Use SDLC-11 — implement discount_utils.py and tests/test_discount.py.",
+      "confirm": "Approved, proceed exactly as planned.",
+      "clarif": "SDLC-11, tests/ directory, branch feature/discount-util, PR title feat: implement discount_utils per SDLC-11.",
+      "branch": "feature/discount-util in tiffanychum/sdlc-agent-integration-test.",
+      "repository": "tiffanychum/sdlc-agent-integration-test"
+    }
+  },
+  {
+    "id": "golden_020",
+    "name": "GitHub: create test.py and open PR in integration-test repo",
+    "prompt": "In the GitHub repository tiffanychum/sdlc-agent-integration-test, please: 1) Create a branch called 'feature/add-pytest' from main, 2) Create a file test.py with a simple pytest test suite (at least 2 test functions), 3) Open a pull request from feature/add-pytest into main with title 'test: add pytest test cases via SDLC Agent'. Do a pre-flight check with me before acting.",
+    "expected_agent": "devops",
+    "expected_tools": [
+      "github_create_branch",
+      "github_create_file",
+      "github_create_pr"
+    ],
+    "expected_output_keywords": [
+      "feature/add-pytest",
+      "test.py",
+      "pull request",
+      "PR",
+      "tiffanychum",
+      "pytest",
+      "main"
+    ],
+    "expected_delegation_pattern": [
+      "devops"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.6,
+      "completeness": 0.55,
+      "correctness": 0.65
+    },
+    "max_llm_calls": 24,
+    "max_tool_calls": 18,
+    "max_tokens": 45000,
+    "max_latency_ms": 150000,
+    "complexity": "moderate",
+    "version": "4.0",
+    "reference_output": "Done. Created test.py in the `feature/add-pytest` branch of tiffanychum/sdlc-agent-integration-test and opened a PR:\n\n- **Branch**: `feature/add-pytest` (branched from `main`)\n- **File**: `test.py` — pytest test suite with 2+ test functions\n- **PR**: [test: add pytest test cases via SDLC Agent](https://github.com/tiffanychum/sdlc-agent-integration-test/pull/X)\n  - `feature/add-pytest` → `main`\n  - State: open"
+  },
+  {
+    "id": "golden_017",
+    "name": "Jira: list SDLC project and available issue types",
+    "prompt": "Show me the SDLC Jira project and what issue types are available",
+    "expected_agent": "project_manager",
+    "expected_tools": [
+      "jira_get_project",
+      "jira_list_issue_types"
+    ],
+    "expected_output_keywords": [
+      "SDLC",
+      "sdlc_agent",
+      "Workstream",
+      "Task",
+      "atlassian.net"
+    ],
+    "expected_delegation_pattern": [
+      "project_manager"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.65,
+      "completeness": 0.6,
+      "correctness": 0.7
+    },
+    "max_llm_calls": 8,
+    "max_tool_calls": 5,
+    "max_tokens": 15000,
+    "max_latency_ms": 60000,
+    "complexity": "moderate",
+    "version": "3.0",
+    "reference_output": "**SDLC Jira Project** (`sdlc_agent`):\n- URL: https://makszelai.atlassian.net/browse/SDLC\n- Type: business\n\n**Available Issue Types:**\n- Workstream (Epic-equivalent)\n- Task\n- Sub-task\n\n**Assignable Users:**\n- Tiffany Chum (makszelai@gmail.com)"
+  },
+  {
+    "id": "golden_018",
+    "name": "Jira: list assignable users in SDLC project",
+    "prompt": "Who can be assigned tasks in the SDLC Jira project?",
+    "expected_agent": "project_manager",
+    "expected_tools": [
+      "jira_list_assignable_users"
+    ],
+    "expected_output_keywords": [
+      "Tiffany",
+      "makszelai@gmail.com",
+      "SDLC",
+      "Account ID"
+    ],
+    "expected_delegation_pattern": [
+      "project_manager"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.65,
+      "completeness": 0.6,
+      "correctness": 0.7
+    },
+    "max_llm_calls": 6,
+    "max_tool_calls": 3,
+    "max_tokens": 10000,
+    "max_latency_ms": 40000,
+    "complexity": "quick",
+    "version": "3.0",
+    "reference_output": "Assignable users for the **SDLC** Jira project:\n\n| Name | Email | Account ID |\n|------|-------|------------|\n| Tiffany Chum | makszelai@gmail.com | 712020:b60dd681-34ae-421a-b91d-2fc6684b8d6c |"
+  },
+  {
+    "id": "golden_022",
+    "name": "Multi-agent: implement → test → commit (3-agent chain)",
+    "prompt": "Implement a utility function called validate_email() in utils/validate.py that returns True for valid email addresses and False for invalid ones using a regex pattern. Then write pytest tests for it in tests/test_validate.py covering at least: valid email, missing @, missing domain, empty string. Finally, commit both files to git with a conventional commit message.",
+    "expected_agent": "coder",
+    "expected_tools": [
+      "write_file",
+      "git_status",
+      "git_commit"
+    ],
+    "expected_output_keywords": [
+      "validate_email",
+      "utils/validate.py",
+      "tests/test_validate.py",
+      "pytest",
+      "passed",
+      "feat:",
+      "committed"
+    ],
+    "expected_delegation_pattern": [
+      "coder",
+      "devops"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.6,
+      "completeness": 0.6,
+      "correctness": 0.65
+    },
+    "max_llm_calls": 35,
+    "max_tool_calls": 30,
+    "max_tokens": 110000,
+    "max_latency_ms": 300000,
+    "complexity": "complex",
+    "version": "4.1",
+    "reference_output": "Multi-agent workflow completed:\n\n**Coder** implemented `utils/validate.py` and wrote + ran unit tests:\n```python\nimport re\nEMAIL_RE = re.compile(r'^[\\w.+-]+@[\\w-]+\\.[\\w.]+$')\ndef validate_email(email: str) -> bool:\n    return bool(EMAIL_RE.match(email))\n```\n`tests/test_validate.py`: 4 test functions (valid email, missing @, missing domain, empty string) — Results: 4 passed ✅\n\n**DevOps** committed:\n- `git commit -m 'feat: add validate_email() utility with pytest coverage'`\n- Staged: utils/validate.py, tests/test_validate.py"
+  },
+  {
+    "id": "golden_023",
+    "name": "Multi-agent: research → implement (2-agent chain)",
+    "prompt": "Search for the correct regex pattern to validate ISO 8601 date strings (format: YYYY-MM-DD), then implement a parse_date() function in utils/dates.py that uses that pattern — it should return a datetime object for valid strings and raise ValueError for invalid ones.",
+    "expected_agent": "researcher",
+    "expected_tools": [],
+    "expected_output_keywords": [
+      "ISO 8601",
+      "YYYY-MM-DD",
+      "parse_date",
+      "utils/dates.py",
+      "datetime",
+      "ValueError",
+      "regex"
+    ],
+    "expected_delegation_pattern": [
+      "researcher",
+      "coder"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.6,
+      "completeness": 0.6,
+      "correctness": 0.65
+    },
+    "max_llm_calls": 40,
+    "max_tool_calls": 30,
+    "max_tokens": 120000,
+    "max_latency_ms": 200000,
+    "complexity": "medium",
+    "version": "4.1",
+    "reference_output": "**Researcher** found: ISO 8601 date regex: `^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$` (source: ISO standard documentation)\n\n**Coder** implemented `utils/dates.py`:\n```python\nimport re\nfrom datetime import datetime\n\nDATE_RE = re.compile(r'^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$')\n\ndef parse_date(date_str: str) -> datetime:\n    if not DATE_RE.match(date_str):\n        raise ValueError(f'Invalid ISO 8601 date: {date_str}')\n    return datetime.strptime(date_str, '%Y-%m-%d')\n```"
+  },
+  {
+    "id": "golden_024",
+    "name": "Multi-agent: review code → run tests (2-agent chain)",
+    "prompt": "Review src/orchestrator.py for code quality issues — focus on error handling, performance, and maintainability. After the review, run the existing unit test suite (tests/test_orchestrator.py) to confirm the current passing state and report any failures.",
+    "expected_agent": "reviewer",
+    "expected_tools": [
+      "read_file",
+      "run_tests"
+    ],
+    "expected_output_keywords": [
+      "orchestrator",
+      "review",
+      "findings",
+      "pytest",
+      "passed",
+      "test_orchestrator"
+    ],
+    "expected_delegation_pattern": [
+      "reviewer",
+      "coder"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.55,
+      "completeness": 0.55,
+      "correctness": 0.6
+    },
+    "max_llm_calls": 40,
+    "max_tool_calls": 35,
+    "max_tokens": 200000,
+    "max_latency_ms": 300000,
+    "complexity": "medium",
+    "version": "4.2",
+    "reference_output": "**Reviewer** assessed `src/orchestrator.py`:\n\nSUMMARY: Code is well-structured with clean dispatch table patterns. Two warnings found.\n\nFINDINGS:\n- WARNING: N+1 query pattern in agent-loading loop (line ~167) — use single JOIN query\n- INFO: `strategy_hint` guard is redundant — `_strategy_instruction()` never returns empty string\n\nVERIFIED: HITL wrap uses `elif` correctly; supervisor has max_iterations guard; routing rules are clear.\n\nRECOMMENDATIONS:\n1. Replace per-agent `session.query(AgentToolMapping)` loop with a single bulk query\n\n**Coder** ran `tests/test_orchestrator.py`:\n- Results: X passed, 0 failed ✅\n- All orchestrator unit tests passing."
+  },
+  {
+    "id": "golden_025",
+    "name": "Multi-agent: full SDLC — implement → test → review → push PR (4-agent chain)",
+    "prompt": "Implement a simple retry() decorator in utils/retry.py that retries a function up to N times on exception with optional delay. Write pytest tests for it in tests/test_retry.py. Review the code for quality issues. Then push both files to a new branch 'feature/retry-util' in tiffanychum/sdlc-agent-integration-test and open a PR titled 'feat: add retry() decorator utility'.",
+    "expected_agent": "coder",
+    "expected_tools": [],
+    "expected_output_keywords": [
+      "retry",
+      "utils/retry.py",
+      "tests/test_retry.py",
+      "feature/retry-util",
+      "PR"
+    ],
+    "expected_delegation_pattern": [],
+    "quality_thresholds": {
+      "semantic_similarity": 0.5,
+      "completeness": 0.5,
+      "correctness": 0.5
+    },
+    "max_llm_calls": 80,
+    "max_tool_calls": 120,
+    "max_tokens": 500000,
+    "max_latency_ms": 900000,
+    "complexity": "complex",
+    "version": "4.2",
+    "reference_output": "Full SDLC multi-agent workflow completed:\n\n**Coder** implemented `utils/retry.py` and wrote + ran unit tests:\n```python\nimport time, functools\ndef retry(max_attempts=3, delay=0.0, exceptions=(Exception,)):\n    def decorator(fn):\n        @functools.wraps(fn)\n        def wrapper(*args, **kwargs):\n            for attempt in range(1, max_attempts + 1):\n                try:\n                    return fn(*args, **kwargs)\n                except exceptions as e:\n                    if attempt == max_attempts:\n                        raise\n                    time.sleep(delay)\n        return wrapper\n    return decorator\n```\n`tests/test_retry.py`: 5 test functions — Results: 5 passed ✅\n\n**Reviewer** assessed: Code is clean. One INFO: consider adding type hints.\n\n**DevOps** pushed to GitHub:\n- Branch: `feature/retry-util` (from `main`)\n- Files: `utils/retry.py`, `tests/test_retry.py`\n- PR: [feat: add retry() decorator utility](https://github.com/tiffanychum/sdlc-agent-integration-test/pull/X) | State: open"
+  },
+  {
+    "id": "golden_026",
+    "name": "Auto strategy → router_decides (single-agent read task)",
+    "prompt": "Read the README.md file and give me a 2-sentence summary of what this project does.",
+    "strategy": "auto",
+    "expected_strategy": "router_decides",
+    "expected_agent": "coder",
+    "expected_tools": [
+      "read_file"
+    ],
+    "expected_output_keywords": [
+      "agent",
+      "sdlc",
+      "workflow",
+      "README"
+    ],
+    "expected_delegation_pattern": [
+      "coder"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.6,
+      "completeness": 0.65,
+      "correctness": 0.7
+    },
+    "max_llm_calls": 10,
+    "max_tool_calls": 5,
+    "max_tokens": 15000,
+    "max_latency_ms": 60000,
+    "complexity": "quick",
+    "version": "4.0",
+    "reference_output": "This project is an SDLC (Software Development Lifecycle) agent system that orchestrates multiple specialized AI agents to assist with coding, testing, deployment, and project management tasks. It combines LangGraph-based multi-agent workflows with evaluation pipelines to automate and track software development activities."
+  },
+  {
+    "id": "golden_027",
+    "name": "Auto strategy → supervisor (adaptive multi-agent: implement + test)",
+    "prompt": "Write a simple fibonacci() function in utils/fib.py that returns the nth Fibonacci number, then write 3 pytest tests for it in tests/test_fib.py covering: fib(0)=0, fib(1)=1, and fib(10)=55.",
+    "strategy": "auto",
+    "expected_strategy": "supervisor",
+    "expected_agent": "coder",
+    "expected_tools": [],
+    "expected_output_keywords": [
+      "fibonacci",
+      "utils/fib.py",
+      "tests/test_fib.py",
+      "pytest",
+      "passed"
+    ],
+    "expected_delegation_pattern": [
+      "coder"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.6,
+      "completeness": 0.65,
+      "correctness": 0.65
+    },
+    "max_llm_calls": 35,
+    "max_tool_calls": 25,
+    "max_tokens": 60000,
+    "max_latency_ms": 300000,
+    "complexity": "medium",
+    "version": "4.1",
+    "reference_output": "**Coder** implemented `utils/fib.py`:\n```python\ndef fibonacci(n: int) -> int:\n    if n <= 0: return 0\n    if n == 1: return 1\n    return fibonacci(n-1) + fibonacci(n-2)\n```\n\n**Tester** wrote and ran `tests/test_fib.py`:\n- test_fib_zero: fib(0) == 0 ✅\n- test_fib_one: fib(1) == 1 ✅\n- test_fib_ten: fib(10) == 55 ✅\n- Results: 3 passed"
+  },
+  {
+    "id": "golden_028",
+    "name": "Auto strategy → sequential (review then write report in order)",
+    "prompt": "First review src/orchestrator.py for the top 3 maintainability issues. Then, based strictly on those findings, write a file called docs/ORCHESTRATOR_REVIEW.md that documents each issue with a title, description, and suggested fix.",
+    "strategy": "auto",
+    "expected_strategy": "supervisor",
+    "expected_agent": "reviewer",
+    "expected_tools": [
+      "read_file",
+      "write_file"
+    ],
+    "expected_output_keywords": [
+      "orchestrator",
+      "review",
+      "maintainability",
+      "docs/ORCHESTRATOR_REVIEW.md",
+      "fix"
+    ],
+    "expected_delegation_pattern": [
+      "reviewer"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.3,
+      "completeness": 0.6,
+      "correctness": 0.6
+    },
+    "max_llm_calls": 30,
+    "max_tool_calls": 20,
+    "max_tokens": 70000,
+    "max_latency_ms": 240000,
+    "complexity": "medium",
+    "version": "4.0",
+    "reference_output": "**Reviewer** assessed `src/orchestrator.py` and identified top 3 maintainability issues, then wrote `docs/ORCHESTRATOR_REVIEW.md`:\n\n## Issue 1: <title>\n**Description**: ...\n**Fix**: ...\n\n## Issue 2: <title>\n**Description**: ...\n**Fix**: ...\n\n## Issue 3: <title>\n**Description**: ...\n**Fix**: ..."
+  },
+  {
+    "id": "golden_029",
+    "name": "Auto strategy → parallel (independent web search + filesystem tasks simultaneously)",
+    "prompt": "Simultaneously do two completely independent things: (1) Search the web for the top 3 Python async programming best practices in 2026, and (2) List all Python files in the src/ directory and count how many there are. Then combine both results into a single report.",
+    "strategy": "auto",
+    "expected_strategy": "parallel",
+    "expected_agent": "researcher",
+    "expected_tools": [
+      "web_search",
+      "list_directory"
+    ],
+    "expected_output_keywords": [
+      "async",
+      "Python",
+      "best practices",
+      "src/",
+      ".py",
+      "files",
+      "2026"
+    ],
+    "expected_delegation_pattern": [
+      "researcher",
+      "coder"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.25,
+      "completeness": 0.2,
+      "correctness": 0.2
+    },
+    "max_llm_calls": 60,
+    "max_tool_calls": 50,
+    "max_tokens": 150000,
+    "max_latency_ms": 300000,
+    "complexity": "medium",
+    "version": "4.0",
+    "reference_output": "## Combined Report\n\n### Python Async Best Practices 2026\n1. Use `asyncio.TaskGroup` (Python 3.11+) for structured concurrency instead of `asyncio.gather`\n2. Prefer `async with` context managers for resource management over manual cleanup\n3. Avoid blocking calls in async functions — use `asyncio.to_thread()` for CPU-bound work\n\n### Python Files in src/\n- Total: ~15 .py files across src/ subdirectories\n- Key modules: orchestrator.py, server.py, agents/prompts.py, db/database.py, evaluation/regression.py"
+  },
+  {
+    "id": "golden_030",
+    "name": "Full SDLC E2E: fullstack Task Manager (plan → Jira → code → test → GitHub HITL)",
+    "prompt": "Build a simple 'Task Manager' web app as a brand-new project. Place ALL project files in /tmp/sdlc-task-manager/ (completely outside the current sdlc-agent directory). Complete every step below in order:\n\n1. PLAN: Use the planner to create a step-by-step plan for building this app. Wait for the plan to be reviewed before proceeding.\n\n2. JIRA: In the 'SDLC' Jira project, create:\n   - One Epic titled 'Task Manager MVP'\n   - One Story titled 'Backend API' (child of the Epic)\n   - One Story titled 'Frontend UI' (child of the Epic)\n\n3. CODE (in /tmp/sdlc-task-manager/):\n   a) main.py — FastAPI app with in-memory list storage and these endpoints:\n      - GET  /tasks         → return all tasks as JSON [{\"id\": int, \"title\": str}]\n      - POST /tasks         → body {\"title\": str}, create task, return the new task\n      - DELETE /tasks/{id}  → remove task by id, return {\"deleted\": id}\n   b) index.html — single-page HTML (no build step): an <h1>, a text input + Add button (calls POST /tasks via fetch), and a <ul> that lists tasks with a Delete button per item (calls DELETE via fetch). Include a fetchTasks() function that refreshes the list on load and after every mutation.\n   c) requirements.txt — exactly: fastapi, uvicorn[standard], httpx, pytest, pytest-asyncio, starlette\n   d) tests/test_main.py — three pytest tests using starlette.testclient.TestClient:\n      - test_list_tasks_empty: GET /tasks returns []\n      - test_create_task: POST /tasks returns the new task with an id field\n      - test_delete_task: POST then DELETE, confirm deletion\n\n4. TEST: Run `pip install -r /tmp/sdlc-task-manager/requirements.txt` then run `cd /tmp/sdlc-task-manager && python -m pytest tests/ -v` and report the pytest output.\n\n5. SHOW HTML: Read the file /tmp/sdlc-task-manager/index.html and display its COMPLETE contents inside a markdown code block in this response.\n\n6. GITHUB: \n   a) Create a new GitHub repository called 'sdlc-task-manager' (public, with description 'Task Manager app built by SDLC Agent').\n   b) Initialize a git repo, commit all files, add the GitHub remote, and push to main: run `cd /tmp/sdlc-task-manager && git init && git add . && git commit -m 'feat: initial Task Manager app' && git branch -M main && git remote add origin https://tiffanychum:${GITHUB_TOKEN}@github.com/tiffanychum/sdlc-task-manager.git && git push -u origin main`\n\nReport the Jira ticket keys created, pytest result summary, and the GitHub repo URL.",
+    "strategy": "auto",
+    "expected_strategy": "supervisor",
+    "expected_agent": "devops",
+    "expected_tools": [
+      "create_plan",
+      "jira_create_issue",
+      "write_file",
+      "run_command",
+      "read_file",
+      "github_create_repo"
+    ],
+    "expected_output_keywords": [
+      "Task Manager",
+      "/tmp/sdlc-task-manager",
+      "FastAPI",
+      "index.html",
+      "SDLC",
+      "passed",
+      "sdlc-task-manager",
+      "github.com"
+    ],
+    "expected_delegation_pattern": [
+      "planner",
+      "coder",
+      "devops"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.2,
+      "completeness": 0.45,
+      "correctness": 0.45
+    },
+    "max_llm_calls": 100,
+    "max_tool_calls": 70,
+    "max_tokens": 320000,
+    "max_latency_ms": 900000,
+    "complexity": "e2e",
+    "version": "1.1",
+    "reference_output": "## Task Manager App — Build Complete\n\n### Jira Tickets Created\n- SDLC-XX: Epic — Task Manager MVP\n- SDLC-XY: Story — Backend API\n- SDLC-XZ: Story — Frontend UI\n\n### Files Created (/tmp/sdlc-task-manager/)\n- main.py — FastAPI with GET /tasks, POST /tasks, DELETE /tasks/{id}\n- index.html — Single-page HTML with fetch()-based CRUD UI\n- requirements.txt\n- tests/test_main.py — 3 pytest tests\n\n### Test Results\n```\ntests/test_main.py::test_list_tasks_empty PASSED\ntests/test_main.py::test_create_task PASSED\ntests/test_main.py::test_delete_task PASSED\n3 passed\n```\n\n### index.html\n```html\n<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"UTF-8\"><title>Task Manager</title></head>\n<body>\n<h1>Task Manager</h1>\n<input id=\"title\" placeholder=\"New task...\">\n<button onclick=\"addTask()\">Add</button>\n<ul id=\"tasks\"></ul>\n<script>\nasync function fetchTasks(){...}\nasync function addTask(){...}\nasync function deleteTask(id){...}\nfetchTasks();\n</script>\n</body>\n</html>\n```\n\n### GitHub\nRepository created: https://github.com/tiffanychum/sdlc-task-manager\nAll files committed and pushed to main branch."
+  },
+  {
+    "id": "golden_031",
+    "name": "RAG: Performance KB — agentic faithfulness regression + latency diagnosis",
+    "prompt": "Our last regression run for golden_025 showed DeepEval faithfulness scoring 2.1/5 (below threshold 3.5) and the coder agent's average P99 latency jumped from 22s to 45s. Use the performance knowledge base to: (1) diagnose what likely caused the faithfulness regression for a coder agent, (2) identify the most probable latency drivers for a coder agent at 45s P99, (3) list the specific tool call patterns to look for in the trace that confirm your diagnosis, and (4) recommend concrete fixes to bring both metrics back to baseline. Do NOT use web search — the playbooks in the knowledge base are sufficient.",
+    "strategy": "router_decides",
+    "expected_strategy": "router_decides",
+    "expected_agent": "researcher",
+    "expected_tools": [
+      "perf_search"
+    ],
+    "expected_output_keywords": [
+      "faithfulness",
+      "read_file",
+      "write_file",
+      "hallucination",
+      "latency",
+      "tool call",
+      "P99",
+      "coder",
+      "fix",
+      "baseline",
+      "threshold",
+      "context"
+    ],
+    "expected_delegation_pattern": [
+      "researcher"
+    ],
+    "quality_thresholds": {
+      "correctness": 4.0,
+      "relevance": 4.5,
+      "coherence": 4.0,
+      "tool_usage_quality": 4.5,
+      "completeness": 4.0
+    },
+    "max_llm_calls": 5,
+    "max_tool_calls": 3,
+    "max_tokens": 4000,
+    "max_latency_ms": 60000,
+    "complexity": "medium",
+    "version": "1.0",
+    "reference_output": "## Coder Agent: Faithfulness Regression + Latency Diagnosis\n\n### 1. Faithfulness Regression Root Cause\nFaithfulness < 0.70 for coder typically means the agent hallucinated file paths, function names, or API signatures — writing code without reading the source files first.\n\n**Confirmation in trace:** check if `write_file` appears BEFORE `read_file` in coder's tool_calls. If yes, this is the root cause.\n\n### 2. P99 Latency Drivers at 45s\nCoder latency of 45s (P99 target: < 90s, P95: < 45s) has three possible causes:\n1. **Large file reads**: reading server.py (2800 lines) costs ~8s per call. Multiple reads = 16-24s just on I/O.\n2. **Model tier**: if using Claude Sonnet/Opus with extended_thinking, add 5-30s per LLM call.\n3. **Context inflation**: prior planner output appended to coder's context inflates tokens_in, slowing generation.\n\n### 3. Trace Patterns to Check\n- `write_file` before `read_file` → faithfulness issue confirmed\n- `read_file` called > 2× on same file → N+1 pattern, add latency\n- `tokens_in` > 8000 → context inflation from long conversation history\n- No `read_file` at all → coder invented API signatures (worst case)\n\n### 4. Concrete Fixes\n1. **Fix faithfulness**: add to coder prompt — 'ALWAYS read_file before write_file; never guess function signatures'\n2. **Fix latency**: use `read_file(path, query=\"function you need\")` for files > 50KB\n3. **Fix context inflation**: enable handoff context compression in orchestrator\n4. **Fix model**: downgrade coder from Sonnet to Haiku/GPT-4o-mini (2-5× cost reduction, ~30% latency reduction)\n\nSources: [playbook://deepeval-metric-patterns], [playbook://agent-latency-attribution]"
+  },
+  {
+    "id": "golden_032",
+    "name": "Data Analysis Agent — regression cost and quality SQL query",
+    "prompt": "Query the regression database to answer: (1) which golden test has the highest average cost across all runs, (2) which DeepEval metric scores lowest on average across all golden tests, and (3) which agent role appears most in the actual_delegation_pattern of failed tests (overall_pass=false). Show the SQL you ran and summarize the findings in plain English.",
+    "strategy": "router_decides",
+    "expected_strategy": "router_decides",
+    "expected_agent": "data_analyst",
+    "expected_tools": [
+      "run_sql"
+    ],
+    "expected_output_keywords": [
+      "SQL",
+      "golden",
+      "cost",
+      "metric",
+      "faithfulness",
+      "failed",
+      "agent",
+      "average"
+    ],
+    "expected_delegation_pattern": [
+      "data_analyst"
+    ],
+    "quality_thresholds": {
+      "correctness": 4.0,
+      "relevance": 4.0,
+      "coherence": 4.0,
+      "tool_usage_quality": 4.5,
+      "completeness": 3.5
+    },
+    "max_llm_calls": 5,
+    "max_tool_calls": 5,
+    "max_tokens": 3000,
+    "max_latency_ms": 45000,
+    "complexity": "medium",
+    "version": "1.0",
+    "reference_output": "## Regression Database Analysis\n\n### Query 1: Highest Average Cost by Golden Test\n```sql\nSELECT golden_case_id, golden_case_name, AVG(actual_cost) as avg_cost\nFROM regression_results GROUP BY golden_case_id ORDER BY avg_cost DESC LIMIT 5;\n```\n**Finding**: golden_030 (full-stack app build) has highest avg cost (~$0.045/run) due to multi-agent chain with coder writing many files.\n\n### Query 2: Lowest Average DeepEval Metric\nLowest-scoring metric is typically faithfulness (~0.65 avg), indicating agents sometimes write code without reading source files first.\n\n### Query 3: Most Common Agent in Failed Delegation Patterns\nCoder appears most in failed test delegation patterns, suggesting routing to coder before planner (wrong order) is the most common failure mode.\n\n**Summary**: The most expensive test is golden_030 (full SDLC build). Faithfulness needs the most improvement. Coder routing order is the primary failure pattern."
+  },
+  {
+    "id": "golden_033",
+    "name": "PromptOptimizer — HITL setup clarification, auto-bootstrap regression, up to 3 improvement cycles",
+    "prompt": "One of our agents seems to be underperforming. Please run a full prompt optimisation loop for it.",
+    "strategy": "router_decides",
+    "expected_strategy": "router_decides",
+    "expected_agent": "prompt_optimizer",
+    "expected_tools": [
+      "ask_human",
+      "get_regression_failures",
+      "get_current_prompt",
+      "run_regression_subset",
+      "register_prompt_version",
+      "diff_prompts"
+    ],
+    "expected_output_keywords": [
+      "SETUP CONFIRMED",
+      "role",
+      "metric",
+      "threshold",
+      "bootstrap",
+      "regression",
+      "root cause",
+      "register",
+      "diff",
+      "iteration",
+      "recommendation"
+    ],
+    "expected_delegation_pattern": [
+      "prompt_optimizer"
+    ],
+    "quality_thresholds": {
+      "correctness": 0.6,
+      "relevance": 0.6,
+      "coherence": 0.6,
+      "tool_usage": 0.6,
+      "completeness": 0.5
+    },
+    "max_llm_calls": 20,
+    "max_tool_calls": 20,
+    "max_tokens": 8000,
+    "max_latency_ms": 600000,
+    "complexity": "complex",
+    "version": "2.0",
+    "hitl_responses": {
+      "Which agent role to optimise?": "coder",
+      "Which prompt version to optimise?": "latest",
+      "Which metric to improve?": "step_efficiency",
+      "Minimum acceptable score?": "0.7"
+    },
+    "reference_output": "## PromptOptimizer Report\n\n### Setup Summary\nRole: coder | Metric: step_efficiency | Threshold: 0.7 | Version: latest\n\n### Bootstrap\nBaseline regression run on golden_001, golden_004, golden_005, golden_006, golden_021 (no prior data for this version).\n\n### Iteration Summary\n| Cycle | Version | Pass Rate | Avg step_efficiency | Δ vs Baseline |\n|-------|---------|-----------|---------------------|---------------|\n| 0 (baseline) | v_orig | ~60% | ~0.58 | — |\n| 1 | vN+1 | ~70% | ~0.67 | +0.09 |\n\n### Root Cause Analysis\nLow step_efficiency caused by: (1) no explicit read-before-write constraint, (2) no tool-call budget awareness.\n\n### Changes Made\n- Added: NEVER call write_file without first calling read_file\n- Added: SITUATION/PLAN/EXECUTE/VERIFY CoT headers\n- Added: tool call budget tracking\n\n### Final Recommendation\nAdopt vN+1: step_efficiency improved from 0.58 → 0.67 (+16%).\n\n### Prompt Diff\n[diff output between v_original and v_final]"
+  },
+  {
+    "id": "golden_034",
+    "name": "QA happy path: coder builds calculator API → QA approves in round 1",
+    "prompt": "Please have the coder agent write a new FastAPI calculator service into /tmp/calc-app/ (the directory does not exist yet — write files directly there). The app needs exactly one endpoint: POST /calculate with JSON body {\"op\": \"add\"|\"subtract\"|\"multiply\"|\"divide\", \"a\": number, \"b\": number} → returns {\"result\": number}. Divide-by-zero must return HTTP 400 {\"error\": \"division by zero\"}. Include requirements.txt (fastapi, uvicorn, httpx, pytest, pytest-asyncio, starlette). Once the code is written, have the qa agent do a full QA pass: run E2E tests covering all 4 ops and the divide-by-zero edge case, a performance test with 10 concurrent requests, and static analysis. Store QA artifacts in /tmp/calc-app/qa/ and write a final QA report qa_round1.md. If all checks pass, emit QA_STATUS: APPROVED.",
+    "strategy": "supervisor",
+    "expected_strategy": "supervisor",
+    "expected_agent": "coder",
+    "expected_tools": [
+      "write_file",
+      "run_command"
+    ],
+    "expected_output_keywords": [
+      "/tmp/calc-app",
+      "POST /calculate",
+      "divide",
+      "400",
+      "QA_STATUS: APPROVED",
+      "qa_round1.md",
+      "passed"
+    ],
+    "expected_delegation_pattern": [
+      "coder",
+      "qa"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.45,
+      "completeness": 0.5,
+      "correctness": 0.55
+    },
+    "max_llm_calls": 80,
+    "max_tool_calls": 80,
+    "max_tokens": 600000,
+    "max_latency_ms": 900000,
+    "complexity": "complex",
+    "version": "1.0",
+    "reference_output": "## Calculator API — QA Complete\n\n### Coder Output\nFiles written to /tmp/calc-app/:\n- `main.py` — FastAPI app with POST /calculate endpoint, handles add/subtract/multiply/divide, returns 400 for division by zero\n- `tests/test_main.py` — 5 unit tests (all 4 ops + div-by-zero): 5 passed ✅\n- `requirements.txt`\n\n### QA Round 1 Results\n**Static Analysis**: 0 violations (flake8 clean)\n**Unit Test Verification**: 5 passed ✅\n**E2E Tests** (tests/qa/qa_e2e_round1.py): 5/5 passed ✅\n  - test_add: POST /calculate {op:add, a:10, b:3} → {result:13} ✅\n  - test_subtract: → {result:7} ✅\n  - test_multiply: → {result:30} ✅\n  - test_divide: → {result:3.333} ✅\n  - test_divide_by_zero: → 400 {error: division by zero} ✅\n**Performance** (10 concurrent requests):\n  | p50 | p95 | p99 | RPS |\n  |-----|-----|-----|-----|\n  | 12ms | 28ms | 45ms | 380 |\n**Defects**: None found\n\n**QA Report**: /tmp/calc-app/qa/qa_round1.md written\n\nQA_STATUS: APPROVED"
+  },
+  {
+    "id": "golden_035",
+    "name": "QA bug-fix cycle: coder builds URL shortener with redirect bug → QA finds it → coder fixes → QA approves",
+    "prompt": "Create a new project at /tmp/url-shortener/ (the directory does not exist yet — create it by writing files there). Build a URL shortener service with these endpoints:\n1. POST /shorten with body {\"url\": \"https://example.com\"} → returns {\"short_code\": \"abc123\", \"short_url\": \"http://localhost:8000/abc123\"}\n2. GET /{short_code} → MUST return HTTP 301 redirect to the original URL (not a 200 with the URL in the body)\n3. GET /stats/{short_code} → returns {\"short_code\": \"abc123\", \"original_url\": \"...\", \"hits\": N}\n4. Use an in-memory dict for storage. No database needed.\n5. requirements.txt: fastapi, uvicorn, httpx, pytest, pytest-asyncio, starlette\n\nAfter building, run a full QA pass. QA should check redirect correctness (status code must be 301/302, not 200), E2E test all endpoints, run a performance test, and write a QA report to /tmp/url-shortener/qa/. If QA finds bugs, coder should fix them and QA should re-validate. Continue until QA_STATUS: APPROVED.",
+    "strategy": "supervisor",
+    "expected_strategy": "supervisor",
+    "expected_agent": "coder",
+    "expected_tools": [
+      "write_file",
+      "run_tests",
+      "run_command"
+    ],
+    "expected_output_keywords": [
+      "/tmp/url-shortener",
+      "POST /shorten",
+      "301",
+      "redirect",
+      "short_code",
+      "hits",
+      "QA_STATUS: APPROVED",
+      "qa_round1.md",
+      "RedirectResponse"
+    ],
+    "expected_delegation_pattern": [
+      "coder",
+      "qa"
+    ],
+    "quality_thresholds": {
+      "semantic_similarity": 0.4,
+      "completeness": 0.45,
+      "correctness": 0.5
+    },
+    "max_llm_calls": 120,
+    "max_tool_calls": 100,
+    "max_tokens": 900000,
+    "max_latency_ms": 1200000,
+    "complexity": "e2e",
+    "version": "1.0",
+    "reference_output": "## URL Shortener — QA Cycle Complete\n\n### Coder Round 1\nFiles written to /tmp/url-shortener/:\n- `main.py` — FastAPI app with POST /shorten, GET /{short_code} (initially returns 200 body — BUG), GET /stats/{short_code}\n- `tests/test_main.py` — unit tests pass (miss redirect bug because TestClient follows redirects)\n- `requirements.txt`\n\n### QA Round 1 — NEEDS_FIX\n**E2E Defect Found**:\n| ID | Severity | Description | Reproduction |\n|----|----------|-------------|-------------|\n| D001 | CRITICAL | GET /{short_code} returns HTTP 200 with URL in body instead of HTTP 301 redirect | curl -I http://localhost/abc123 → 200 OK (expected 301 Moved Permanently) |\n\nQA Report: /tmp/url-shortener/qa/qa_round1.md\nQA_STATUS: NEEDS_FIX\n\n### Coder Round 2 — Fix Applied\nFixed `main.py`: changed `GET /{short_code}` to return `RedirectResponse(url=original_url, status_code=301)`\nUnit tests updated to check status_code=301 and Location header.\n\n### QA Round 2 — APPROVED\n**E2E Tests** (tests/qa/qa_e2e_round2.py): 4/4 passed ✅\n  - test_shorten: POST /shorten → {short_code, short_url} ✅\n  - test_redirect: GET /{short_code} → 301 Location: https://example.com ✅\n  - test_stats: GET /stats/{short_code} → {hits: 1} after redirect ✅\n  - test_not_found: GET /missing → 404 ✅\n**Performance**: p50=15ms, p95=32ms — within thresholds ✅\n**Defects**: 0 remaining\n\nQA Report: /tmp/url-shortener/qa/qa_round2.md\nQA_STATUS: APPROVED"
+  }
+]

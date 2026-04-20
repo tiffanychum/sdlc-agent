@@ -2319,31 +2319,42 @@ async def run_regression_stream(request: RegressionRunRequest):
 
 
 @app.get("/api/regression/runs")
-def list_regression_runs():
-    """List eval runs that have associated regression results."""
+def list_regression_runs(team_id: Optional[str] = None):
+    """List eval runs that have associated regression results.
+
+    When `team_id` is supplied, we scope the list to runs executed against that
+    team. EvalRun.team_id was back-filled as part of the sdlc_2_0 work; runs
+    that predate the column are returned only when no team filter is set.
+    """
     session = get_session()
-    run_ids = session.query(RegressionResult.run_id).distinct().all()
-    run_ids = [r[0] for r in run_ids]
-    runs = session.query(EvalRun).filter(EvalRun.id.in_(run_ids)).order_by(EvalRun.created_at.desc()).all()
-    result = []
-    for r in runs:
-        cases = session.query(RegressionResult).filter_by(run_id=r.id).all()
-        case_count = len(cases)
-        passed_count = sum(1 for c in cases if c.overall_pass)
-        case_ids = [c.golden_case_id for c in cases]
-        rj = r.results_json or {}
-        result.append({
-            "id": r.id, "model": r.model, "prompt_version": r.prompt_version,
-            "num_cases": case_count, "passed": passed_count, "failed": case_count - passed_count,
-            "pass_rate": round(passed_count / max(case_count, 1), 3),
-            "avg_latency_ms": rj.get("avg_latency_ms", r.avg_latency_ms),
-            "total_cost": r.total_cost or 0,
-            "regressions": rj.get("regressions", {}),
-            "case_ids": case_ids,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-        })
-    session.close()
-    return result
+    try:
+        run_ids = session.query(RegressionResult.run_id).distinct().all()
+        run_ids = [r[0] for r in run_ids]
+        q = session.query(EvalRun).filter(EvalRun.id.in_(run_ids))
+        if team_id:
+            q = q.filter(EvalRun.team_id == team_id)
+        runs = q.order_by(EvalRun.created_at.desc()).all()
+        result = []
+        for r in runs:
+            cases = session.query(RegressionResult).filter_by(run_id=r.id).all()
+            case_count = len(cases)
+            passed_count = sum(1 for c in cases if c.overall_pass)
+            case_ids = [c.golden_case_id for c in cases]
+            rj = r.results_json or {}
+            result.append({
+                "id": r.id, "model": r.model, "prompt_version": r.prompt_version,
+                "team_id": getattr(r, "team_id", None),
+                "num_cases": case_count, "passed": passed_count, "failed": case_count - passed_count,
+                "pass_rate": round(passed_count / max(case_count, 1), 3),
+                "avg_latency_ms": rj.get("avg_latency_ms", r.avg_latency_ms),
+                "total_cost": r.total_cost or 0,
+                "regressions": rj.get("regressions", {}),
+                "case_ids": case_ids,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            })
+        return result
+    finally:
+        session.close()
 
 
 @app.get("/api/regression/results/{run_id}")
@@ -2441,20 +2452,25 @@ def get_regression_case_detail(run_id: str, case_id: str):
 
 
 @app.get("/api/regression/ab/options")
-def regression_ab_options(golden_id: str):
+def regression_ab_options(golden_id: str, team_id: Optional[str] = None):
     """
     Returns distinct regression runs available for a given golden test case,
     ordered newest-first. Each entry includes run_id, model, prompt_version,
     created_at, and overall_pass so the UI can populate two run-picker dropdowns.
+
+    When `team_id` is passed we join against EvalRun and restrict to that team
+    so dev-team and sdlc_2_0 A/B options stay isolated.
     """
     session = get_session()
     try:
-        rows = (
-            session.query(RegressionResult)
-            .filter(RegressionResult.golden_case_id == golden_id)
-            .order_by(RegressionResult.created_at.desc())
-            .all()
+        q = session.query(RegressionResult).filter(
+            RegressionResult.golden_case_id == golden_id
         )
+        if team_id:
+            q = q.join(EvalRun, EvalRun.id == RegressionResult.run_id).filter(
+                EvalRun.team_id == team_id
+            )
+        rows = q.order_by(RegressionResult.created_at.desc()).all()
         # Deduplicate by run_id (keep first = most recent per run)
         seen = set()
         options = []
@@ -2699,6 +2715,7 @@ class RagConfigCreate(BaseModel):
     multi_query_n: int = 3
     system_prompt: Optional[str] = None
     reranker: str = "none"
+    team_id: Optional[str] = None
 
 
 class RagSourceCreate(BaseModel):
@@ -2757,6 +2774,7 @@ def _cfg_row_to_dict(r: RagConfigModel) -> dict:
         "multi_query_n": r.multi_query_n,
         "system_prompt": r.system_prompt,
         "reranker": r.reranker or "none",
+        "team_id": getattr(r, "team_id", None),
         "is_active": r.is_active,
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "sources": [
@@ -2792,10 +2810,21 @@ def list_rag_models():
 
 
 @app.get("/api/rag/configs")
-def list_rag_configs():
+def list_rag_configs(team_id: Optional[str] = None):
+    """List RAG configs, optionally scoped to a team.
+
+    Configs whose `team_id` is NULL (pre-migration rows) remain visible to
+    every team so existing playbooks keep working; explicitly-tagged rows are
+    only returned when the team matches.
+    """
     session = get_session()
     try:
-        rows = session.query(RagConfigModel).order_by(RagConfigModel.created_at.desc()).all()
+        q = session.query(RagConfigModel)
+        if team_id:
+            q = q.filter(
+                (RagConfigModel.team_id == team_id) | (RagConfigModel.team_id.is_(None))
+            )
+        rows = q.order_by(RagConfigModel.created_at.desc()).all()
         return [_cfg_row_to_dict(r) for r in rows]
     finally:
         session.close()
@@ -2820,6 +2849,7 @@ def create_rag_config(body: RagConfigCreate):
             multi_query_n=body.multi_query_n,
             system_prompt=body.system_prompt,
             reranker=body.reranker,
+            team_id=body.team_id,
         )
         session.add(row)
         session.commit()
