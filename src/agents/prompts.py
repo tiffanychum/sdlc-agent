@@ -698,23 +698,31 @@ prompt version with a validated performance improvement.
 ## PHASE 0 — SETUP CLARIFICATION (run FIRST, always)
 ═══════════════════════════════════════════════════════
 
-Before doing anything else, resolve these four parameters.
+Before doing anything else, resolve these parameters.
 They may be provided in the user message (use them directly) or missing (ask via ask_human).
 
-| Parameter      | How to resolve if missing                              |
-|----------------|--------------------------------------------------------|
-| TARGET_ROLE    | ask_human: "Which agent role to optimise? (e.g. coder, qa, planner)" |
-| TARGET_VERSION | ask_human: "Which prompt version to optimise? (default: latest for that role)" |
-| TARGET_METRIC  | ask_human: "Which metric to improve? (default: step_efficiency)" |
-| THRESHOLD      | ask_human: "Minimum acceptable score? (default: 0.7)"  |
+| Parameter        | How to resolve if missing                                             |
+|------------------|------------------------------------------------------------------------|
+| TARGET_ROLE      | ask_human: "Which agent role to optimise? (e.g. coder, qa, planner)"   |
+| TARGET_VERSION   | ask_human: "Which prompt version to optimise? (default: latest)"       |
+| TARGET_METRIC    | ask_human: "Which metric to improve? (default: step_efficiency)"       |
+| THRESHOLD        | ask_human: "Minimum acceptable score? (default: 0.7)"                  |
+| TEAM_ID          | default "default" — use value from message if present                  |
+| BASELINE_RUN_ID  | Optional — if present, pin baseline failures to this run_id            |
+| GOLDEN_IDS       | Optional — explicit subset of golden IDs to optimise on                |
+| EARLY_EXIT       | Bool (default true) — stop after first cycle that crosses threshold    |
 
-Once all four are known, echo them as a confirmation block:
+Once the required four are known, echo them as a confirmation block:
 ```
 SETUP CONFIRMED:
-  Role:    <TARGET_ROLE>
-  Version: <TARGET_VERSION>
-  Metric:  <TARGET_METRIC>
-  Target:  ≥ <THRESHOLD>
+  Role:     <TARGET_ROLE>
+  Version:  <TARGET_VERSION>
+  Metric:   <TARGET_METRIC>
+  Target:   ≥ <THRESHOLD>
+  Team:     <TEAM_ID>
+  Baseline: <BASELINE_RUN_ID or "fresh bootstrap">
+  Goldens:  <GOLDEN_IDS or "derived from baseline failures">
+  EarlyExit:<EARLY_EXIT>
 ```
 
 ═══════════════════════════════════════════════════════
@@ -727,21 +735,39 @@ REASONING PROTOCOL (use before EVERY tool call):
 **EXECUTE**   — Call the tool, read the full result.
 **VERIFY**    — Did I get the data I need? Any surprises?
 
-### Step B1 — Check for existing regression data
+### Step B1 — Collect baseline failures (and weak passes)
 Call: **get_regression_failures(role=TARGET_ROLE, metric=TARGET_METRIC,
-                                threshold=THRESHOLD, version=TARGET_VERSION)**
+                                threshold=THRESHOLD, version=TARGET_VERSION,
+                                run_id=BASELINE_RUN_ID,
+                                golden_ids=GOLDEN_IDS)**
 
-**If the tool returns "no data" or 0 failing tests for TARGET_VERSION:**
-→ There are no regression records yet. Run a bootstrap regression FIRST:
+Rules for the `run_id` / `golden_ids` args:
+  • If BASELINE_RUN_ID was provided in SETUP → pass it. This pins the baseline
+    to a single deterministic run and is the preferred path.
+  • If GOLDEN_IDS were provided in SETUP → pass them. This lets the human scope
+    the optimisation to a specific subset.
+  • **PINNED MODE** (both run_id and golden_ids provided — the recommended flow):
+    the tool returns ALL rows for the pinned run/goldens pair, including PASSES,
+    with full DeepEval sub-scores. This is important: a test can be overall_pass=1
+    but still have a low `faithfulness` / `step_efficiency` / `tool_usage`
+    sub-score — those are legitimate optimisation targets even though the test
+    "passed". Use the `Candidate golden_ids with weak sub-metrics` line in the
+    tool output as your baseline_failing_ids if no hard failures exist.
+  • If neither is provided → the tool scans all historical failing runs for the role.
+
+**Otherwise, if the tool returns "no data" or 0 failing tests:**
+→ Run a bootstrap regression FIRST:
   Call: **run_regression_subset(role=TARGET_ROLE, prompt_version=TARGET_VERSION,
-         golden_ids=["golden_001","golden_004","golden_005","golden_006","golden_021"],
-         model="claude-sonnet-4.6")**
-  Wait for it to complete. Then re-call get_regression_failures to get the baseline.
+         golden_ids=GOLDEN_IDS or ["golden_001","golden_004","golden_005","golden_006","golden_021"],
+         model="claude-sonnet-4.6", team_id=TEAM_ID, max_parallel=3)**
+  Then re-call get_regression_failures.
 
-**If data exists:** proceed directly.
+**Otherwise:** proceed with failure IDs as the baseline.
 
 Save:
-  - baseline_failing_ids = [golden IDs that failed or scored below threshold]
+  - baseline_failing_ids = GOLDEN_IDS if provided, else
+      [golden IDs that failed] OR, in PINNED MODE with no hard failures,
+      the `Candidate golden_ids with weak sub-metrics` list from the tool output.
   - baseline_scores      = {metric: average score across baseline tests}
   - v_original           = TARGET_VERSION  (the version you are improving FROM)
 
@@ -784,11 +810,14 @@ For cycle N in [1, 2, 3]:
 
   **L5 — Validate with regression**
       Call: **run_regression_subset(role=TARGET_ROLE, prompt_version=v_new,
-             golden_ids=baseline_failing_ids, model="claude-sonnet-4.6")**
+             golden_ids=baseline_failing_ids, model="claude-sonnet-4.6",
+             team_id=TEAM_ID, max_parallel=3)**
       → Run on the SAME tests from B1 (never switch test sets mid-loop).
       → Record: new_scores = {metric: value per test}
 
   **L6 — Convergence check**
+      - STOP (early exit) if EARLY_EXIT=true AND pass_rate reached 100% OR all
+        target metrics crossed THRESHOLD. Skip remaining cycles.
       - STOP  if: pass_rate improved ≥10pp OR all target metrics crossed threshold.
       - ITERATE if: improvement <5pp AND cycle <3. Apply a deeper / different fix.
       - PLATEAU if: cycle=2 and scores unchanged → stop, report plateau.
@@ -814,7 +843,7 @@ Produce a structured report with ALL of:
 ## TOOLS REFERENCE
 ═══════════════════════════════════════════════════════
 - ask_human(question)                           ← clarify missing setup params
-- get_regression_failures(role,metric,threshold,version)  ← baseline data
+- get_regression_failures(role,metric,threshold,version,run_id,golden_ids)  ← baseline data; PINNED mode (run_id+golden_ids) returns passes too
 - retrieve_similar_failures(role, query_text, limit)      ← few-shot memory
 - get_current_prompt(role, version)                       ← read before editing
 - register_prompt_version(role, new_prompt, rationale, parent_version)

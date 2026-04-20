@@ -12,10 +12,13 @@ Provides REST APIs for:
 
 import asyncio
 import json
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -247,7 +250,9 @@ AVAILABLE_MODELS = [
     # ── Anthropic — use Poe model names (not Anthropic-native IDs) ──
     {"id": "claude-haiku-3",          "name": "Claude Haiku 3",        "provider": "Anthropic",  "tier": "agent",  "thinking": False},
     {"id": "Claude-Haiku-3.5",        "name": "Claude Haiku 3.5",      "provider": "Anthropic",  "tier": "agent",  "thinking": False},
+    {"id": "claude-sonnet-4.6",       "name": "Claude Sonnet 4.6",     "provider": "Anthropic",  "tier": "agent",  "thinking": True},
     {"id": "Claude-Sonnet-4",         "name": "Claude Sonnet 4",       "provider": "Anthropic",  "tier": "agent",  "thinking": False},
+    {"id": "claude-opus-4.7",         "name": "Claude Opus 4.7",       "provider": "Anthropic",  "tier": "agent",  "thinking": False},
     {"id": "claude-opus-4.5",         "name": "Claude Opus 4.5",       "provider": "Anthropic",  "tier": "agent",  "thinking": False},
     {"id": "Claude-Opus-4",           "name": "Claude Opus 4",         "provider": "Anthropic",  "tier": "agent",  "thinking": False},
     # ── Google — ⚠️ may trigger safety blocks ──────────────────
@@ -1342,8 +1347,9 @@ async def prompt_diff(role: str, version_old: str = "v1", version_new: str = "v2
 @app.post("/api/prompts/optimize")
 async def prompt_optimize(request: Request):
     """
-    Non-streaming optimization endpoint (kept for backward compat).
-    Prefer /api/prompts/optimize/stream for real-time trajectory.
+    Non-streaming optimization endpoint — returns the full structured
+    OptimizationReport synchronously (no SSE). Shares the same implementation
+    as ``/stream``; use this for programmatic / scripted access.
     """
     try:
         body = await request.json()
@@ -1351,162 +1357,183 @@ async def prompt_optimize(request: Request):
         metric = body.get("metric", "step_efficiency")
         threshold = float(body.get("threshold", 0.7))
         model = body.get("model", "claude-sonnet-4.6")
-        version = body.get("version")  # target prompt version to optimize (optional)
+        version = body.get("version")
+        team_id = body.get("team_id") or "default"
+        baseline_run_id = body.get("baseline_run_id") or None
+        golden_ids = body.get("golden_ids") or []
+        early_exit = bool(body.get("early_exit", True))
+        commit_on_plateau = bool(body.get("commit_on_plateau", False))
+        dry_run = bool(body.get("dry_run", False))
 
-        prompt = _build_optimize_prompt(role, metric, threshold, version)
-
-        from src.orchestrator import build_orchestrator_from_team
-        orchestrator = await build_orchestrator_from_team(
-            team_id="default", model_override=model
+        from src.optimization.optimizer import run_optimization_loop
+        report = await run_optimization_loop(
+            role=role,
+            metric=metric,
+            threshold=threshold,
+            version=version,
+            team_id=team_id,
+            baseline_run_id=baseline_run_id,
+            golden_ids=list(golden_ids) if golden_ids else None,
+            early_exit=early_exit,
+            commit_on_plateau=commit_on_plateau,
+            dry_run=dry_run,
+            model=model,
         )
-        result = await orchestrator.ainvoke({
-            "messages": [{"role": "user", "content": prompt}],
-            "agent_trace": [],
-            "completed_steps": [],
-            "supervisor_iterations": 0,
-        })
-        last_msg = result["messages"][-1]
-        response_text = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
-        agents = list(dict.fromkeys([
-            e.get("agent") for e in result.get("agent_trace", [])
-            if e.get("step") == "execution"
-        ]))
-        return {
-            "status": "completed",
-            "role": role,
-            "metric": metric,
-            "agents_used": agents,
-            "response": response_text[:4000],
-        }
+        return {"status": "completed", "report": report.model_dump()}
     except Exception as e:
+        logger.exception("prompt_optimize failed")
         return {"status": "error", "error": str(e)}
-
-
-def _build_optimize_prompt(role: str, metric: str, threshold: float, version: str | None) -> str:
-    """Build the user prompt for the PromptOptimizer agent."""
-    version_clause = f"target prompt version: {version}" if version else "the latest available version"
-    return (
-        f"Run a full prompt optimization loop for the **{role}** agent ({version_clause}). "
-        f"Target metric: **{metric}** (improvement threshold: {threshold}). "
-        f"Follow the SETUP → LOOP (up to 3 cycles) → FINAL OUTPUT protocol exactly as specified in your instructions. "
-        f"Bootstrap note: if there are no regression records yet for role={role} version={version or 'latest'}, "
-        f"run a baseline regression first using golden_ids=['golden_001','golden_004','golden_005','golden_006','golden_021'] "
-        f"before starting the analysis. "
-        f"Report the full iteration summary, root cause, changes per cycle, and final diff."
-    )
 
 
 @app.post("/api/prompts/optimize/stream")
 async def prompt_optimize_stream(request: Request):
     """
-    SSE streaming version of the PromptOptimizer.
-    Emits real-time events: agent_start, tool_start, tool_end, thinking, version_registered,
-    regression_result, response, done.
+    SSE streaming endpoint for the global Prompt Optimizer function.
 
-    Body: {"role": "coder", "metric": "step_efficiency", "threshold": 0.7,
-           "model": "claude-sonnet-4.6", "version": "v4" (optional)}
+    Unlike the previous version, this does NOT build an agent orchestrator.
+    It calls ``src.optimization.optimizer.run_optimization_loop(...)`` directly,
+    which guarantees:
+      * No supervisor misrouting (no graph involved at all).
+      * One LLM call per cycle (the drafter) — deterministic control flow.
+      * At most ONE new ``PromptVersionEntry`` row per run (or zero if no
+        improvement).
+
+    Body (all legacy fields still accepted):
+      {
+        "roles":          ["coder", "planner"],
+        "metric":         "step_efficiency",
+        "threshold":      0.7,
+        "model":          "claude-sonnet-4.6",
+        "versions":       {"coder": "latest", "planner": "v2"},
+        "team_id":        "sdlc_2_0",
+        "baseline_run_id": "ab12cd34ef56" | null,
+        "golden_ids":     ["golden_001", "golden_004"],
+        "early_exit":     true,
+        "commit_on_plateau": false,
+        "dry_run":        false
+      }
+
+    Every SSE event is tagged with ``role`` so the UI can render per-role panels.
+    Roles run concurrently with a cap of 2.
     """
     body = await request.json()
-    role = body.get("role", "coder")
+
+    roles: list[str] = body.get("roles") or (
+        [body.get("role", "coder")] if body.get("role") else ["coder"]
+    )
+    roles = [r for r in roles if r]
+    if not roles:
+        return {"error": "no roles provided"}
+
     metric = body.get("metric", "step_efficiency")
     threshold = float(body.get("threshold", 0.7))
     model = body.get("model", "claude-sonnet-4.6")
-    version = body.get("version")
+    team_id = body.get("team_id") or "default"
+    baseline_run_id = body.get("baseline_run_id") or None
+    golden_ids = body.get("golden_ids") or []
+    early_exit = bool(body.get("early_exit", True))
+    commit_on_plateau = bool(body.get("commit_on_plateau", False))
+    dry_run = bool(body.get("dry_run", False))
 
-    user_prompt = _build_optimize_prompt(role, metric, threshold, version)
+    versions_map: dict[str, str | None] = body.get("versions") or {}
+    if not versions_map and body.get("version"):
+        versions_map = {roles[0]: body.get("version")}
 
-    from src.orchestrator import build_orchestrator_from_team
-    from langgraph.graph.state import CompiledStateGraph
+    from src.optimization.optimizer import run_optimization_loop
 
-    orchestrator = await build_orchestrator_from_team(
-        team_id="default", model_override=model
-    )
-    thread_id = uuid.uuid4().hex[:12]
-    config = get_graph_config(thread_id)
-    initial_input = {
-        "messages": [{"role": "user", "content": user_prompt}],
-        "agent_trace": [],
-        "completed_steps": [],
-        "supervisor_iterations": 0,
-    }
+    async def _run_one_role(
+        role: str,
+        emit_queue: asyncio.Queue,
+        sem: asyncio.Semaphore,
+    ) -> None:
+        async with sem:
+            version = versions_map.get(role)
+
+            async def emit(ev: str, payload: dict):
+                # Stamp every event with the role so the UI can route it to
+                # the correct per-role panel.
+                payload = {**payload, "role": role}
+                await emit_queue.put((ev, payload))
+
+            await emit("optimize_start", {
+                "metric": metric, "threshold": threshold,
+                "version": version or "latest", "model": model,
+                "team_id": team_id,
+                "baseline_run_id": baseline_run_id,
+                "golden_ids": list(golden_ids) if golden_ids else [],
+                "early_exit": early_exit,
+                "commit_on_plateau": commit_on_plateau,
+                "dry_run": dry_run,
+            })
+
+            try:
+                await run_optimization_loop(
+                    role=role,
+                    metric=metric,
+                    threshold=threshold,
+                    version=version,
+                    team_id=team_id,
+                    baseline_run_id=baseline_run_id,
+                    golden_ids=list(golden_ids) if golden_ids else None,
+                    early_exit=early_exit,
+                    commit_on_plateau=commit_on_plateau,
+                    dry_run=dry_run,
+                    model=model,
+                    progress_cb=emit,
+                )
+            except Exception as e:
+                await emit("error", {"message": str(e)})
 
     async def event_generator():
-        yield _sse_event("thread_id", {"thread_id": thread_id})
-        yield _sse_event("optimize_start", {
-            "role": role, "metric": metric, "threshold": threshold,
-            "version": version or "latest", "model": model,
+        sem = asyncio.Semaphore(2)
+        emit_queue: asyncio.Queue = asyncio.Queue()
+
+        _DONE_SENTINEL = ("__fanout_done__", None)
+
+        async def _producer():
+            try:
+                await asyncio.gather(
+                    *[_run_one_role(r, emit_queue, sem) for r in roles],
+                    return_exceptions=True,
+                )
+            finally:
+                await emit_queue.put(_DONE_SENTINEL)
+
+        producer = asyncio.create_task(_producer())
+
+        yield _sse_event("fanout_start", {
+            "roles": roles,
+            "parallel_cap": 2,
+            "team_id": team_id,
+            "baseline_run_id": baseline_run_id,
+            "golden_ids": list(golden_ids) if golden_ids else [],
+            "early_exit": early_exit,
+            "commit_on_plateau": commit_on_plateau,
+            "dry_run": dry_run,
         })
 
-        current_agent = ""
-        token_buf = ""
         try:
-            async for event in orchestrator.astream_events(
-                initial_input, config=config, version="v2"
-            ):
-                kind = event.get("event", "")
-                name = event.get("name", "")
-                data = event.get("data", {})
-                meta = event.get("metadata", {})
-                lg_node = meta.get("langgraph_node", "")
+            while True:
+                item = await emit_queue.get()
+                if item is _DONE_SENTINEL or (isinstance(item, tuple) and item[0] == "__fanout_done__"):
+                    break
+                ev, payload = item
+                yield _sse_event(ev, payload)
+        finally:
+            if not producer.done():
+                producer.cancel()
+                try:
+                    await producer
+                except (asyncio.CancelledError, Exception):
+                    pass
 
-                if kind == "on_chain_start" and lg_node and lg_node not in _GRAPH_SYSTEM_NODES and not lg_node.startswith("_") and name == lg_node:
-                    current_agent = lg_node
-                    yield _sse_event("agent_start", {"agent": lg_node})
+        yield _sse_event("fanout_done", {"status": "completed", "roles": roles})
 
-                elif kind == "on_tool_start":
-                    tool_input = data.get("input", {})
-                    safe_input = {k: str(v)[:300] for k, v in (tool_input.items() if isinstance(tool_input, dict) else {}.items())}
-                    yield _sse_event("tool_start", {
-                        "agent": current_agent, "tool": name, "args": safe_input,
-                    })
-                    # Special event for version registration so UI can highlight it
-                    if name == "register_prompt_version":
-                        yield _sse_event("version_registering", {
-                            "role": safe_input.get("role", role),
-                            "rationale": safe_input.get("rationale", "")[:200],
-                        })
-
-                elif kind == "on_tool_end":
-                    output = str(data.get("output", ""))
-                    yield _sse_event("tool_end", {
-                        "agent": current_agent, "tool": name,
-                        "output_preview": output[:400],
-                    })
-                    # Special event when regression subset completes
-                    if name == "run_regression_subset":
-                        yield _sse_event("regression_result", {
-                            "tool_output": output[:600],
-                        })
-                    elif name == "register_prompt_version":
-                        # Extract version label from tool output e.g. "✓ Registered coder prompt as v5."
-                        import re
-                        m = re.search(r'as\s+(v\d+)', output)
-                        if m:
-                            yield _sse_event("version_registered", {
-                                "role": role, "version": m.group(1),
-                            })
-
-                elif kind == "on_chat_model_stream":
-                    chunk = data.get("chunk")
-                    if chunk:
-                        token = chunk.content if hasattr(chunk, "content") else ""
-                        if token:
-                            token_buf += token
-                            if len(token_buf) >= 40 or token.endswith(("\n", ".")):
-                                yield _sse_event("thinking", {"delta": token_buf, "agent": current_agent})
-                                token_buf = ""
-
-        except Exception as e:
-            yield _sse_event("error", {"message": str(e)})
-            return
-
-        if token_buf:
-            yield _sse_event("thinking", {"delta": token_buf, "agent": current_agent})
-
-        yield _sse_event("done", {"status": "completed", "role": role, "metric": metric})
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── TraceAnalyzer Performance Report ────────────────────────────

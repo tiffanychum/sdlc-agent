@@ -153,11 +153,25 @@ export default function RegressionPage() {
   const [optimizeLoading, setOptimizeLoading] = useState(false);
   const [optimizeResult, setOptimizeResult] = useState<any>(null);
   const [showOptimizeSetup, setShowOptimizeSetup] = useState(false);
-  const [optimizeRole, setOptimizeRole] = useState("coder");
-  const [optimizeVersion, setOptimizeVersion] = useState("latest");
+  // Multi-role optimisation: Set keeps selection deterministic and unique.
+  const [optimizeRoles, setOptimizeRoles] = useState<Set<string>>(new Set(["coder"]));
+  // Per-role target version. When a role has no entry here we send "latest".
+  const [optimizeVersions, setOptimizeVersions] = useState<Record<string, string>>({});
   const [optimizeMetric, setOptimizeMetric] = useState("step_efficiency");
   const [optimizeThreshold, setOptimizeThreshold] = useState("0.7");
-  const [optimizeTrajectory, setOptimizeTrajectory] = useState<Array<{type: string; text: string; ts: number}>>([]);
+  // Baseline mode: pick a past run ('run') or let the optimizer bootstrap
+  // ('fresh'). We recommend 'run' because it gives deterministic baselines.
+  const [optimizeBaselineMode, setOptimizeBaselineMode] = useState<"run" | "fresh">("run");
+  const [optimizeBaselineRunId, setOptimizeBaselineRunId] = useState<string>("");
+  // Explicit golden subset. Empty = let the optimizer derive from failures.
+  const [optimizeGoldenIds, setOptimizeGoldenIds] = useState<Set<string>>(new Set());
+  const [optimizeEarlyExit, setOptimizeEarlyExit] = useState(true);
+  const [optimizeCommitOnPlateau, setOptimizeCommitOnPlateau] = useState(false);
+  const [optimizeDryRun, setOptimizeDryRun] = useState(false);
+  // One trajectory panel per role so parallel runs stay legible.
+  const [optimizeTrajectory, setOptimizeTrajectory] = useState<Record<string, Array<{type: string; text: string; ts: number}>>>({});
+  const [optimizeActiveRoleTab, setOptimizeActiveRoleTab] = useState<string>("");
+  const optimizeAbortRef = useRef<AbortController | null>(null);
   const trajectoryEndRef = useRef<HTMLDivElement>(null);
 
   // config
@@ -268,22 +282,61 @@ export default function RegressionPage() {
     finally { setPromptAbLoadingReg(false); }
   }, [API_BASE]);
 
-  const runOptimize = useCallback(async (role: string, version: string, metric: string, threshold: string) => {
+  const runOptimize = useCallback(async (opts: {
+    roles: string[];
+    versions: Record<string, string>;
+    metric: string;
+    threshold: string;
+    baselineRunId: string | null;
+    goldenIds: string[];
+    earlyExit: boolean;
+    commitOnPlateau: boolean;
+    dryRun: boolean;
+    teamId: string;
+  }) => {
     setOptimizeLoading(true);
     setOptimizeResult(null);
-    setOptimizeTrajectory([]);
-    const addEvent = (type: string, text: string) =>
-      setOptimizeTrajectory(prev => [...prev, { type, text, ts: Date.now() }]);
+    // Reset per-role trajectory buckets so parallel runs stay isolated.
+    const initial: Record<string, Array<{type: string; text: string; ts: number}>> = {};
+    for (const r of opts.roles) initial[r] = [];
+    setOptimizeTrajectory(initial);
+    setOptimizeActiveRoleTab(opts.roles[0] || "");
+
+    const addEvent = (role: string, type: string, text: string) =>
+      setOptimizeTrajectory(prev => ({
+        ...prev,
+        [role]: [...(prev[role] || []), { type, text, ts: Date.now() }],
+      }));
+
+    // Used by the "Stop" button to cancel the SSE stream mid-flight.
+    const controller = new AbortController();
+    optimizeAbortRef.current = controller;
+
+    const finalByRole: Record<string, string> = {};
+
     try {
       const res = await fetch(`${API_BASE}/api/prompts/optimize/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ role, version: version || undefined, metric, threshold: parseFloat(threshold) || 0.7, model: "claude-sonnet-4.6" }),
+        body: JSON.stringify({
+          roles: opts.roles,
+          versions: opts.versions,
+          metric: opts.metric,
+          threshold: parseFloat(opts.threshold) || 0.7,
+          model: "claude-sonnet-4.6",
+          team_id: opts.teamId,
+          baseline_run_id: opts.baselineRunId || undefined,
+          golden_ids: opts.goldenIds.length ? opts.goldenIds : undefined,
+          early_exit: opts.earlyExit,
+          commit_on_plateau: opts.commitOnPlateau,
+          dry_run: opts.dryRun,
+        }),
+        signal: controller.signal,
       });
       if (!res.body) throw new Error("No SSE body");
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let buf = ""; let finalResponse = "";
+      let buf = "";
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -301,29 +354,81 @@ export default function RegressionPage() {
           if (!eventType || !dataStr) continue;
           try {
             const d = JSON.parse(dataStr);
-            if (eventType === "optimize_start") addEvent("start", `▶ Starting — role: ${d.role} | metric: ${d.metric} | version: ${d.version}`);
-            else if (eventType === "agent_start") addEvent("agent", `🤖 Agent: ${d.agent}`);
-            else if (eventType === "tool_start") addEvent("tool", `  ⚙ ${d.tool}(${Object.entries(d.args || {}).map(([k,v]) => `${k}=${String(v).slice(0,60)}`).join(", ")})`);
-            else if (eventType === "tool_end") addEvent("tool_result", `  ↳ ${d.output_preview}`);
-            else if (eventType === "version_registering") addEvent("version", `  📝 Registering new version for ${d.role}: ${d.rationale}`);
-            else if (eventType === "version_registered") addEvent("version_done", `  ✅ Registered ${d.role} @ ${d.version}`);
-            else if (eventType === "regression_result") addEvent("regression", `  📊 ${d.tool_output}`);
-            else if (eventType === "thinking") { addEvent("thinking", d.delta); finalResponse += d.delta; }
-            else if (eventType === "done") addEvent("done", `✓ Optimization complete — ${d.role} / ${d.metric}`);
-            else if (eventType === "error") addEvent("error", `✗ Error: ${d.message}`);
+            // Global (non-per-role) events keyed under the special bucket "_all".
+            const role: string = d.role || "_all";
+            if (eventType === "fanout_start") {
+              for (const r of (d.roles || [])) {
+                addEvent(r, "start", `▶ Starting optimisation — team: ${d.team_id} | parallel cap: ${d.parallel_cap} | baseline: ${d.baseline_run_id || "fresh"} | early_exit: ${d.early_exit}${d.dry_run ? " | DRY-RUN" : ""}${d.commit_on_plateau ? " | commit_on_plateau" : ""}`);
+              }
+            } else if (eventType === "optimize_start") {
+              addEvent(role, "start", `  model: ${d.model} | version: ${d.version} | metric: ${d.metric} | goldens: ${(d.golden_ids || []).length || "auto"}`);
+            } else if (eventType === "phase_start") {
+              addEvent(role, "phase", `── Phase: ${d.phase} ──`);
+            } else if (eventType === "baseline_computed") {
+              addEvent(role, "baseline", `📏 Baseline: pass_rate=${(d.pass_rate * 100).toFixed(1)}% | ${d.n_rows} rows`);
+            } else if (eventType === "cycle_start") {
+              addEvent(role, "cycle_start", `▶ Cycle ${d.cycle} (from ${d.from_version})`);
+            } else if (eventType === "llm_drafting") {
+              addEvent(role, "drafting", `  ✍  Drafting new prompt (cycle ${d.cycle})…`);
+            } else if (eventType === "tool_start") {
+              const argPreview = Object.entries(d.args || {}).map(([k,v]) => `${k}=${String(v).slice(0,60)}`).join(", ");
+              addEvent(role, "tool", `  ⚙ ${d.tool}${argPreview ? `(${argPreview})` : ""}`);
+            } else if (eventType === "tool_end") {
+              const passInfo = typeof d.pass_rate === "number" ? ` pass=${(d.pass_rate * 100).toFixed(1)}%` : "";
+              const metInfo = typeof d.metric_avg === "number" ? ` metric=${d.metric_avg.toFixed(3)}` : "";
+              addEvent(role, "tool_result", `  ↳ ${d.tool}${passInfo}${metInfo}${d.run_id ? ` run_id=${d.run_id}` : ""}`);
+            } else if (eventType === "cycle_end") {
+              const dp = (d.delta_pass_pp * 100).toFixed(1);
+              const dm = d.delta_metric.toFixed(3);
+              const icon = d.classification === "crossed" ? "✅"
+                        : d.classification === "improved" ? "📈"
+                        : d.classification === "plateau"  ? "➖"
+                        : d.classification === "marginal" ? "↗"
+                        : "📉";
+              addEvent(role, "cycle_end", `${icon} Cycle ${d.cycle}: ${d.classification} (ΔPass ${dp >= "0" ? "+" : ""}${dp}pp, Δmetric ${dm >= "0" ? "+" : ""}${dm}) → ${d.loop_decision}`);
+            } else if (eventType === "report") {
+              const c = d.cycles?.length || 0;
+              const winLine = d.winner_cycle != null ? `winner cycle-${d.winner_cycle}` : "no winner";
+              const commitLine = d.committed_version
+                ? `✅ committed as ${d.committed_version}`
+                : `ℹ️ no commit (${d.commit_status})`;
+              addEvent(role, "report", `📋 Report — cycles=${c} | ${winLine} | ${commitLine}`);
+              addEvent(role, "report", `   ${d.recommendation}`);
+              finalByRole[role] = d.recommendation || "";
+            } else if (eventType === "done") {
+              addEvent(role, "done", `✓ Optimisation complete — ${role} / ${d.status}${d.committed_version ? ` → ${d.committed_version}` : ""}`);
+            } else if (eventType === "fanout_done") {
+              // swallow — the final "done" per role already logged.
+            } else if (eventType === "error") {
+              const ctx = d.phase ? ` [phase=${d.phase}${d.cycle ? ` cycle=${d.cycle}` : ""}]` : "";
+              addEvent(role, "error", `✗ Error${ctx}: ${d.message}`);
+            }
           } catch { /* skip */ }
         }
       }
-      setOptimizeResult({ status: "completed", response: finalResponse });
+      setOptimizeResult({ status: "completed", responses: finalByRole });
       await loadPromptVersionsReg();
     } catch (e: any) {
-      setOptimizeResult({ status: "error", error: e.message });
-    } finally { setOptimizeLoading(false); }
+      if (e.name === "AbortError") {
+        setOptimizeResult({ status: "stopped", error: "Stopped by user" });
+      } else {
+        setOptimizeResult({ status: "error", error: e.message });
+      }
+    } finally {
+      optimizeAbortRef.current = null;
+      setOptimizeLoading(false);
+    }
   }, [API_BASE, loadPromptVersionsReg]);
 
+  const stopOptimize = useCallback(() => {
+    optimizeAbortRef.current?.abort();
+  }, []);
+
   useEffect(() => {
-    if (optimizeTrajectory.length > 0) trajectoryEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [optimizeTrajectory]);
+    // Auto-scroll to bottom of the *active* role panel as new events stream in.
+    const active = optimizeTrajectory[optimizeActiveRoleTab];
+    if (active && active.length > 0) trajectoryEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [optimizeTrajectory, optimizeActiveRoleTab]);
 
   useEffect(() => {
     loadGolden();
@@ -1775,55 +1880,211 @@ export default function RegressionPage() {
               {/* Prompt Optimizer */}
               <div className="card space-y-3">
                 <h3 className="text-xs font-semibold text-zinc-600 uppercase tracking-wide">Run Optimization Loop</h3>
-                <p className="text-xs text-[var(--text-muted)]">Triggers the PromptOptimizer agent to analyse failures, bootstrap if needed, and run up to 3 improvement cycles.</p>
+                <p className="text-xs text-[var(--text-muted)]">
+                  Triggers the PromptOptimizer agent on one or more roles in parallel (cap 2).
+                  You can pin the baseline to a past regression run, hand-pick which goldens to
+                  evaluate on, and let it early-exit once the threshold is crossed.
+                </p>
                 {showOptimizeSetup ? (
-                  <div className="p-3 border border-indigo-200 bg-indigo-50/40 rounded-lg space-y-2.5">
+                  <div className="p-3 border border-indigo-200 bg-indigo-50/40 rounded-lg space-y-3">
                     <div className="text-[11px] font-medium text-indigo-700 uppercase tracking-wide">Optimization Setup</div>
-                    <div className="grid grid-cols-2 gap-2">
+
+                    {/* Row 1: multi-role picker + metric + threshold + early-exit */}
+                    <div className="grid grid-cols-2 gap-3">
                       <div>
-                        <label className="text-[10px] text-zinc-500 block mb-0.5">Agent Role</label>
-                        <select value={optimizeRole} onChange={e => setOptimizeRole(e.target.value)} className="input text-xs w-full">
-                          {(promptVersionsReg ? Object.keys(promptVersionsReg.roles || {}) : [selectedRoleReg]).map((r: string) => <option key={r} value={r}>{r}</option>)}
-                        </select>
+                        <label className="text-[10px] text-zinc-500 block mb-1">Agent Roles (pick one or more)</label>
+                        <div className="max-h-28 overflow-y-auto border border-[var(--border)] rounded bg-white p-1.5 space-y-0.5">
+                          {(promptVersionsReg ? Object.keys(promptVersionsReg.roles || {}) : [selectedRoleReg]).map((r: string) => {
+                            const checked = optimizeRoles.has(r);
+                            const versions = promptVersionsReg?.roles?.[r] || [];
+                            return (
+                              <label key={r} className="flex items-center gap-2 text-xs px-1 py-0.5 rounded hover:bg-zinc-50 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={e => setOptimizeRoles(prev => {
+                                    const next = new Set(prev);
+                                    if (e.target.checked) next.add(r); else next.delete(r);
+                                    return next;
+                                  })}
+                                />
+                                <span className="font-medium">{r}</span>
+                                {checked && (
+                                  <select
+                                    value={optimizeVersions[r] || "latest"}
+                                    onChange={e => setOptimizeVersions(prev => ({ ...prev, [r]: e.target.value }))}
+                                    className="ml-auto input text-[10px] !py-0.5"
+                                  >
+                                    <option value="latest">latest</option>
+                                    {versions.map((v: any) => (
+                                      <option key={v.version} value={v.version}>{v.version}{v.cot_enhanced ? " [CoT]" : ""}</option>
+                                    ))}
+                                  </select>
+                                )}
+                              </label>
+                            );
+                          })}
+                        </div>
                       </div>
-                      <div>
-                        <label className="text-[10px] text-zinc-500 block mb-0.5">Target Version</label>
-                        <select value={optimizeVersion} onChange={e => setOptimizeVersion(e.target.value)} className="input text-xs w-full">
-                          <option value="latest">latest</option>
-                          {(promptVersionsReg?.roles?.[optimizeRole] || []).map((v: any) => <option key={v.version} value={v.version}>{v.version}{v.cot_enhanced ? " [CoT]" : ""}</option>)}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="text-[10px] text-zinc-500 block mb-0.5">Metric to Improve</label>
-                        <select value={optimizeMetric} onChange={e => setOptimizeMetric(e.target.value)} className="input text-xs w-full">
-                          {["step_efficiency","tool_usage","completeness","faithfulness","coherence","correctness","relevance"].map(m => <option key={m} value={m}>{m}</option>)}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="text-[10px] text-zinc-500 block mb-0.5">Threshold (0–1)</label>
-                        <input type="number" min="0" max="1" step="0.05" value={optimizeThreshold} onChange={e => setOptimizeThreshold(e.target.value)} className="input text-xs w-full" />
+
+                      <div className="space-y-2">
+                        <div>
+                          <label className="text-[10px] text-zinc-500 block mb-0.5">Metric to Improve</label>
+                          <select value={optimizeMetric} onChange={e => setOptimizeMetric(e.target.value)} className="input text-xs w-full">
+                            {["step_efficiency","tool_usage","completeness","faithfulness","coherence","correctness","relevance"].map(m => <option key={m} value={m}>{m}</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-zinc-500 block mb-0.5">Threshold (0–1)</label>
+                          <input type="number" min="0" max="1" step="0.05" value={optimizeThreshold} onChange={e => setOptimizeThreshold(e.target.value)} className="input text-xs w-full" />
+                        </div>
+                        <label className="flex items-center gap-2 text-xs">
+                          <input type="checkbox" checked={optimizeEarlyExit} onChange={e => setOptimizeEarlyExit(e.target.checked)} />
+                          <span>Early exit once threshold crossed (recommended)</span>
+                        </label>
+                        <label className="flex items-center gap-2 text-xs" title="Force-commit the winner even when no significant improvement was achieved. Defaults to OFF — the optimizer will only commit when a cycle crosses the threshold or improves ≥5pp pass-rate / ≥0.05 metric.">
+                          <input type="checkbox" checked={optimizeCommitOnPlateau} onChange={e => setOptimizeCommitOnPlateau(e.target.checked)} />
+                          <span>Force-commit even if no improvement</span>
+                        </label>
+                        <label className="flex items-center gap-2 text-xs" title="Run all cycles and report findings but register nothing in the prompt registry. Useful for previewing drafts.">
+                          <input type="checkbox" checked={optimizeDryRun} onChange={e => setOptimizeDryRun(e.target.checked)} />
+                          <span>Dry run (preview only, never commit)</span>
+                        </label>
                       </div>
                     </div>
+
+                    {/* Row 2: baseline source */}
+                    <div>
+                      <label className="text-[10px] text-zinc-500 block mb-1">Baseline</label>
+                      <div className="flex gap-2 items-center">
+                        <label className="flex items-center gap-1.5 text-xs">
+                          <input type="radio" checked={optimizeBaselineMode === "run"} onChange={() => setOptimizeBaselineMode("run")} />
+                          Past regression run
+                        </label>
+                        <label className="flex items-center gap-1.5 text-xs">
+                          <input type="radio" checked={optimizeBaselineMode === "fresh"} onChange={() => setOptimizeBaselineMode("fresh")} />
+                          Fresh bootstrap
+                        </label>
+                      </div>
+                      {optimizeBaselineMode === "run" && (
+                        <select
+                          value={optimizeBaselineRunId}
+                          onChange={e => setOptimizeBaselineRunId(e.target.value)}
+                          className="input text-xs w-full mt-1"
+                        >
+                          <option value="">— pick a run —</option>
+                          {regRuns.slice(0, 40).map((r: any) => (
+                            <option key={r.id} value={r.id}>
+                              {r.id.slice(0, 10)} · {r.model} · pass {r.passed}/{r.num_cases} · {r.created_at?.slice(0, 16).replace("T", " ")}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                    </div>
+
+                    {/* Row 3: golden subset */}
+                    <div>
+                      <label className="text-[10px] text-zinc-500 block mb-1">
+                        Golden tests ({optimizeGoldenIds.size} selected — empty = derive from baseline failures)
+                      </label>
+                      <div className="max-h-28 overflow-y-auto border border-[var(--border)] rounded bg-white p-1.5 grid grid-cols-2 gap-x-2">
+                        {goldenCases.filter(c => c.is_active).map(c => (
+                          <label key={c.id} className="flex items-center gap-1.5 text-[11px] px-1 py-0.5 rounded hover:bg-zinc-50 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={optimizeGoldenIds.has(c.id)}
+                              onChange={e => setOptimizeGoldenIds(prev => {
+                                const next = new Set(prev);
+                                if (e.target.checked) next.add(c.id); else next.delete(c.id);
+                                return next;
+                              })}
+                            />
+                            <span className="font-mono text-[10px] text-zinc-500">{c.id}</span>
+                            <span className="truncate">{c.name}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+
                     <div className="flex gap-2 pt-1">
-                      <button className="btn-primary text-xs" disabled={optimizeLoading} onClick={() => { setShowOptimizeSetup(false); runOptimize(optimizeRole, optimizeVersion, optimizeMetric, optimizeThreshold); }}>
-                        {optimizeLoading ? "Running…" : "▶ Run Optimization"}
+                      <button
+                        className="btn-primary text-xs"
+                        disabled={optimizeLoading || optimizeRoles.size === 0 || (optimizeBaselineMode === "run" && !optimizeBaselineRunId)}
+                        onClick={() => {
+                          setShowOptimizeSetup(false);
+                          const versionsMap: Record<string, string> = {};
+                          Array.from(optimizeRoles).forEach(r => {
+                            versionsMap[r] = optimizeVersions[r] || "latest";
+                          });
+                          runOptimize({
+                            roles: Array.from(optimizeRoles),
+                            versions: versionsMap,
+                            metric: optimizeMetric,
+                            threshold: optimizeThreshold,
+                            baselineRunId: optimizeBaselineMode === "run" ? optimizeBaselineRunId : null,
+                            goldenIds: Array.from(optimizeGoldenIds),
+                            earlyExit: optimizeEarlyExit,
+                            commitOnPlateau: optimizeCommitOnPlateau,
+                            dryRun: optimizeDryRun,
+                            teamId: teamId || "default",
+                          });
+                        }}
+                      >
+                        {optimizeLoading ? "Running…" : `▶ Run Optimization (${optimizeRoles.size} role${optimizeRoles.size === 1 ? "" : "s"})`}
                       </button>
                       <button className="btn-ghost text-xs" onClick={() => setShowOptimizeSetup(false)}>Cancel</button>
                     </div>
                   </div>
                 ) : (
                   <div className="flex items-center gap-3">
-                    <button className="btn-primary text-xs" onClick={() => { setOptimizeRole(selectedRoleReg); setOptimizeVersion("latest"); setShowOptimizeSetup(true); setOptimizeTrajectory([]); setOptimizeResult(null); }} disabled={optimizeLoading}>
+                    <button
+                      className="btn-primary text-xs"
+                      onClick={() => {
+                        setOptimizeRoles(new Set([selectedRoleReg]));
+                        setOptimizeVersions({ [selectedRoleReg]: "latest" });
+                        setOptimizeBaselineMode("run");
+                        setOptimizeBaselineRunId(regRuns[0]?.id || "");
+                        setOptimizeGoldenIds(new Set());
+                        setShowOptimizeSetup(true);
+                        setOptimizeTrajectory({});
+                        setOptimizeResult(null);
+                      }}
+                      disabled={optimizeLoading}
+                    >
                       {optimizeLoading ? "Running optimizer…" : "⚙ Configure & Run"}
                     </button>
-                    {optimizeLoading && <span className="text-xs text-[var(--text-muted)] animate-pulse">Running — may take 2–10 min…</span>}
+                    {optimizeLoading && (
+                      <>
+                        <span className="text-xs text-[var(--text-muted)] animate-pulse">Running — may take 2–10 min…</span>
+                        <button className="btn-secondary text-xs" onClick={stopOptimize}>■ Stop</button>
+                      </>
+                    )}
                   </div>
                 )}
-                {optimizeTrajectory.length > 0 && (
+
+                {/* Per-role trajectory tabs */}
+                {Object.keys(optimizeTrajectory).length > 0 && (
                   <div className="mt-2">
-                    <div className="text-[10px] font-medium text-zinc-500 uppercase tracking-wide mb-1.5">Live Trajectory</div>
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <div className="text-[10px] font-medium text-zinc-500 uppercase tracking-wide">Live Trajectory</div>
+                      <div className="flex gap-1 flex-wrap">
+                        {Object.keys(optimizeTrajectory).map(r => {
+                          const active = r === optimizeActiveRoleTab;
+                          const count = optimizeTrajectory[r]?.length || 0;
+                          return (
+                            <button
+                              key={r}
+                              onClick={() => setOptimizeActiveRoleTab(r)}
+                              className={`text-[10px] px-2 py-0.5 rounded border ${active ? "bg-indigo-600 text-white border-indigo-700" : "bg-white text-zinc-600 border-[var(--border)] hover:bg-zinc-50"}`}
+                            >
+                              {r} <span className={active ? "text-indigo-100" : "text-zinc-400"}>({count})</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
                     <div className="bg-zinc-950 rounded-lg p-3 max-h-72 overflow-y-auto font-mono text-[10px] space-y-0.5">
-                      {optimizeTrajectory.map((ev, i) => (
+                      {(optimizeTrajectory[optimizeActiveRoleTab] || []).map((ev, i) => (
                         <div key={i} className={ev.type==="agent"?"text-cyan-400":ev.type==="tool"?"text-yellow-300":ev.type==="tool_result"?"text-zinc-400":ev.type==="version"||ev.type==="version_done"?"text-green-400":ev.type==="regression"?"text-purple-300":ev.type==="thinking"?"text-zinc-300":ev.type==="start"?"text-blue-300 font-semibold":ev.type==="done"?"text-emerald-400 font-semibold":ev.type==="error"?"text-red-400":"text-zinc-500"}>
                           {ev.type !== "thinking" && <span className="text-zinc-600 mr-1">{new Date(ev.ts).toLocaleTimeString("en",{hour12:false,hour:"2-digit",minute:"2-digit",second:"2-digit"})}</span>}
                           {ev.text}
@@ -1833,14 +2094,26 @@ export default function RegressionPage() {
                     </div>
                   </div>
                 )}
+
                 {optimizeResult && (
                   <div className="mt-2">
-                    <div className={`text-xs font-medium mb-1 ${optimizeResult.status==="completed"?"text-emerald-600":"text-red-500"}`}>
-                      {optimizeResult.status==="completed" ? "✓ Optimization complete" : "✗ Error"}
+                    <div className={`text-xs font-medium mb-1 ${optimizeResult.status==="completed"?"text-emerald-600":optimizeResult.status==="stopped"?"text-amber-600":"text-red-500"}`}>
+                      {optimizeResult.status==="completed" ? "✓ Optimization complete" : optimizeResult.status==="stopped" ? "■ Stopped" : "✗ Error"}
                     </div>
-                    <pre className="text-[11px] bg-zinc-50 rounded p-3 max-h-64 overflow-y-auto border border-[var(--border)] whitespace-pre-wrap leading-relaxed text-zinc-700">
-                      {optimizeResult.response || optimizeResult.error}
-                    </pre>
+                    {optimizeResult.responses ? (
+                      <div className="space-y-2">
+                        {Object.entries(optimizeResult.responses as Record<string, string>).map(([role, text]) => (
+                          <div key={role}>
+                            <div className="text-[10px] font-medium text-indigo-700 uppercase tracking-wide mb-0.5">{role}</div>
+                            <pre className="text-[11px] bg-zinc-50 rounded p-3 max-h-56 overflow-y-auto border border-[var(--border)] whitespace-pre-wrap leading-relaxed text-zinc-700">{text}</pre>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <pre className="text-[11px] bg-zinc-50 rounded p-3 max-h-64 overflow-y-auto border border-[var(--border)] whitespace-pre-wrap leading-relaxed text-zinc-700">
+                        {optimizeResult.error}
+                      </pre>
+                    )}
                   </div>
                 )}
               </div>

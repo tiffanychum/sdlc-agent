@@ -550,6 +550,24 @@ def get_prompt_optimization_tools() -> list[StructuredTool]:
             default="v1",
             description="Prompt version to analyse (e.g. 'v1', 'v2').",
         )
+        run_id: Optional[str] = Field(
+            default=None,
+            description=(
+                "Optional regression run_id to pin the baseline. If set, only "
+                "rows from that specific run are returned (deterministic baseline). "
+                "If omitted, scans all historical runs for the role."
+            ),
+        )
+        golden_ids: Optional[list[str]] = Field(
+            default=None,
+            description=(
+                "Optional explicit golden case IDs to inspect (e.g. ['golden_001']). "
+                "When BOTH run_id AND golden_ids are provided, the tool switches into "
+                "'pinned' mode and returns ALL rows (passes + fails) with full "
+                "DeepEval sub-scores — so you can still optimise cases that pass "
+                "overall but have a low sub-metric."
+            ),
+        )
         limit: int = Field(default=20, description="Max results to return.")
 
     def _get_regression_failures(
@@ -557,11 +575,20 @@ def get_prompt_optimization_tools() -> list[StructuredTool]:
         metric: str = "step_efficiency",
         threshold: float = 0.7,
         version: str = "v1",
+        run_id: Optional[str] = None,
+        golden_ids: Optional[list[str]] = None,
         limit: int = 20,
     ) -> str:
         """
-        Return failing regression runs for an agent role filtered by a metric threshold.
-        Shows golden test ID, metric score, tool calls used, and failure patterns.
+        Return regression results for an agent role, filtered by metric threshold.
+
+        Two modes:
+          • Default (failures-only): returns only rows where overall_pass=0.
+          • Pinned (run_id + golden_ids both set): returns ALL rows for the pinned
+            (run, goldens) pair — including passes — with full DeepEval sub-scores
+            so the optimizer can target cases that pass overall but are weak on a
+            specific sub-metric.
+
         Use this to understand WHAT is failing and WHY before generating a prompt fix.
         """
         try:
@@ -569,31 +596,64 @@ def get_prompt_optimization_tools() -> list[StructuredTool]:
             from sqlalchemy import text
             session = get_session()
             try:
-                rows = session.execute(text(
-                    """SELECT golden_case_id, golden_case_name, actual_agent,
-                              quality_scores, deepeval_scores, actual_tool_calls,
-                              actual_latency_ms, overall_pass, created_at
-                       FROM regression_results
-                       WHERE actual_agent LIKE :role
-                         AND prompt_version = :version
-                         AND overall_pass = 0
-                       ORDER BY created_at DESC
-                       LIMIT :lim"""
-                ), {"role": f"%{role}%", "version": version, "lim": limit}).fetchall()
+                pinned_mode = bool(run_id and golden_ids)
+                sql = """SELECT golden_case_id, golden_case_name, actual_agent,
+                                quality_scores, deepeval_scores, actual_tool_calls,
+                                actual_latency_ms, overall_pass, created_at, run_id
+                         FROM regression_results
+                         WHERE actual_agent LIKE :role
+                           AND prompt_version = :version"""
+                params: dict = {"role": f"%{role}%", "version": version, "lim": limit}
+
+                if pinned_mode:
+                    # Pinned: include passes too — the optimizer is targeting a
+                    # specific (run, goldens) pair for sub-metric weaknesses.
+                    sql += " AND run_id = :run_id"
+                    params["run_id"] = run_id
+                    placeholders = ", ".join(f":gid_{i}" for i in range(len(golden_ids)))
+                    sql += f" AND golden_case_id IN ({placeholders})"
+                    for i, gid in enumerate(golden_ids):
+                        params[f"gid_{i}"] = gid
+                else:
+                    sql += " AND overall_pass = 0"
+                    if run_id:
+                        sql += " AND run_id = :run_id"
+                        params["run_id"] = run_id
+                    if golden_ids:
+                        placeholders = ", ".join(f":gid_{i}" for i in range(len(golden_ids)))
+                        sql += f" AND golden_case_id IN ({placeholders})"
+                        for i, gid in enumerate(golden_ids):
+                            params[f"gid_{i}"] = gid
+
+                sql += " ORDER BY created_at DESC LIMIT :lim"
+                rows = session.execute(text(sql), params).fetchall()
             finally:
                 session.close()
 
             if not rows:
+                if pinned_mode:
+                    return (
+                        f"No rows found for role={role} version={version} "
+                        f"run_id={run_id} golden_ids={golden_ids}. "
+                        "Verify that the specified run exists and that the goldens "
+                        "were actually executed against that role+version."
+                    )
                 return (
                     f"No failing runs found for role={role} version={version}. "
                     "Either all tests passed or no data exists for this version yet."
                 )
 
             import json as _json
-            lines = [
-                f"Failing regression runs — role={role} version={version} "
-                f"metric={metric} threshold={threshold} ({len(rows)} found):\n"
-            ]
+            header = (
+                f"Regression rows (PINNED mode — passes + fails) — "
+                f"role={role} version={version} run_id={run_id} "
+                f"metric={metric} threshold={threshold} ({len(rows)} rows):\n"
+                if pinned_mode
+                else f"Failing regression runs — role={role} version={version} "
+                     f"metric={metric} threshold={threshold} ({len(rows)} found):\n"
+            )
+            lines = [header]
+            weak_ids: list[str] = []
             for r in rows:
                 try:
                     qs = _json.loads(r[3]) if isinstance(r[3], str) else (r[3] or {})
@@ -603,16 +663,40 @@ def get_prompt_optimization_tools() -> list[StructuredTool]:
 
                 score = qs.get(metric) or ds.get(metric)
                 score_str = f"{score:.3f}" if score is not None else "N/A"
+                verdict = "PASS" if r[7] else "FAIL"
+                prefix = f"[{verdict}] " if pinned_mode else ""
                 lines.append(
-                    f"  [{r[0]}] {r[1] or ''} | {metric}={score_str} "
+                    f"  {prefix}[{r[0]}] {r[1] or ''} | {metric}={score_str} "
                     f"| tool_calls={r[5]} | latency={int(r[6] or 0)}ms"
                 )
-                # Show all sub-threshold metrics
                 all_scores = {**qs, **ds}
-                bad = [f"{k}={v:.2f}" for k, v in all_scores.items()
-                       if v is not None and isinstance(v, (int, float)) and v < threshold]
+                if pinned_mode:
+                    # In pinned mode always show full score dict — the optimizer
+                    # needs to reason about passes with weak sub-metrics too.
+                    pretty = ", ".join(
+                        f"{k}={v:.2f}" for k, v in all_scores.items()
+                        if v is not None and isinstance(v, (int, float))
+                    )
+                    if pretty:
+                        lines.append(f"    scores: {pretty}")
+                bad = [
+                    f"{k}={v:.2f}" for k, v in all_scores.items()
+                    if v is not None and isinstance(v, (int, float)) and v < threshold
+                ]
                 if bad:
-                    lines.append(f"    low metrics: {', '.join(bad)}")
+                    lines.append(f"    low metrics (<{threshold}): {', '.join(bad)}")
+                    weak_ids.append(r[0])
+
+            if pinned_mode:
+                unique_weak = list(dict.fromkeys(weak_ids))
+                lines.append(
+                    f"\nSummary: {len(unique_weak)}/{len(rows)} rows have at least one "
+                    f"sub-metric below {threshold}."
+                )
+                if unique_weak:
+                    lines.append(
+                        f"Candidate golden_ids with weak sub-metrics: {unique_weak}"
+                    )
 
             return "\n".join(lines)
         except Exception as e:
@@ -803,12 +887,25 @@ def get_prompt_optimization_tools() -> list[StructuredTool]:
             default="claude-sonnet-4.6",
             description="LLM model to use for this regression subset.",
         )
+        team_id: str = Field(
+            default="default",
+            description=(
+                "Team to run against ('default', 'sdlc_2_0', …). Pass the team "
+                "the baseline was collected on so results are directly comparable."
+            ),
+        )
+        max_parallel: int = Field(
+            default=3,
+            description="How many cases to run concurrently (1 = serial).",
+        )
 
     def _run_regression_subset(
         role: str,
         prompt_version: str,
         golden_ids: list,
         model: str = "claude-sonnet-4.6",
+        team_id: str = "default",
+        max_parallel: int = 3,
     ) -> str:
         """
         Run a focused regression subset on specific golden tests with a given prompt version.
@@ -825,12 +922,12 @@ def get_prompt_optimization_tools() -> list[StructuredTool]:
 
             runner = RegressionRunner(
                 model=model,
-                team_id="default",
+                team_id=team_id,
                 prompt_version=prompt_version,
             )
 
             async def _run():
-                return await runner.run_subset(golden_ids)
+                return await runner.run_subset(golden_ids, max_parallel=max_parallel)
 
             try:
                 loop = asyncio.get_event_loop()
@@ -849,7 +946,8 @@ def get_prompt_optimization_tools() -> list[StructuredTool]:
 
             lines = [
                 f"Regression subset — role={role} version={prompt_version} "
-                f"model={model} ({len(results)} tests):\n"
+                f"model={model} team={team_id} parallel={max_parallel} "
+                f"({len(results)} tests):\n"
             ]
             passed = sum(1 for r in results if r.get("overall_pass"))
             lines.append(f"  Pass rate: {passed}/{len(results)}\n")
@@ -986,8 +1084,11 @@ def get_prompt_optimization_tools() -> list[StructuredTool]:
             func=_get_regression_failures,
             name="get_regression_failures",
             description=(
-                "Get failing regression runs for an agent role filtered by a metric and threshold. "
-                "Returns golden test ID, metric scores, tool call counts, and failure patterns. "
+                "Get regression rows for an agent role. Default mode returns only "
+                "FAILED runs (overall_pass=0). Pinned mode — when BOTH run_id AND "
+                "golden_ids are provided — returns ALL rows (passes + fails) for the "
+                "pinned run/goldens pair with full DeepEval sub-scores, so you can "
+                "optimise on cases that pass overall but have a low sub-metric. "
                 "START HERE when asked to optimize a prompt."
             ),
             args_schema=RegressionFailuresArgs,

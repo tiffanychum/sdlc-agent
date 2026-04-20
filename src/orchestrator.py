@@ -505,7 +505,16 @@ async def build_orchestrator_from_team(
     strategy_override: str = None,
     prompt_versions_by_role: dict = None,
     routing_prompt_versions: dict = None,
+    prompt_text_overrides: dict = None,
 ):
+    """Build an orchestrator graph for a team.
+
+    ``prompt_text_overrides`` (optional) maps ``role → prompt_text`` and takes
+    precedence over both ``prompt_versions_by_role`` and the registry lookup.
+    Used by the global Prompt Optimizer to validate a candidate prompt in memory
+    without registering it — the orchestrator sees the raw text for that role
+    and the rest of the team uses their registered versions.
+    """
     # Deferred imports to avoid circular imports at module load time.
     from src.db.database import get_session
     from src.db.models import Team, Agent, AgentToolMapping
@@ -551,6 +560,13 @@ async def build_orchestrator_from_team(
                         system_prompt = versioned
                 except Exception:
                     pass  # fall back to DB value
+
+            # In-memory prompt-text override — beats registry lookup and pv map.
+            # Used by the global Prompt Optimizer to validate an unregistered
+            # candidate prompt against the regression suite.
+            if prompt_text_overrides and a.role in prompt_text_overrides:
+                system_prompt = prompt_text_overrides[a.role]
+                pv = f"{pv}+override"
 
             agents_config.append({
                 "id": a.id, "name": a.name, "role": a.role,

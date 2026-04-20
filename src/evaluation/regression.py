@@ -156,6 +156,8 @@ class RegressionRunner:
         prompt_version: str = "v1",
         team_id: str = "default",
         prompt_versions_by_role: dict = None,
+        prompt_text_overrides: dict = None,
+        persist: bool = True,
     ):
         self.model = model or config.llm.model
         self.prompt_version = prompt_version
@@ -163,20 +165,33 @@ class RegressionRunner:
         # Per-role overrides take priority over the global prompt_version.
         # e.g. {"coder": "v3", "planner": "v2"}
         self.prompt_versions_by_role = prompt_versions_by_role or {}
+        # In-memory prompt-text overrides (role -> full prompt text). Used by
+        # the global Prompt Optimizer to validate a candidate prompt WITHOUT
+        # registering it in the DB. Takes precedence over version lookup.
+        self.prompt_text_overrides = prompt_text_overrides or {}
+        # When False, no EvalRun / RegressionResult rows are written — used by
+        # dry-run / in-memory cycle validation to keep the DB clean.
+        self.persist = persist
 
-    async def run_subset(self, golden_ids: list[str]) -> list[dict]:
+    async def run_subset(
+        self,
+        golden_ids: list[str],
+        max_parallel: int = 3,
+    ) -> list[dict]:
         """
         Run a focused regression on specific golden test IDs.
         Returns a list of per-test result dicts (not a full eval_run record).
         Used by the PromptOptimizer agent's run_regression_subset tool.
+        Cases execute concurrently up to `max_parallel` at a time.
         """
-        full = await self.run(case_ids=golden_ids)
+        full = await self.run(case_ids=golden_ids, max_parallel=max_parallel)
         return full.get("results", [])
 
     async def run(
         self,
         case_ids: list[str] = None,
         baseline_run_id: str = None,
+        max_parallel: int = 1,
     ) -> dict:
         """Run regression suite on selected golden cases. Returns full results."""
         cases = get_active_cases(case_ids)
@@ -252,6 +267,7 @@ class RegressionRunner:
                     model_override=self.model or None,
                     strategy_override=strat,
                     prompt_versions_by_role=self.prompt_versions_by_role or None,
+                    prompt_text_overrides=self.prompt_text_overrides or None,
                 )
                 orchestrator_cache[strat] = graph
                 routing_versions_cache[strat] = getattr(
@@ -268,25 +284,46 @@ class RegressionRunner:
             sr["run_id"] = run_id
             results.append(sr)
 
-        for case in cases:
-            resolved_strat = case_strategy_map[case.id]
-            orchestrator = orchestrator_cache[resolved_strat]
-            result = await self._run_single_case(orchestrator, case, baseline_results.get(case.id))
-            result["run_id"] = run_id
-            # Record strategy provenance: what was configured vs what ran.
-            result["expected_strategy"] = getattr(case, "expected_strategy", None) or getattr(case, "strategy", None)
-            result["actual_strategy"] = resolved_strat  # always a real strategy name now
-            # Record routing prompt versions for traceability
-            rv = routing_versions_cache.get(resolved_strat, {})
-            result["router_prompt_version"] = (
-                f"supervisor={rv.get('supervisor','v1')} "
-                f"meta_router={rv.get('meta_router','v1')} "
-                f"router={rv.get('router','v1')}"
+        # ── Case execution ───────────────────────────────────────────────────
+        # When max_parallel > 1 (used by the PromptOptimizer's run_regression_subset
+        # tool, among others) cases execute concurrently. The serial default
+        # (max_parallel=1) preserves behaviour for callers that rely on ordered
+        # side-effects or stable logs.
+        sem = asyncio.Semaphore(max(1, max_parallel))
+
+        async def _run_one(case):
+            async with sem:
+                resolved_strat = case_strategy_map[case.id]
+                orchestrator = orchestrator_cache[resolved_strat]
+                result = await self._run_single_case(
+                    orchestrator, case, baseline_results.get(case.id)
+                )
+                result["run_id"] = run_id
+                result["expected_strategy"] = (
+                    getattr(case, "expected_strategy", None)
+                    or getattr(case, "strategy", None)
+                )
+                result["actual_strategy"] = resolved_strat
+                rv = routing_versions_cache.get(resolved_strat, {})
+                result["router_prompt_version"] = (
+                    f"supervisor={rv.get('supervisor','v1')} "
+                    f"meta_router={rv.get('meta_router','v1')} "
+                    f"router={rv.get('router','v1')}"
+                )
+                return result
+
+        if max_parallel <= 1:
+            for case in cases:
+                results.append(await _run_one(case))
+        else:
+            gathered = await asyncio.gather(
+                *(_run_one(c) for c in cases), return_exceptions=False
             )
-            results.append(result)
+            results.extend(gathered)
 
         summary = self._build_summary(run_id, results, cases)
-        self._persist(run_id, results, summary)
+        if self.persist:
+            self._persist(run_id, results, summary)
 
         return {
             "run_id": run_id,
@@ -360,6 +397,7 @@ class RegressionRunner:
                     model_override=self.model or None,
                     strategy_override=strat,
                     prompt_versions_by_role=self.prompt_versions_by_role or None,
+                    prompt_text_overrides=self.prompt_text_overrides or None,
                 )
                 orchestrator_cache[strat] = graph
                 routing_versions_cache[strat] = getattr(
@@ -447,7 +485,8 @@ class RegressionRunner:
         await asyncio.gather(*[_run_one(case, i) for i, case in enumerate(cases)])
 
         summary = self._build_summary(run_id, results, cases)
-        self._persist(run_id, results, summary)
+        if self.persist:
+            self._persist(run_id, results, summary)
 
         await emit("run_done", {
             "run_id": run_id,
