@@ -9,10 +9,62 @@ cost/latency regressions.
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from datetime import datetime
 from typing import AsyncIterator, Callable, Awaitable
+
+# ── Regression-mode HITL auto-confirm (Fix #2) ────────────────────────────
+# Some agents end a turn with a plain-text confirmation prompt ("Shall I
+# proceed with step 2?", "Please confirm before I push", etc.) instead of
+# calling ask_human.  In interactive chat the user answers; in regression
+# mode the graph terminates and we record the task as incomplete.
+#
+# When that signature is detected at the end of a run, we inject ONE
+# deterministic "Yes, proceed" message and re-invoke the graph.  Capped at
+# one retry per case so we can never loop.
+# Quote-char class covering straight + smart/curly quotes (Claude & GPT both
+# use curly quotes in natural prose).  [" ' " ' " ]  ↓
+_Q = "['\"\u2018\u2019\u201c\u201d\u2032\u2033]"
+_CONFIRM_TRIGGERS = (
+    re.compile(r"\bshall i (proceed|execute|continue|run|do)\b", re.I),
+    re.compile(r"\bshould i (proceed|execute|continue|run|do)\b", re.I),
+    re.compile(r"\bdo you want me to (proceed|continue|execute|run)\b", re.I),
+    # "Please confirm ..." in any common framing (including "or adjust")
+    re.compile(r"\bplease confirm\b", re.I),
+    re.compile(r"\bawait(ing)? (your )?confirmation\b", re.I),
+    # Reply "Yes" / reply yes / reply with yes — straight or curly quotes.
+    # Also handle "Reply 'Approved'" (past tense) and "approve" alone.
+    re.compile(rf"\breply (with )?{_Q}?(yes|proceed|confirm|approv(e|ed))\b", re.I),
+    # "If approved, I will ..." and "Approved?" variants used by gpt-5
+    re.compile(r"\bif approved,?\s*i['\u2019]?ll\b", re.I),
+    re.compile(r"\bif approved,?\s*i will\b", re.I),
+    re.compile(r"\bconfirm (this )?(plan|before proceeding|and i will)\b", re.I),
+    re.compile(r"\bwould you like me to (proceed|continue|execute|run)\b", re.I),
+    # Cursor/OpenCode-style plan-approval gate: "Approve this plan?" / "A) Approve"
+    re.compile(r"\bapprove (this )?plan\b", re.I),
+    re.compile(r"^\s*A\)\s*Approve\b", re.I | re.M),
+    re.compile(r"\bproceed\?\s*$", re.I | re.M),
+)
+
+
+def _looks_like_hitl_wait(messages: list) -> bool:
+    """True when the run ended on a plain-text confirmation question with no
+    tool_calls attached (i.e. the agent asked the user a question instead of
+    calling ask_human).  Only checks the LAST AIMessage.
+    """
+    from langchain_core.messages import AIMessage
+    if not messages:
+        return False
+    last = messages[-1]
+    if not isinstance(last, AIMessage):
+        return False
+    if getattr(last, "tool_calls", None):
+        return False
+    text = _extract_text(last.content if hasattr(last, "content") else "") or ""
+    tail = text[-1500:]  # scan end of message — that's where the question lives
+    return any(p.search(tail) for p in _CONFIRM_TRIGGERS)
 
 from src.db.database import get_session
 
@@ -751,6 +803,50 @@ class RegressionRunner:
                     resume_cmd = LGCommand(resume=interrupt_map)
 
                 result = await orchestrator.ainvoke(resume_cmd, config=config)
+
+            # Fix #2: HITL auto-confirm.  If the graph finished (no interrupts)
+            # but the final AI message is a plain-text confirmation question
+            # — "shall I proceed?", "please confirm", etc. — inject ONE
+            # deterministic approval and re-invoke.  Only runs once per case.
+            try:
+                from langchain_core.messages import HumanMessage as _HM
+                final_msgs = list(result.get("messages", []) or [])
+                if _looks_like_hitl_wait(final_msgs):
+                    logger.info(
+                        "HITL auto-confirm fired for case %s — injecting "
+                        "deterministic approval.", getattr(case, "id", "?"),
+                    )
+                    result = await orchestrator.ainvoke(
+                        {"messages": [*final_msgs, _HM(content=(
+                            "Yes, proceed exactly as planned. Execute now and "
+                            "complete the task end-to-end without asking for "
+                            "further confirmation."
+                        ))]},
+                        config=config,
+                    )
+                    # After the re-invoke we may have generated new interrupts —
+                    # drain up to 5 of them the same way as the main loop above.
+                    for _ in range(5):
+                        state = await orchestrator.aget_state(config)
+                        if not state.next:
+                            break
+                        interrupt_map: dict = {}
+                        if state.tasks:
+                            for task in state.tasks:
+                                if hasattr(task, "interrupts") and task.interrupts:
+                                    for intr in task.interrupts:
+                                        iv = intr.value if hasattr(intr, "value") else intr
+                                        interrupt_map[intr.id] = _auto_approve_hitl(iv, case)
+                        if not interrupt_map:
+                            resume_cmd = LGCommand(resume={"approved": True,
+                                                           "answer": "auto-approved for regression test"})
+                        elif len(interrupt_map) == 1:
+                            resume_cmd = LGCommand(resume=next(iter(interrupt_map.values())))
+                        else:
+                            resume_cmd = LGCommand(resume=interrupt_map)
+                        result = await orchestrator.ainvoke(resume_cmd, config=config)
+            except Exception as _e:
+                logger.warning("HITL auto-confirm path raised %s — continuing with previous result.", _e)
 
         except Exception as e:
             return self._error_result(case, str(e), time.time() - start)

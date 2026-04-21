@@ -25,6 +25,7 @@ from src.mcp_servers.memory_server import mcp as mem_mcp
 from src.mcp_servers.planner_server import mcp as planner_mcp
 from src.mcp_servers.github_server import mcp as github_mcp
 from src.mcp_servers.jira_server import mcp as jira_mcp
+from src.tools.tool_retry import invoke_with_recovery
 
 
 # ── Schema conversion ─────────────────────────────────────────────
@@ -107,8 +108,12 @@ def _make_langchain_tool(tool, mcp_server) -> StructuredTool:
             k: v for k, v in kwargs.items()
             if k in _required or v is not None
         }
-        result = await mcp_server.call_tool(tool_name, cleaned)
-        return result.content[0].text if result.content else "No result"
+
+        async def _call():
+            result = await mcp_server.call_tool(tool_name, cleaned)
+            return result.content[0].text if result.content else "No result"
+
+        return await invoke_with_recovery(tool_name, cleaned, _call)
 
     return StructuredTool.from_function(
         coroutine=_invoke,
@@ -156,6 +161,23 @@ async def get_web_tools() -> list[StructuredTool]:
 
 async def get_memory_tools() -> list[StructuredTool]:
     return await _get_tools_for(mem_mcp)
+
+
+# Plan-management tool names — part of the `memory` MCP server but we expose a
+# plan-free subset (`memory_kv`) for agents that should produce their plan as a
+# final-message artefact instead of going through a separate `create_plan` /
+# `update_plan_step` tool-call round-trip (e.g. sdlc_2_0's builder / planner_v2).
+_MEMORY_PLAN_NAMES = {"create_plan", "update_plan_step"}
+
+
+async def get_memory_kv_tools() -> list[StructuredTool]:
+    """Return memory tools excluding plan-management (create_plan/update_plan_step).
+
+    Used by agents that should treat the plan as an output artefact in their
+    final AIMessage rather than persisting it via a separate tool call.
+    """
+    all_mem = await _get_tools_for(mem_mcp)
+    return [t for t in all_mem if t.name not in _MEMORY_PLAN_NAMES]
 
 
 async def get_planner_tools() -> list[StructuredTool]:
@@ -364,6 +386,7 @@ async def get_all_tools() -> dict[str, list[StructuredTool]]:
         "git": await get_git_tools(),
         "web": await get_web_tools(),
         "memory": await get_memory_tools(),
+        "memory_kv": await get_memory_kv_tools(),
         "planner": await get_planner_tools(),
         "github": await get_github_tools(),
         "jira": await get_jira_tools(),

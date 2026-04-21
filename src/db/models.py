@@ -9,7 +9,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Column, String, Text, Float, Integer, Boolean,
-    DateTime, ForeignKey, JSON,
+    DateTime, ForeignKey, JSON, UniqueConstraint,
 )
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -230,6 +230,43 @@ class RegressionResult(Base):
     eval_run = relationship("EvalRun", back_populates="regression_results")
 
 
+# ── Adaptive A/B Judge Cache ─────────────────────────────────────
+#
+# One row per (run_a, run_b, golden_id) judgment. Keeps Opus-level pairwise
+# analyses reproducible + cheap on re-view. Use the ↻ button in the UI to
+# re-run a judgement; UniqueConstraint prevents duplicate cache entries.
+
+class ABJudgeResult(Base):
+    __tablename__ = "ab_judge_results"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    run_a = Column(String, nullable=False, index=True)
+    run_b = Column(String, nullable=False, index=True)
+    golden_id = Column(String, nullable=False, index=True)
+    judge_model = Column(String, nullable=False)
+
+    # Convenience fields (denormalised from payload for quick lookups)
+    winner = Column(String, nullable=True)            # "A" | "B" | "tie"
+    confidence = Column(Float, nullable=True)
+    rubric_score_a = Column(Float, nullable=True)
+    rubric_score_b = Column(Float, nullable=True)
+
+    # Full judge JSON — task_dimensions / per_dimension / gap_analysis / verdict
+    payload = Column(JSON, nullable=False)
+
+    # Cross-team flag: true when run_a.team_id != run_b.team_id at judge time
+    cross_team = Column(Boolean, default=False)
+    team_a = Column(String, nullable=True)
+    team_b = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("run_a", "run_b", "golden_id", name="uq_ab_judge_triplet"),
+    )
+
+
 # ── RAG Pipeline ─────────────────────────────────────────────────
 
 class RagConfig(Base):
@@ -330,6 +367,14 @@ class PromptVersionEntry(Base):
     __tablename__ = "prompt_version_entries"
 
     id = Column(String, primary_key=True, default=_uuid)
+    # team_id scopes the prompt to a specific Team.id, or NULL for "global".
+    # Agent-role prompts (coder, qa, …) are currently stored globally.  The
+    # orchestration roles (supervisor, router) are seeded per-team on the
+    # first orchestrator build so each team can evolve them independently
+    # (dev team's `supervisor` uses the full 5-step pipeline template,
+    # sdlc_2_0's `supervisor` uses the 2-agent template).  meta_router
+    # remains global because its text is already team-agnostic.
+    team_id = Column(String, nullable=True, index=True)
     role = Column(String, nullable=False, index=True)       # e.g. "coder"
     version = Column(String, nullable=False)                # e.g. "v1", "v2"
     prompt_text = Column(Text, nullable=False)

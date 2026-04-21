@@ -110,6 +110,20 @@ def _migrate(engine):
                 conn.execute(text("ALTER TABLE agents ADD COLUMN prompt_version TEXT DEFAULT 'v1'"))
             conn.commit()
 
+    # Patch 5: team-scope PromptVersionEntry.  Existing rows keep team_id = NULL
+    # (= "global"), which is the correct default — the agent-role prompts were
+    # never team-specific anyway, and the first orchestrator build after this
+    # migration will seed per-team supervisor/router rows on demand.
+    if "prompt_version_entries" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("prompt_version_entries")}
+        with engine.connect() as conn:
+            if "team_id" not in cols:
+                conn.execute(text("ALTER TABLE prompt_version_entries ADD COLUMN team_id TEXT"))
+                # Backfill existing rows explicitly as NULL (global) — no-op in
+                # SQLite but keeps the intent obvious to future readers.
+                conn.execute(text("UPDATE prompt_version_entries SET team_id = NULL WHERE team_id IS NULL"))
+            conn.commit()
+
 
 def get_session() -> Session:
     engine = get_engine()
