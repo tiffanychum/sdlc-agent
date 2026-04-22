@@ -119,11 +119,6 @@ Golden dataset manager, run configuration (model + strategy + prompt version), p
 
 ![Regression](docs/screenshots/regression.png)
 
-### Evaluation
-Agent and RAG evaluation tabs — G-Eval quality scores, DeepEval agentic/RAG metrics with reasoning, all-request breakdown.
-
-![Evaluation](docs/screenshots/evaluation.png)
-
 ---
 
 ## Evaluation Pipeline
