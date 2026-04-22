@@ -134,6 +134,17 @@ export default function RegressionPage() {
   const [abLoading, setAbLoading] = useState(false);
   const [abExpandAgent, setAbExpandAgent] = useState<string | null>(null);
 
+  // A/B v2: cross-project workflow (pick runs first, then overlapping golden)
+  const [abScope, setAbScope] = useState<"same" | "cross">("same");
+  const [abV2Runs, setAbV2Runs] = useState<any[]>([]);
+  const [abV2RunsLoading, setAbV2RunsLoading] = useState(false);
+  const [abV2Overlap, setAbV2Overlap] = useState<any>(null);
+  const [abV2OverlapLoading, setAbV2OverlapLoading] = useState(false);
+  // Adaptive LLM judge panel
+  const [abJudgeResult, setAbJudgeResult] = useState<any>(null);
+  const [abJudgeLoading, setAbJudgeLoading] = useState(false);
+  const [abJudgeError, setAbJudgeError] = useState<string>("");
+
   // Performance analysis (moved from monitoring)
   const [perfReport, setPerfReport] = useState<any>(null);
   const [perfDays, setPerfDays] = useState(7);
@@ -153,11 +164,25 @@ export default function RegressionPage() {
   const [optimizeLoading, setOptimizeLoading] = useState(false);
   const [optimizeResult, setOptimizeResult] = useState<any>(null);
   const [showOptimizeSetup, setShowOptimizeSetup] = useState(false);
-  const [optimizeRole, setOptimizeRole] = useState("coder");
-  const [optimizeVersion, setOptimizeVersion] = useState("latest");
+  // Multi-role optimisation: Set keeps selection deterministic and unique.
+  const [optimizeRoles, setOptimizeRoles] = useState<Set<string>>(new Set(["coder"]));
+  // Per-role target version. When a role has no entry here we send "latest".
+  const [optimizeVersions, setOptimizeVersions] = useState<Record<string, string>>({});
   const [optimizeMetric, setOptimizeMetric] = useState("step_efficiency");
   const [optimizeThreshold, setOptimizeThreshold] = useState("0.7");
-  const [optimizeTrajectory, setOptimizeTrajectory] = useState<Array<{type: string; text: string; ts: number}>>([]);
+  // Baseline mode: pick a past run ('run') or let the optimizer bootstrap
+  // ('fresh'). We recommend 'run' because it gives deterministic baselines.
+  const [optimizeBaselineMode, setOptimizeBaselineMode] = useState<"run" | "fresh">("run");
+  const [optimizeBaselineRunId, setOptimizeBaselineRunId] = useState<string>("");
+  // Explicit golden subset. Empty = let the optimizer derive from failures.
+  const [optimizeGoldenIds, setOptimizeGoldenIds] = useState<Set<string>>(new Set());
+  const [optimizeEarlyExit, setOptimizeEarlyExit] = useState(true);
+  const [optimizeCommitOnPlateau, setOptimizeCommitOnPlateau] = useState(false);
+  const [optimizeDryRun, setOptimizeDryRun] = useState(false);
+  // One trajectory panel per role so parallel runs stay legible.
+  const [optimizeTrajectory, setOptimizeTrajectory] = useState<Record<string, Array<{type: string; text: string; ts: number}>>>({});
+  const [optimizeActiveRoleTab, setOptimizeActiveRoleTab] = useState<string>("");
+  const optimizeAbortRef = useRef<AbortController | null>(null);
   const trajectoryEndRef = useRef<HTMLDivElement>(null);
 
   // config
@@ -168,6 +193,31 @@ export default function RegressionPage() {
   const [roleVersionsMap, setRoleVersionsMap] = useState<Record<string, any[]>>({});
   // Per-role selected prompt version for the upcoming run
   const [rolePromptVerMap, setRolePromptVerMap] = useState<Record<string, string>>({});
+  // Roles that belong to the *currently-selected* team (e.g. sdlc_2_0 →
+  // ["builder", "planner_v2"]).  Used to scope every role-list in this page
+  // (Run Tests, Prompt Versioning, Prompt Optimizer) so project A can't
+  // see / edit / run project B's agents.  The three routing roles
+  // (supervisor / meta_router / router) are considered global and always
+  // included — they configure the orchestrator, not the team's own agents.
+  const [teamAgentRoles, setTeamAgentRoles] = useState<string[]>([]);
+
+  // The canonical "common" routing roles.  After Patch 5 these become
+  // team-scoped rows in the registry, but for UI-filter purposes they are
+  // always visible to every team.
+  const COMMON_ROUTING_ROLES = ["supervisor", "meta_router", "router"] as const;
+
+  // Helper: return a copy of a role→X map (e.g. registry versions) scoped to
+  // the active team's agents + common routing roles.  Falls through to the
+  // full map until the team data has loaded, so the UI doesn't flash empty.
+  const scopeRolesToTeam = useCallback(<T,>(all: Record<string, T>): Record<string, T> => {
+    if (!teamAgentRoles.length) return all;
+    const allow = new Set<string>([...teamAgentRoles, ...COMMON_ROUTING_ROLES]);
+    const out: Record<string, T> = {};
+    for (const [role, v] of Object.entries(all)) {
+      if (allow.has(role)) out[role] = v;
+    }
+    return out;
+  }, [teamAgentRoles]);
 
   // `selectedTeam` is provided by useTeam() above.
 
@@ -183,23 +233,47 @@ export default function RegressionPage() {
   useEffect(() => {
     if (!teamId) return;
     Promise.all([
-      api.prompts.versions().catch(() => ({ roles: {} })),
+      // Patch 5: pass teamId so supervisor/router return team-scoped rows
+      // (with automatic fallback to global rows for brand-new teams).
+      api.prompts.versions(undefined, teamId).catch(() => ({ roles: {} })),
       api.teams.get(teamId).catch(() => ({ agents: [] })),
     ]).then(([versionsRes, teamData]: [any, any]) => {
-      const roles = versionsRes?.roles || {};
-      setRoleVersionsMap(roles);
+      const allRoles = versionsRes?.roles || {};
+      const agentRoles = (teamData?.agents || [])
+        .map((a: any) => a.role)
+        .filter((r: any): r is string => Boolean(r));
+      setTeamAgentRoles(agentRoles);
+
+      // Scope the Run Tests role list to this team's agents + common
+      // routing roles only.  Without this, selecting sdlc_2_0 would still
+      // show dev-team roles (coder, qa, devops, …) in the prompt-version
+      // selector, which is confusing and lets users override prompts for
+      // agents that aren't even in the active team.
+      const allow = new Set<string>([...agentRoles, ...COMMON_ROUTING_ROLES]);
+      const scopedRoles: Record<string, any[]> = {};
+      for (const [role, versions] of Object.entries(allRoles) as [string, any[]][]) {
+        if (allow.has(role)) scopedRoles[role] = versions;
+      }
+      setRoleVersionsMap(scopedRoles);
+
       const studioVersions: Record<string, string> = {};
       for (const agent of (teamData?.agents || [])) {
         if (agent.role && agent.prompt_version) studioVersions[agent.role] = agent.prompt_version;
       }
+      // Default each role to the *latest* registry version.
+      // list_versions is ordered newest-first (created_at.desc) so
+      // versions[0] is always the latest, even when the only row is v1.
+      // If Studio has pinned a non-v1 version for the role, respect that
+      // pin (the user explicitly chose it); otherwise pick registry[0].
       const defaults: Record<string, string> = {};
-      for (const [role, versions] of Object.entries(roles) as [string, any[]][]) {
+      for (const [role, versions] of Object.entries(scopedRoles) as [string, any[]][]) {
+        const allVersions = versions as any[];
+        const latestVer = allVersions[0]?.version;
         const studioVer = studioVersions[role];
         if (studioVer && studioVer !== "v1") {
           defaults[role] = studioVer;
-        } else {
-          const latest = (versions as any[]).find((v: any) => v.version !== "v1");
-          if (latest) defaults[role] = latest.version;
+        } else if (latestVer) {
+          defaults[role] = latestVer;
         }
       }
       setRolePromptVerMap(defaults);
@@ -217,7 +291,31 @@ export default function RegressionPage() {
     setAbRunIdA("");
     setAbRunIdB("");
     setAbResult(null);
+    setAbV2Runs([]);
+    setAbV2Overlap(null);
+    setAbJudgeResult(null);
+    setAbJudgeError("");
   }, [teamId]);
+
+  // If the currently-selected role in the Prompt Versioning tab, or the
+  // roles chosen in the Prompt Optimizer, no longer belong to the active
+  // team (e.g. user switched from dev team → sdlc_2_0 with {builder,
+  // planner_v2}), snap them back to a valid role so the right-hand panels
+  // don't show empty state / operate on invisible rows.
+  useEffect(() => {
+    if (!teamAgentRoles.length) return;
+    const allow = new Set<string>([...teamAgentRoles, ...COMMON_ROUTING_ROLES]);
+    if (!allow.has(selectedRoleReg)) {
+      setSelectedRoleReg(teamAgentRoles[0]);
+      setPromptDiffReg(null);
+      setPromptAbResultReg(null);
+    }
+    setOptimizeRoles(prev => {
+      const filtered = Array.from(prev).filter(r => allow.has(r));
+      if (filtered.length === prev.size) return prev;
+      return new Set<string>(filtered.length ? filtered : [teamAgentRoles[0]]);
+    });
+  }, [teamAgentRoles, selectedRoleReg]);
 
   const loadGolden = useCallback(async () => {
     try { const c = await api.golden.list(); setGoldenCases(c); } catch { /* ignore */ }
@@ -246,17 +344,24 @@ export default function RegressionPage() {
 
   const loadPromptVersionsReg = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/prompts/versions`);
+      // Patch 5: scope to the active team so supervisor/router return the
+      // team's own version history; agent roles are returned globally.
+      const qs = teamId ? `?team_id=${encodeURIComponent(teamId)}` : "";
+      const res = await fetch(`${API_BASE}/api/prompts/versions${qs}`);
       setPromptVersionsReg(await res.json());
     } catch { /* ignore */ }
-  }, [API_BASE]);
+  }, [API_BASE, teamId]);
 
   const loadPromptDiffReg = useCallback(async (role: string, vOld: string, vNew: string) => {
     try {
-      const res = await fetch(`${API_BASE}/api/prompts/diff?role=${role}&version_old=${vOld}&version_new=${vNew}`);
+      // Thread team_id so the diff for team-scoped roles (supervisor, router)
+      // compares the correct per-team rows, not the global fallback.
+      const params = new URLSearchParams({ role, version_old: vOld, version_new: vNew });
+      if (teamId) params.set("team_id", teamId);
+      const res = await fetch(`${API_BASE}/api/prompts/diff?${params.toString()}`);
       setPromptDiffReg(await res.json());
     } catch { /* ignore */ }
-  }, [API_BASE]);
+  }, [API_BASE, teamId]);
 
   const runPromptAbCompareReg = useCallback(async (role: string, va: string, vb: string) => {
     setPromptAbLoadingReg(true);
@@ -268,22 +373,61 @@ export default function RegressionPage() {
     finally { setPromptAbLoadingReg(false); }
   }, [API_BASE]);
 
-  const runOptimize = useCallback(async (role: string, version: string, metric: string, threshold: string) => {
+  const runOptimize = useCallback(async (opts: {
+    roles: string[];
+    versions: Record<string, string>;
+    metric: string;
+    threshold: string;
+    baselineRunId: string | null;
+    goldenIds: string[];
+    earlyExit: boolean;
+    commitOnPlateau: boolean;
+    dryRun: boolean;
+    teamId: string;
+  }) => {
     setOptimizeLoading(true);
     setOptimizeResult(null);
-    setOptimizeTrajectory([]);
-    const addEvent = (type: string, text: string) =>
-      setOptimizeTrajectory(prev => [...prev, { type, text, ts: Date.now() }]);
+    // Reset per-role trajectory buckets so parallel runs stay isolated.
+    const initial: Record<string, Array<{type: string; text: string; ts: number}>> = {};
+    for (const r of opts.roles) initial[r] = [];
+    setOptimizeTrajectory(initial);
+    setOptimizeActiveRoleTab(opts.roles[0] || "");
+
+    const addEvent = (role: string, type: string, text: string) =>
+      setOptimizeTrajectory(prev => ({
+        ...prev,
+        [role]: [...(prev[role] || []), { type, text, ts: Date.now() }],
+      }));
+
+    // Used by the "Stop" button to cancel the SSE stream mid-flight.
+    const controller = new AbortController();
+    optimizeAbortRef.current = controller;
+
+    const finalByRole: Record<string, string> = {};
+
     try {
       const res = await fetch(`${API_BASE}/api/prompts/optimize/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ role, version: version || undefined, metric, threshold: parseFloat(threshold) || 0.7, model: "claude-sonnet-4.6" }),
+        body: JSON.stringify({
+          roles: opts.roles,
+          versions: opts.versions,
+          metric: opts.metric,
+          threshold: parseFloat(opts.threshold) || 0.7,
+          model: "claude-sonnet-4.6",
+          team_id: opts.teamId,
+          baseline_run_id: opts.baselineRunId || undefined,
+          golden_ids: opts.goldenIds.length ? opts.goldenIds : undefined,
+          early_exit: opts.earlyExit,
+          commit_on_plateau: opts.commitOnPlateau,
+          dry_run: opts.dryRun,
+        }),
+        signal: controller.signal,
       });
       if (!res.body) throw new Error("No SSE body");
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let buf = ""; let finalResponse = "";
+      let buf = "";
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -301,29 +445,81 @@ export default function RegressionPage() {
           if (!eventType || !dataStr) continue;
           try {
             const d = JSON.parse(dataStr);
-            if (eventType === "optimize_start") addEvent("start", `▶ Starting — role: ${d.role} | metric: ${d.metric} | version: ${d.version}`);
-            else if (eventType === "agent_start") addEvent("agent", `🤖 Agent: ${d.agent}`);
-            else if (eventType === "tool_start") addEvent("tool", `  ⚙ ${d.tool}(${Object.entries(d.args || {}).map(([k,v]) => `${k}=${String(v).slice(0,60)}`).join(", ")})`);
-            else if (eventType === "tool_end") addEvent("tool_result", `  ↳ ${d.output_preview}`);
-            else if (eventType === "version_registering") addEvent("version", `  📝 Registering new version for ${d.role}: ${d.rationale}`);
-            else if (eventType === "version_registered") addEvent("version_done", `  ✅ Registered ${d.role} @ ${d.version}`);
-            else if (eventType === "regression_result") addEvent("regression", `  📊 ${d.tool_output}`);
-            else if (eventType === "thinking") { addEvent("thinking", d.delta); finalResponse += d.delta; }
-            else if (eventType === "done") addEvent("done", `✓ Optimization complete — ${d.role} / ${d.metric}`);
-            else if (eventType === "error") addEvent("error", `✗ Error: ${d.message}`);
+            // Global (non-per-role) events keyed under the special bucket "_all".
+            const role: string = d.role || "_all";
+            if (eventType === "fanout_start") {
+              for (const r of (d.roles || [])) {
+                addEvent(r, "start", `▶ Starting optimisation — team: ${d.team_id} | parallel cap: ${d.parallel_cap} | baseline: ${d.baseline_run_id || "fresh"} | early_exit: ${d.early_exit}${d.dry_run ? " | DRY-RUN" : ""}${d.commit_on_plateau ? " | commit_on_plateau" : ""}`);
+              }
+            } else if (eventType === "optimize_start") {
+              addEvent(role, "start", `  model: ${d.model} | version: ${d.version} | metric: ${d.metric} | goldens: ${(d.golden_ids || []).length || "auto"}`);
+            } else if (eventType === "phase_start") {
+              addEvent(role, "phase", `── Phase: ${d.phase} ──`);
+            } else if (eventType === "baseline_computed") {
+              addEvent(role, "baseline", `📏 Baseline: pass_rate=${(d.pass_rate * 100).toFixed(1)}% | ${d.n_rows} rows`);
+            } else if (eventType === "cycle_start") {
+              addEvent(role, "cycle_start", `▶ Cycle ${d.cycle} (from ${d.from_version})`);
+            } else if (eventType === "llm_drafting") {
+              addEvent(role, "drafting", `  ✍  Drafting new prompt (cycle ${d.cycle})…`);
+            } else if (eventType === "tool_start") {
+              const argPreview = Object.entries(d.args || {}).map(([k,v]) => `${k}=${String(v).slice(0,60)}`).join(", ");
+              addEvent(role, "tool", `  ⚙ ${d.tool}${argPreview ? `(${argPreview})` : ""}`);
+            } else if (eventType === "tool_end") {
+              const passInfo = typeof d.pass_rate === "number" ? ` pass=${(d.pass_rate * 100).toFixed(1)}%` : "";
+              const metInfo = typeof d.metric_avg === "number" ? ` metric=${d.metric_avg.toFixed(3)}` : "";
+              addEvent(role, "tool_result", `  ↳ ${d.tool}${passInfo}${metInfo}${d.run_id ? ` run_id=${d.run_id}` : ""}`);
+            } else if (eventType === "cycle_end") {
+              const dp = (d.delta_pass_pp * 100).toFixed(1);
+              const dm = d.delta_metric.toFixed(3);
+              const icon = d.classification === "crossed" ? "✅"
+                        : d.classification === "improved" ? "📈"
+                        : d.classification === "plateau"  ? "➖"
+                        : d.classification === "marginal" ? "↗"
+                        : "📉";
+              addEvent(role, "cycle_end", `${icon} Cycle ${d.cycle}: ${d.classification} (ΔPass ${dp >= "0" ? "+" : ""}${dp}pp, Δmetric ${dm >= "0" ? "+" : ""}${dm}) → ${d.loop_decision}`);
+            } else if (eventType === "report") {
+              const c = d.cycles?.length || 0;
+              const winLine = d.winner_cycle != null ? `winner cycle-${d.winner_cycle}` : "no winner";
+              const commitLine = d.committed_version
+                ? `✅ committed as ${d.committed_version}`
+                : `ℹ️ no commit (${d.commit_status})`;
+              addEvent(role, "report", `📋 Report — cycles=${c} | ${winLine} | ${commitLine}`);
+              addEvent(role, "report", `   ${d.recommendation}`);
+              finalByRole[role] = d.recommendation || "";
+            } else if (eventType === "done") {
+              addEvent(role, "done", `✓ Optimisation complete — ${role} / ${d.status}${d.committed_version ? ` → ${d.committed_version}` : ""}`);
+            } else if (eventType === "fanout_done") {
+              // swallow — the final "done" per role already logged.
+            } else if (eventType === "error") {
+              const ctx = d.phase ? ` [phase=${d.phase}${d.cycle ? ` cycle=${d.cycle}` : ""}]` : "";
+              addEvent(role, "error", `✗ Error${ctx}: ${d.message}`);
+            }
           } catch { /* skip */ }
         }
       }
-      setOptimizeResult({ status: "completed", response: finalResponse });
+      setOptimizeResult({ status: "completed", responses: finalByRole });
       await loadPromptVersionsReg();
     } catch (e: any) {
-      setOptimizeResult({ status: "error", error: e.message });
-    } finally { setOptimizeLoading(false); }
+      if (e.name === "AbortError") {
+        setOptimizeResult({ status: "stopped", error: "Stopped by user" });
+      } else {
+        setOptimizeResult({ status: "error", error: e.message });
+      }
+    } finally {
+      optimizeAbortRef.current = null;
+      setOptimizeLoading(false);
+    }
   }, [API_BASE, loadPromptVersionsReg]);
 
+  const stopOptimize = useCallback(() => {
+    optimizeAbortRef.current?.abort();
+  }, []);
+
   useEffect(() => {
-    if (optimizeTrajectory.length > 0) trajectoryEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [optimizeTrajectory]);
+    // Auto-scroll to bottom of the *active* role panel as new events stream in.
+    const active = optimizeTrajectory[optimizeActiveRoleTab];
+    if (active && active.length > 0) trajectoryEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [optimizeTrajectory, optimizeActiveRoleTab]);
 
   useEffect(() => {
     loadGolden();
@@ -344,8 +540,13 @@ export default function RegressionPage() {
     setRegRunning(true);
     setRegRunResult(null);
 
+    // Send EVERY role's selected version (including v1) so the backend
+    // uses exactly what the UI displayed, not the stale Studio-saved pin.
+    // Previously v1 entries were filtered out, which caused the backend
+    // to fall through to `agent.prompt_version` in the DB — so a user who
+    // explicitly picked v1 could still silently get v3 from Studio.
     const pvByRole = Object.fromEntries(
-      Object.entries(rolePromptVerMap).filter(([, v]) => v && v !== "v1")
+      Object.entries(rolePromptVerMap).filter(([, v]) => Boolean(v))
     );
     const hasPvByRole = Object.keys(pvByRole).length > 0;
     const globalVersion = regPromptVer !== "v1" ? regPromptVer : undefined;
@@ -418,6 +619,9 @@ export default function RegressionPage() {
     if (!abGoldenId) return;
     setAbLoading(true);
     setAbResult(null);
+    // A new comparison invalidates the prior judgement — user must click again.
+    setAbJudgeResult(null);
+    setAbJudgeError("");
     try {
       const d = await api.regression.ab({
         golden_id: abGoldenId,
@@ -427,6 +631,63 @@ export default function RegressionPage() {
       setAbResult(d);
     } catch { /* ignore */ }
     setAbLoading(false);
+  }
+
+  // v2: load ALL runs for the current scope (same-team or cross-team)
+  async function loadAbV2Runs(scope: "same" | "cross") {
+    setAbScope(scope);
+    setAbV2RunsLoading(true);
+    setAbV2Runs([]);
+    setAbV2Overlap(null);
+    setAbJudgeResult(null);
+    setAbJudgeError("");
+    try {
+      const d = await api.regression.abV2Runs({
+        scope,
+        team_id: scope === "same" ? (teamId || undefined) : undefined,
+        limit: 80,
+      });
+      setAbV2Runs(d.options || []);
+    } catch { /* ignore */ }
+    setAbV2RunsLoading(false);
+  }
+
+  // v2: when both run_ids are set, fetch overlap goldens
+  async function loadAbV2Overlap() {
+    if (!abRunIdA || !abRunIdB || abRunIdA === abRunIdB) {
+      setAbV2Overlap(null);
+      return;
+    }
+    setAbV2OverlapLoading(true);
+    try {
+      const d = await api.regression.abV2Overlap(abRunIdA, abRunIdB);
+      setAbV2Overlap(d);
+      // Auto-pick the first overlapping golden where results DIFFER (pass vs fail)
+      const items: any[] = d.items || [];
+      if (items.length && !abGoldenId) {
+        const differ = items.find(it => it.side_a_pass !== it.side_b_pass);
+        setAbGoldenId((differ || items[0]).golden_id);
+      }
+    } catch { /* ignore */ }
+    setAbV2OverlapLoading(false);
+  }
+
+  // v2: trigger the adaptive LLM judge (cached; force_refresh re-runs Opus)
+  async function runAbJudge(force: boolean = false) {
+    if (!abRunIdA || !abRunIdB || !abGoldenId) return;
+    setAbJudgeLoading(true);
+    setAbJudgeError("");
+    if (force) setAbJudgeResult(null);
+    try {
+      const d = await api.regression.abV2Judge({
+        run_a: abRunIdA, run_b: abRunIdB, golden_id: abGoldenId,
+        force_refresh: force,
+      });
+      setAbJudgeResult(d);
+    } catch (err: any) {
+      setAbJudgeError(err?.message || "Judge call failed");
+    }
+    setAbJudgeLoading(false);
   }
 
   // ── Computed values ────────────────────────────────────────────
@@ -467,10 +728,13 @@ export default function RegressionPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subTab]);
 
+  // Load when the Prompt Versioning tab is first visited, AND refetch
+  // whenever the active team changes while on that tab — supervisor/router
+  // rows are team-scoped now, so switching team must re-query.
   useEffect(() => {
-    if (subTab === "prompts" && !promptVersionsReg) loadPromptVersionsReg();
+    if (subTab === "prompts") loadPromptVersionsReg();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subTab]);
+  }, [subTab, teamId]);
 
   // ── Render ─────────────────────────────────────────────────────
 
@@ -581,10 +845,12 @@ export default function RegressionPage() {
                 {Object.keys(roleVersionsMap).length > 0 ? (
                   <div className="space-y-1.5">
                     {Object.entries(roleVersionsMap).map(([role, versions]: [string, any[]]) => {
-                      const selected = rolePromptVerMap[role] || "v1";
                       const allVersions = versions as any[];
-                      const latestVer = allVersions.find((v: any) => v.version !== "v1");
-                      const isLatest = latestVer && selected === latestVer.version;
+                      // list_versions returns newest-first, so [0] is the latest
+                      // registry version regardless of whether it's v1 or v42.
+                      const latestVer = allVersions[0]?.version;
+                      const selected = rolePromptVerMap[role] || latestVer || "v1";
+                      const isLatest = latestVer && selected === latestVer;
                       return (
                         <div key={role} className={`flex items-center gap-2 px-2 py-1.5 rounded-md border ${selected !== "v1" ? "border-indigo-200 bg-indigo-50/50" : "border-transparent"}`}>
                           <span className="text-[11px] text-zinc-700 font-medium w-24 shrink-0">{role}</span>
@@ -592,11 +858,11 @@ export default function RegressionPage() {
                             value={selected}
                             onChange={e => setRolePromptVerMap(prev => ({ ...prev, [role]: e.target.value }))}
                             className="input !py-0.5 text-[10px] flex-1">
-                            <option value="v1">v1 (baseline)</option>
-                            {allVersions.filter((v: any) => v.version !== "v1").map((v: any) => (
+                            {allVersions.map((v: any) => (
                               <option key={v.version} value={v.version}>
-                                {v.version}{v.cot_enhanced ? " [CoT]" : ""}{v.created_by === "optimizer" ? " [opt]" : ""}
-                                {v.version === latestVer?.version ? " ← latest" : ""}
+                                {v.version}{v.version === "v1" ? " (baseline)" : ""}
+                                {v.cot_enhanced ? " [CoT]" : ""}{v.created_by === "optimizer" ? " [opt]" : ""}
+                                {v.version === latestVer ? " ← latest" : ""}
                               </option>
                             ))}
                           </select>
@@ -1016,9 +1282,118 @@ export default function RegressionPage() {
       {/* ─────────── A/B COMPARISON ─────────── */}
       {subTab === "ab" && (
         <div className="space-y-4">
-          {/* Filter bar */}
+          {/* v2 workflow: pick scope + runs → see overlapping goldens */}
+          <div className="card space-y-3 border-l-4 border-indigo-400">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h2 className="text-sm font-medium">A/B Comparison — runs-first workflow</h2>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 font-medium">new</span>
+            </div>
+            <p className="text-[11px] text-[var(--text-muted)]">
+              Pick two regression runs and see every golden they share. Supports <b>same-team</b> (within the current project) or <b>cross-team</b> (e.g. dev vs sdlc_2_0).
+            </p>
+
+            {/* 1) Scope toggle */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[10px] text-[var(--text-muted)] uppercase">Scope:</span>
+              {(["same", "cross"] as const).map(s => (
+                <button key={s}
+                  onClick={() => loadAbV2Runs(s)}
+                  className={`px-2.5 py-1 rounded-md text-[11px] border transition-colors ${
+                    abScope === s
+                      ? "bg-indigo-600 text-white border-indigo-600 font-medium"
+                      : "bg-white text-zinc-600 border-[var(--border)] hover:bg-zinc-50"
+                  }`}>
+                  {s === "same" ? `Same-team (${teamId || "current"})` : "Cross-team (all projects)"}
+                </button>
+              ))}
+              {abV2RunsLoading && <span className="text-[10px] text-[var(--text-muted)] animate-pulse">loading…</span>}
+            </div>
+
+            {/* 2) Two run pickers (shared list, disabled-if-other) */}
+            {abV2Runs.length > 0 && (
+              <div className="grid grid-cols-2 gap-3">
+                {(["A", "B"] as const).map(side => {
+                  const val = side === "A" ? abRunIdA : abRunIdB;
+                  const setVal = side === "A" ? setAbRunIdA : setAbRunIdB;
+                  const other = side === "A" ? abRunIdB : abRunIdA;
+                  return (
+                    <div key={side} className={`rounded-lg border p-2.5 ${side === "A" ? "border-blue-200 bg-blue-50/40" : "border-orange-200 bg-orange-50/40"}`}>
+                      <div className={`text-[11px] font-bold mb-1 ${side === "A" ? "text-blue-700" : "text-orange-700"}`}>Run {side}</div>
+                      <select
+                        value={val}
+                        onChange={e => {
+                          setVal(e.target.value);
+                          setAbV2Overlap(null);
+                          setAbGoldenId("");
+                          setAbResult(null);
+                          setAbJudgeResult(null);
+                        }}
+                        className="input text-[11px] w-full">
+                        <option value="">— pick run —</option>
+                        {abV2Runs.map(r => (
+                          <option key={r.run_id} value={r.run_id} disabled={r.run_id === other}>
+                            {r.run_id.slice(0, 8)} · {abScope === "cross" ? `${r.team_id || "?"} · ` : ""}{r.model?.split("/").pop() || "?"} · {r.passed}/{r.total} pass · {r.started_at ? new Date(r.started_at).toLocaleDateString("en", { month: "short", day: "numeric" }) : ""}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {abV2Runs.length > 0 && abRunIdA && abRunIdB && abRunIdA !== abRunIdB && (
+              <button onClick={loadAbV2Overlap} disabled={abV2OverlapLoading}
+                      className="px-3 py-1 rounded-md bg-indigo-600 text-white text-[11px] hover:bg-indigo-700 disabled:opacity-50">
+                {abV2OverlapLoading ? "Finding shared goldens…" : "Find overlapping golden tests →"}
+              </button>
+            )}
+
+            {/* 3) Overlap dropdown */}
+            {abV2Overlap && (
+              <div className="space-y-1.5 pt-1">
+                <div className="text-[11px] text-[var(--text-muted)]">
+                  <b>{abV2Overlap.overlap_count}</b> shared golden{abV2Overlap.overlap_count === 1 ? "" : "s"} ·
+                  only in A: <b>{(abV2Overlap.only_in_a || []).length}</b> ·
+                  only in B: <b>{(abV2Overlap.only_in_b || []).length}</b>
+                </div>
+                {abV2Overlap.overlap_count === 0 ? (
+                  <p className="text-[11px] text-amber-700">No shared golden between these runs. Pick a different pair.</p>
+                ) : (
+                  <select value={abGoldenId}
+                          onChange={e => {
+                            setAbGoldenId(e.target.value);
+                            setAbResult(null);
+                            setAbJudgeResult(null);
+                          }}
+                          className="input text-[11px] w-full max-w-lg">
+                    <option value="">— pick overlapping golden —</option>
+                    {abV2Overlap.items.map((it: any) => {
+                      const n = it.golden_id.replace(/^golden_?/, "");
+                      const tag =
+                        it.side_a_pass === it.side_b_pass
+                          ? (it.side_a_pass ? "both ✓" : "both ✗")
+                          : `A:${it.side_a_pass ? "✓" : "✗"} B:${it.side_b_pass ? "✓" : "✗"}`;
+                      return (
+                        <option key={it.golden_id} value={it.golden_id}>
+                          #{n} · {it.name} · {tag}
+                        </option>
+                      );
+                    })}
+                  </select>
+                )}
+                {abGoldenId && (
+                  <button onClick={loadAbCompare} disabled={abLoading}
+                          className="btn-primary text-[11px] mt-1">
+                    {abLoading ? "Loading…" : "Compare these runs →"}
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Legacy workflow: pick golden first, then two runs */}
           <div className="card space-y-3">
-            <h2 className="text-sm font-medium">A/B Comparison</h2>
+            <h2 className="text-sm font-medium">Or: golden-first workflow</h2>
             <p className="text-[11px] text-[var(--text-muted)]">
               Compare two configurations (model, prompt version) for the same golden test. Fetches the most recent regression result matching each set of filters.
             </p>
@@ -1273,6 +1648,175 @@ export default function RegressionPage() {
                   </table>
                 </div>
               )}
+
+              {/* ─── Adaptive LLM Judge (4th score family) ─── */}
+              <div className="card border-l-4 border-purple-400 space-y-3">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div>
+                    <h3 className="text-sm font-medium">Output-quality judgement <span className="text-[10px] text-purple-700 bg-purple-50 border border-purple-200 rounded px-1.5 py-0.5 ml-1">Opus 4.7</span></h3>
+                    <p className="text-[11px] text-[var(--text-muted)]">
+                      Task-adaptive pairwise rubric. Derives relevant quality dimensions from the golden, scores with quoted evidence, and contrasts the verdict against DeepEval to reveal what these metrics missed.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {abJudgeResult?.cached && (
+                      <span className="text-[10px] text-[var(--text-muted)] italic">cached · {abJudgeResult.judge_model}</span>
+                    )}
+                    <button
+                      onClick={() => runAbJudge(false)}
+                      disabled={abJudgeLoading || !abGoldenId || !abRunIdA || !abRunIdB}
+                      className="btn-primary text-[11px]">
+                      {abJudgeLoading ? "Judging (30-90s)…" : abJudgeResult ? "View judgment" : "Run LLM judge →"}
+                    </button>
+                    {abJudgeResult && (
+                      <button
+                        onClick={() => runAbJudge(true)}
+                        disabled={abJudgeLoading}
+                        title="Re-run with fresh Opus call"
+                        className="text-[11px] px-2 py-1 rounded border border-[var(--border)] hover:bg-zinc-50">
+                        ↻
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {abJudgeError && (
+                  <div className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1.5">
+                    {abJudgeError}
+                  </div>
+                )}
+
+                {abJudgeResult?.payload && (() => {
+                  const p = abJudgeResult.payload;
+                  const rs = p.rubric_score || {};
+                  const dims: any[] = p.task_dimensions || [];
+                  const perDim: Record<string, any> = p.per_dimension || {};
+                  const gap: any[] = p.deepeval_gap_analysis || [];
+                  const defects: string[] = p.key_defects_in_loser || [];
+                  const winClr = p.winner === "A" ? "text-blue-700 bg-blue-50 border-blue-300"
+                              : p.winner === "B" ? "text-orange-700 bg-orange-50 border-orange-300"
+                              : "text-zinc-700 bg-zinc-50 border-zinc-300";
+                  return (
+                    <div className="space-y-3">
+                      {/* Verdict strip */}
+                      <div className="flex items-center gap-3 flex-wrap">
+                        <span className={`text-[11px] font-bold px-2 py-1 rounded border ${winClr}`}>
+                          Winner: {p.winner?.toUpperCase() || "—"}
+                        </span>
+                        <span className="text-[11px] text-[var(--text-muted)]">
+                          confidence <b>{((p.confidence ?? 0) * 100).toFixed(0)}%</b>
+                        </span>
+                        <span className="text-[11px]">
+                          rubric A <b className="text-blue-700">{rs.side_a != null ? (rs.side_a * 100).toFixed(0) + "%" : "—"}</b>
+                          {" "}·{" "}
+                          rubric B <b className="text-orange-700">{rs.side_b != null ? (rs.side_b * 100).toFixed(0) + "%" : "—"}</b>
+                          {rs.delta && <span className="text-[var(--text-muted)]"> ({rs.delta})</span>}
+                        </span>
+                        {abJudgeResult.cross_team && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
+                            cross-team · {abJudgeResult.team_a} vs {abJudgeResult.team_b}
+                          </span>
+                        )}
+                      </div>
+
+                      {p.verdict && (
+                        <div className="text-[12px] bg-purple-50/40 border border-purple-100 rounded p-2.5">
+                          <Md content={p.verdict} />
+                        </div>
+                      )}
+
+                      {/* Task-derived dimensions */}
+                      {dims.length > 0 && (
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-[11px]">
+                            <thead>
+                              <tr className="text-left text-[var(--text-muted)] border-b border-[var(--border)]">
+                                <th className="pb-2 font-medium pr-2">Dimension</th>
+                                <th className="pb-2 font-medium pr-2">Why it matters</th>
+                                <th className="pb-2 font-medium text-right pr-2">A</th>
+                                <th className="pb-2 font-medium text-right pr-2">B</th>
+                                <th className="pb-2 font-medium text-right pr-2">Δ</th>
+                                <th className="pb-2 font-medium pr-2">Evidence A</th>
+                                <th className="pb-2 font-medium">Evidence B</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {dims.filter(d => d.applicable_here !== false).map(d => {
+                                const pd = perDim[d.dim] || {};
+                                const ea = pd.side_a || {};
+                                const eb = pd.side_b || {};
+                                const scA = typeof ea.score === "number" ? ea.score : null;
+                                const scB = typeof eb.score === "number" ? eb.score : null;
+                                return (
+                                  <tr key={d.dim} className="border-b border-[var(--border)] last:border-0 align-top">
+                                    <td className="py-1.5 font-medium pr-2">{d.dim}</td>
+                                    <td className="py-1.5 text-[var(--text-muted)] pr-2 max-w-[180px]">{d.why_it_matters}</td>
+                                    <td className="py-1.5 text-right font-mono pr-2">
+                                      {scA != null ? <span className={scA >= 0.7 ? "text-emerald-600" : scA >= 0.4 ? "text-amber-600" : "text-red-600"}>{(scA*100).toFixed(0)}%</span> : "—"}
+                                    </td>
+                                    <td className="py-1.5 text-right font-mono pr-2">
+                                      {scB != null ? <span className={scB >= 0.7 ? "text-emerald-600" : scB >= 0.4 ? "text-amber-600" : "text-red-600"}>{(scB*100).toFixed(0)}%</span> : "—"}
+                                    </td>
+                                    <td className="py-1.5 text-right font-mono pr-2 text-[var(--text-muted)]">{pd.delta || "—"}</td>
+                                    <td className="py-1.5 text-[10px] text-[var(--text-muted)] max-w-[200px] pr-2">
+                                      <span className="line-clamp-3" title={ea.evidence}>{ea.evidence || "—"}</span>
+                                    </td>
+                                    <td className="py-1.5 text-[10px] text-[var(--text-muted)] max-w-[200px]">
+                                      <span className="line-clamp-3" title={eb.evidence}>{eb.evidence || "—"}</span>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                          {dims.some(d => d.applicable_here === false) && (
+                            <div className="text-[10px] text-[var(--text-muted)] mt-1">
+                              Skipped (not applicable to this task): {dims.filter(d => d.applicable_here === false).map(d => d.dim).join(", ")}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* DeepEval gap analysis */}
+                      {gap.length > 0 && (
+                        <div className="rounded-md border border-amber-200 bg-amber-50/40 p-2.5">
+                          <div className="text-[11px] font-semibold text-amber-800 mb-1.5">DeepEval gap analysis</div>
+                          <div className="space-y-1.5">
+                            {gap.map((g, i) => {
+                              const clr = g.pointed === "right" ? "text-emerald-700 bg-emerald-50 border-emerald-200"
+                                       : g.pointed === "wrong" ? "text-red-700 bg-red-50 border-red-200"
+                                       : "text-zinc-600 bg-zinc-50 border-zinc-200";
+                              return (
+                                <div key={i} className="text-[11px]">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="font-mono font-medium">{g.metric}</span>
+                                    <span className={`text-[10px] px-1.5 py-0.5 rounded border ${clr}`}>pointed: {g.pointed}</span>
+                                    <span className="text-[10px] text-[var(--text-muted)] font-mono">{g.deepeval_verdict}</span>
+                                  </div>
+                                  <div className="text-[11px] text-zinc-700 mt-0.5"><b>actual:</b> {g.actual_story}</div>
+                                  {g.corrective_signal && (
+                                    <div className="text-[10px] text-[var(--text-muted)] italic mt-0.5">↳ {g.corrective_signal}</div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Key defects in loser */}
+                      {defects.length > 0 && (
+                        <div>
+                          <div className="text-[11px] font-semibold text-zinc-700 mb-1">Key defects in the losing side</div>
+                          <ul className="list-disc list-inside text-[11px] text-zinc-700 space-y-0.5">
+                            {defects.map((d, i) => <li key={i}>{d}</li>)}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
             </div>
           )}
         </div>
@@ -1611,7 +2155,7 @@ export default function RegressionPage() {
             <div className="card lg:col-span-1 space-y-4">
               <h3 className="text-xs font-semibold text-zinc-600 uppercase tracking-wide">Agent Roles</h3>
               <div className="flex flex-col gap-1">
-                {promptVersionsReg && Object.keys(promptVersionsReg.roles || {}).map((role: string) => {
+                {promptVersionsReg && Object.keys(scopeRolesToTeam(promptVersionsReg.roles || {})).map((role: string) => {
                   const versions = promptVersionsReg.roles[role] || [];
                   const latest = versions[0];
                   return (
@@ -1775,55 +2319,211 @@ export default function RegressionPage() {
               {/* Prompt Optimizer */}
               <div className="card space-y-3">
                 <h3 className="text-xs font-semibold text-zinc-600 uppercase tracking-wide">Run Optimization Loop</h3>
-                <p className="text-xs text-[var(--text-muted)]">Triggers the PromptOptimizer agent to analyse failures, bootstrap if needed, and run up to 3 improvement cycles.</p>
+                <p className="text-xs text-[var(--text-muted)]">
+                  Triggers the PromptOptimizer agent on one or more roles in parallel (cap 2).
+                  You can pin the baseline to a past regression run, hand-pick which goldens to
+                  evaluate on, and let it early-exit once the threshold is crossed.
+                </p>
                 {showOptimizeSetup ? (
-                  <div className="p-3 border border-indigo-200 bg-indigo-50/40 rounded-lg space-y-2.5">
+                  <div className="p-3 border border-indigo-200 bg-indigo-50/40 rounded-lg space-y-3">
                     <div className="text-[11px] font-medium text-indigo-700 uppercase tracking-wide">Optimization Setup</div>
-                    <div className="grid grid-cols-2 gap-2">
+
+                    {/* Row 1: multi-role picker + metric + threshold + early-exit */}
+                    <div className="grid grid-cols-2 gap-3">
                       <div>
-                        <label className="text-[10px] text-zinc-500 block mb-0.5">Agent Role</label>
-                        <select value={optimizeRole} onChange={e => setOptimizeRole(e.target.value)} className="input text-xs w-full">
-                          {(promptVersionsReg ? Object.keys(promptVersionsReg.roles || {}) : [selectedRoleReg]).map((r: string) => <option key={r} value={r}>{r}</option>)}
-                        </select>
+                        <label className="text-[10px] text-zinc-500 block mb-1">Agent Roles (pick one or more)</label>
+                        <div className="max-h-28 overflow-y-auto border border-[var(--border)] rounded bg-white p-1.5 space-y-0.5">
+                          {(promptVersionsReg ? Object.keys(scopeRolesToTeam(promptVersionsReg.roles || {})) : [selectedRoleReg]).map((r: string) => {
+                            const checked = optimizeRoles.has(r);
+                            const versions = promptVersionsReg?.roles?.[r] || [];
+                            return (
+                              <label key={r} className="flex items-center gap-2 text-xs px-1 py-0.5 rounded hover:bg-zinc-50 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={e => setOptimizeRoles(prev => {
+                                    const next = new Set(prev);
+                                    if (e.target.checked) next.add(r); else next.delete(r);
+                                    return next;
+                                  })}
+                                />
+                                <span className="font-medium">{r}</span>
+                                {checked && (
+                                  <select
+                                    value={optimizeVersions[r] || "latest"}
+                                    onChange={e => setOptimizeVersions(prev => ({ ...prev, [r]: e.target.value }))}
+                                    className="ml-auto input text-[10px] !py-0.5"
+                                  >
+                                    <option value="latest">latest</option>
+                                    {versions.map((v: any) => (
+                                      <option key={v.version} value={v.version}>{v.version}{v.cot_enhanced ? " [CoT]" : ""}</option>
+                                    ))}
+                                  </select>
+                                )}
+                              </label>
+                            );
+                          })}
+                        </div>
                       </div>
-                      <div>
-                        <label className="text-[10px] text-zinc-500 block mb-0.5">Target Version</label>
-                        <select value={optimizeVersion} onChange={e => setOptimizeVersion(e.target.value)} className="input text-xs w-full">
-                          <option value="latest">latest</option>
-                          {(promptVersionsReg?.roles?.[optimizeRole] || []).map((v: any) => <option key={v.version} value={v.version}>{v.version}{v.cot_enhanced ? " [CoT]" : ""}</option>)}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="text-[10px] text-zinc-500 block mb-0.5">Metric to Improve</label>
-                        <select value={optimizeMetric} onChange={e => setOptimizeMetric(e.target.value)} className="input text-xs w-full">
-                          {["step_efficiency","tool_usage","completeness","faithfulness","coherence","correctness","relevance"].map(m => <option key={m} value={m}>{m}</option>)}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="text-[10px] text-zinc-500 block mb-0.5">Threshold (0–1)</label>
-                        <input type="number" min="0" max="1" step="0.05" value={optimizeThreshold} onChange={e => setOptimizeThreshold(e.target.value)} className="input text-xs w-full" />
+
+                      <div className="space-y-2">
+                        <div>
+                          <label className="text-[10px] text-zinc-500 block mb-0.5">Metric to Improve</label>
+                          <select value={optimizeMetric} onChange={e => setOptimizeMetric(e.target.value)} className="input text-xs w-full">
+                            {["step_efficiency","tool_usage","completeness","faithfulness","coherence","correctness","relevance"].map(m => <option key={m} value={m}>{m}</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-zinc-500 block mb-0.5">Threshold (0–1)</label>
+                          <input type="number" min="0" max="1" step="0.05" value={optimizeThreshold} onChange={e => setOptimizeThreshold(e.target.value)} className="input text-xs w-full" />
+                        </div>
+                        <label className="flex items-center gap-2 text-xs">
+                          <input type="checkbox" checked={optimizeEarlyExit} onChange={e => setOptimizeEarlyExit(e.target.checked)} />
+                          <span>Early exit once threshold crossed (recommended)</span>
+                        </label>
+                        <label className="flex items-center gap-2 text-xs" title="Force-commit the winner even when no significant improvement was achieved. Defaults to OFF — the optimizer will only commit when a cycle crosses the threshold or improves ≥5pp pass-rate / ≥0.05 metric.">
+                          <input type="checkbox" checked={optimizeCommitOnPlateau} onChange={e => setOptimizeCommitOnPlateau(e.target.checked)} />
+                          <span>Force-commit even if no improvement</span>
+                        </label>
+                        <label className="flex items-center gap-2 text-xs" title="Run all cycles and report findings but register nothing in the prompt registry. Useful for previewing drafts.">
+                          <input type="checkbox" checked={optimizeDryRun} onChange={e => setOptimizeDryRun(e.target.checked)} />
+                          <span>Dry run (preview only, never commit)</span>
+                        </label>
                       </div>
                     </div>
+
+                    {/* Row 2: baseline source */}
+                    <div>
+                      <label className="text-[10px] text-zinc-500 block mb-1">Baseline</label>
+                      <div className="flex gap-2 items-center">
+                        <label className="flex items-center gap-1.5 text-xs">
+                          <input type="radio" checked={optimizeBaselineMode === "run"} onChange={() => setOptimizeBaselineMode("run")} />
+                          Past regression run
+                        </label>
+                        <label className="flex items-center gap-1.5 text-xs">
+                          <input type="radio" checked={optimizeBaselineMode === "fresh"} onChange={() => setOptimizeBaselineMode("fresh")} />
+                          Fresh bootstrap
+                        </label>
+                      </div>
+                      {optimizeBaselineMode === "run" && (
+                        <select
+                          value={optimizeBaselineRunId}
+                          onChange={e => setOptimizeBaselineRunId(e.target.value)}
+                          className="input text-xs w-full mt-1"
+                        >
+                          <option value="">— pick a run —</option>
+                          {regRuns.slice(0, 40).map((r: any) => (
+                            <option key={r.id} value={r.id}>
+                              {r.id.slice(0, 10)} · {r.model} · pass {r.passed}/{r.num_cases} · {r.created_at?.slice(0, 16).replace("T", " ")}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                    </div>
+
+                    {/* Row 3: golden subset */}
+                    <div>
+                      <label className="text-[10px] text-zinc-500 block mb-1">
+                        Golden tests ({optimizeGoldenIds.size} selected — empty = derive from baseline failures)
+                      </label>
+                      <div className="max-h-28 overflow-y-auto border border-[var(--border)] rounded bg-white p-1.5 grid grid-cols-2 gap-x-2">
+                        {goldenCases.filter(c => c.is_active).map(c => (
+                          <label key={c.id} className="flex items-center gap-1.5 text-[11px] px-1 py-0.5 rounded hover:bg-zinc-50 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={optimizeGoldenIds.has(c.id)}
+                              onChange={e => setOptimizeGoldenIds(prev => {
+                                const next = new Set(prev);
+                                if (e.target.checked) next.add(c.id); else next.delete(c.id);
+                                return next;
+                              })}
+                            />
+                            <span className="font-mono text-[10px] text-zinc-500">{c.id}</span>
+                            <span className="truncate">{c.name}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+
                     <div className="flex gap-2 pt-1">
-                      <button className="btn-primary text-xs" disabled={optimizeLoading} onClick={() => { setShowOptimizeSetup(false); runOptimize(optimizeRole, optimizeVersion, optimizeMetric, optimizeThreshold); }}>
-                        {optimizeLoading ? "Running…" : "▶ Run Optimization"}
+                      <button
+                        className="btn-primary text-xs"
+                        disabled={optimizeLoading || optimizeRoles.size === 0 || (optimizeBaselineMode === "run" && !optimizeBaselineRunId)}
+                        onClick={() => {
+                          setShowOptimizeSetup(false);
+                          const versionsMap: Record<string, string> = {};
+                          Array.from(optimizeRoles).forEach(r => {
+                            versionsMap[r] = optimizeVersions[r] || "latest";
+                          });
+                          runOptimize({
+                            roles: Array.from(optimizeRoles),
+                            versions: versionsMap,
+                            metric: optimizeMetric,
+                            threshold: optimizeThreshold,
+                            baselineRunId: optimizeBaselineMode === "run" ? optimizeBaselineRunId : null,
+                            goldenIds: Array.from(optimizeGoldenIds),
+                            earlyExit: optimizeEarlyExit,
+                            commitOnPlateau: optimizeCommitOnPlateau,
+                            dryRun: optimizeDryRun,
+                            teamId: teamId || "default",
+                          });
+                        }}
+                      >
+                        {optimizeLoading ? "Running…" : `▶ Run Optimization (${optimizeRoles.size} role${optimizeRoles.size === 1 ? "" : "s"})`}
                       </button>
                       <button className="btn-ghost text-xs" onClick={() => setShowOptimizeSetup(false)}>Cancel</button>
                     </div>
                   </div>
                 ) : (
                   <div className="flex items-center gap-3">
-                    <button className="btn-primary text-xs" onClick={() => { setOptimizeRole(selectedRoleReg); setOptimizeVersion("latest"); setShowOptimizeSetup(true); setOptimizeTrajectory([]); setOptimizeResult(null); }} disabled={optimizeLoading}>
+                    <button
+                      className="btn-primary text-xs"
+                      onClick={() => {
+                        setOptimizeRoles(new Set([selectedRoleReg]));
+                        setOptimizeVersions({ [selectedRoleReg]: "latest" });
+                        setOptimizeBaselineMode("run");
+                        setOptimizeBaselineRunId(regRuns[0]?.id || "");
+                        setOptimizeGoldenIds(new Set());
+                        setShowOptimizeSetup(true);
+                        setOptimizeTrajectory({});
+                        setOptimizeResult(null);
+                      }}
+                      disabled={optimizeLoading}
+                    >
                       {optimizeLoading ? "Running optimizer…" : "⚙ Configure & Run"}
                     </button>
-                    {optimizeLoading && <span className="text-xs text-[var(--text-muted)] animate-pulse">Running — may take 2–10 min…</span>}
+                    {optimizeLoading && (
+                      <>
+                        <span className="text-xs text-[var(--text-muted)] animate-pulse">Running — may take 2–10 min…</span>
+                        <button className="btn-secondary text-xs" onClick={stopOptimize}>■ Stop</button>
+                      </>
+                    )}
                   </div>
                 )}
-                {optimizeTrajectory.length > 0 && (
+
+                {/* Per-role trajectory tabs */}
+                {Object.keys(optimizeTrajectory).length > 0 && (
                   <div className="mt-2">
-                    <div className="text-[10px] font-medium text-zinc-500 uppercase tracking-wide mb-1.5">Live Trajectory</div>
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <div className="text-[10px] font-medium text-zinc-500 uppercase tracking-wide">Live Trajectory</div>
+                      <div className="flex gap-1 flex-wrap">
+                        {Object.keys(optimizeTrajectory).map(r => {
+                          const active = r === optimizeActiveRoleTab;
+                          const count = optimizeTrajectory[r]?.length || 0;
+                          return (
+                            <button
+                              key={r}
+                              onClick={() => setOptimizeActiveRoleTab(r)}
+                              className={`text-[10px] px-2 py-0.5 rounded border ${active ? "bg-indigo-600 text-white border-indigo-700" : "bg-white text-zinc-600 border-[var(--border)] hover:bg-zinc-50"}`}
+                            >
+                              {r} <span className={active ? "text-indigo-100" : "text-zinc-400"}>({count})</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
                     <div className="bg-zinc-950 rounded-lg p-3 max-h-72 overflow-y-auto font-mono text-[10px] space-y-0.5">
-                      {optimizeTrajectory.map((ev, i) => (
+                      {(optimizeTrajectory[optimizeActiveRoleTab] || []).map((ev, i) => (
                         <div key={i} className={ev.type==="agent"?"text-cyan-400":ev.type==="tool"?"text-yellow-300":ev.type==="tool_result"?"text-zinc-400":ev.type==="version"||ev.type==="version_done"?"text-green-400":ev.type==="regression"?"text-purple-300":ev.type==="thinking"?"text-zinc-300":ev.type==="start"?"text-blue-300 font-semibold":ev.type==="done"?"text-emerald-400 font-semibold":ev.type==="error"?"text-red-400":"text-zinc-500"}>
                           {ev.type !== "thinking" && <span className="text-zinc-600 mr-1">{new Date(ev.ts).toLocaleTimeString("en",{hour12:false,hour:"2-digit",minute:"2-digit",second:"2-digit"})}</span>}
                           {ev.text}
@@ -1833,14 +2533,26 @@ export default function RegressionPage() {
                     </div>
                   </div>
                 )}
+
                 {optimizeResult && (
                   <div className="mt-2">
-                    <div className={`text-xs font-medium mb-1 ${optimizeResult.status==="completed"?"text-emerald-600":"text-red-500"}`}>
-                      {optimizeResult.status==="completed" ? "✓ Optimization complete" : "✗ Error"}
+                    <div className={`text-xs font-medium mb-1 ${optimizeResult.status==="completed"?"text-emerald-600":optimizeResult.status==="stopped"?"text-amber-600":"text-red-500"}`}>
+                      {optimizeResult.status==="completed" ? "✓ Optimization complete" : optimizeResult.status==="stopped" ? "■ Stopped" : "✗ Error"}
                     </div>
-                    <pre className="text-[11px] bg-zinc-50 rounded p-3 max-h-64 overflow-y-auto border border-[var(--border)] whitespace-pre-wrap leading-relaxed text-zinc-700">
-                      {optimizeResult.response || optimizeResult.error}
-                    </pre>
+                    {optimizeResult.responses ? (
+                      <div className="space-y-2">
+                        {Object.entries(optimizeResult.responses as Record<string, string>).map(([role, text]) => (
+                          <div key={role}>
+                            <div className="text-[10px] font-medium text-indigo-700 uppercase tracking-wide mb-0.5">{role}</div>
+                            <pre className="text-[11px] bg-zinc-50 rounded p-3 max-h-56 overflow-y-auto border border-[var(--border)] whitespace-pre-wrap leading-relaxed text-zinc-700">{text}</pre>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <pre className="text-[11px] bg-zinc-50 rounded p-3 max-h-64 overflow-y-auto border border-[var(--border)] whitespace-pre-wrap leading-relaxed text-zinc-700">
+                        {optimizeResult.error}
+                      </pre>
+                    )}
                   </div>
                 )}
               </div>

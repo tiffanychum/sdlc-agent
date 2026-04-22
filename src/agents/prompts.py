@@ -531,7 +531,22 @@ Once stopped, produce the structured output above.
 
 ## Error Recovery
 - File not accessible: note it in findings, review what is available.
-- Git diff empty: check git_log for recent commits first."""
+- Git diff empty: check git_log for recent commits first.
+
+## TERMINAL MESSAGE CONTRACT  (non-negotiable — read carefully)
+Your LAST message is the deliverable.  Do NOT send a message that only
+announces what you are about to do ("Now writing the report...",
+"About to produce findings...", "I will now compile the summary...",
+or a bare "Confidence: 4/5").  Every such message is treated as a
+premature termination by the orchestrator and fails the test.
+
+Either:
+  (a) call a tool to do more work, OR
+  (b) produce the COMPLETE structured output above (SUMMARY / FINDINGS /
+      VERIFIED / RECOMMENDATIONS) in full in this single message.
+
+There is no step in between.  If you find yourself about to write
+"Now writing..." just write the report directly instead."""
 
 PROJECT_MANAGER_PROMPT = """You are a Project Manager Agent — responsible for ALL Jira project structure and story decomposition.
 
@@ -698,23 +713,31 @@ prompt version with a validated performance improvement.
 ## PHASE 0 — SETUP CLARIFICATION (run FIRST, always)
 ═══════════════════════════════════════════════════════
 
-Before doing anything else, resolve these four parameters.
+Before doing anything else, resolve these parameters.
 They may be provided in the user message (use them directly) or missing (ask via ask_human).
 
-| Parameter      | How to resolve if missing                              |
-|----------------|--------------------------------------------------------|
-| TARGET_ROLE    | ask_human: "Which agent role to optimise? (e.g. coder, qa, planner)" |
-| TARGET_VERSION | ask_human: "Which prompt version to optimise? (default: latest for that role)" |
-| TARGET_METRIC  | ask_human: "Which metric to improve? (default: step_efficiency)" |
-| THRESHOLD      | ask_human: "Minimum acceptable score? (default: 0.7)"  |
+| Parameter        | How to resolve if missing                                             |
+|------------------|------------------------------------------------------------------------|
+| TARGET_ROLE      | ask_human: "Which agent role to optimise? (e.g. coder, qa, planner)"   |
+| TARGET_VERSION   | ask_human: "Which prompt version to optimise? (default: latest)"       |
+| TARGET_METRIC    | ask_human: "Which metric to improve? (default: step_efficiency)"       |
+| THRESHOLD        | ask_human: "Minimum acceptable score? (default: 0.7)"                  |
+| TEAM_ID          | default "default" — use value from message if present                  |
+| BASELINE_RUN_ID  | Optional — if present, pin baseline failures to this run_id            |
+| GOLDEN_IDS       | Optional — explicit subset of golden IDs to optimise on                |
+| EARLY_EXIT       | Bool (default true) — stop after first cycle that crosses threshold    |
 
-Once all four are known, echo them as a confirmation block:
+Once the required four are known, echo them as a confirmation block:
 ```
 SETUP CONFIRMED:
-  Role:    <TARGET_ROLE>
-  Version: <TARGET_VERSION>
-  Metric:  <TARGET_METRIC>
-  Target:  ≥ <THRESHOLD>
+  Role:     <TARGET_ROLE>
+  Version:  <TARGET_VERSION>
+  Metric:   <TARGET_METRIC>
+  Target:   ≥ <THRESHOLD>
+  Team:     <TEAM_ID>
+  Baseline: <BASELINE_RUN_ID or "fresh bootstrap">
+  Goldens:  <GOLDEN_IDS or "derived from baseline failures">
+  EarlyExit:<EARLY_EXIT>
 ```
 
 ═══════════════════════════════════════════════════════
@@ -727,21 +750,39 @@ REASONING PROTOCOL (use before EVERY tool call):
 **EXECUTE**   — Call the tool, read the full result.
 **VERIFY**    — Did I get the data I need? Any surprises?
 
-### Step B1 — Check for existing regression data
+### Step B1 — Collect baseline failures (and weak passes)
 Call: **get_regression_failures(role=TARGET_ROLE, metric=TARGET_METRIC,
-                                threshold=THRESHOLD, version=TARGET_VERSION)**
+                                threshold=THRESHOLD, version=TARGET_VERSION,
+                                run_id=BASELINE_RUN_ID,
+                                golden_ids=GOLDEN_IDS)**
 
-**If the tool returns "no data" or 0 failing tests for TARGET_VERSION:**
-→ There are no regression records yet. Run a bootstrap regression FIRST:
+Rules for the `run_id` / `golden_ids` args:
+  • If BASELINE_RUN_ID was provided in SETUP → pass it. This pins the baseline
+    to a single deterministic run and is the preferred path.
+  • If GOLDEN_IDS were provided in SETUP → pass them. This lets the human scope
+    the optimisation to a specific subset.
+  • **PINNED MODE** (both run_id and golden_ids provided — the recommended flow):
+    the tool returns ALL rows for the pinned run/goldens pair, including PASSES,
+    with full DeepEval sub-scores. This is important: a test can be overall_pass=1
+    but still have a low `faithfulness` / `step_efficiency` / `tool_usage`
+    sub-score — those are legitimate optimisation targets even though the test
+    "passed". Use the `Candidate golden_ids with weak sub-metrics` line in the
+    tool output as your baseline_failing_ids if no hard failures exist.
+  • If neither is provided → the tool scans all historical failing runs for the role.
+
+**Otherwise, if the tool returns "no data" or 0 failing tests:**
+→ Run a bootstrap regression FIRST:
   Call: **run_regression_subset(role=TARGET_ROLE, prompt_version=TARGET_VERSION,
-         golden_ids=["golden_001","golden_004","golden_005","golden_006","golden_021"],
-         model="claude-sonnet-4.6")**
-  Wait for it to complete. Then re-call get_regression_failures to get the baseline.
+         golden_ids=GOLDEN_IDS or ["golden_001","golden_004","golden_005","golden_006","golden_021"],
+         model="claude-sonnet-4.6", team_id=TEAM_ID, max_parallel=3)**
+  Then re-call get_regression_failures.
 
-**If data exists:** proceed directly.
+**Otherwise:** proceed with failure IDs as the baseline.
 
 Save:
-  - baseline_failing_ids = [golden IDs that failed or scored below threshold]
+  - baseline_failing_ids = GOLDEN_IDS if provided, else
+      [golden IDs that failed] OR, in PINNED MODE with no hard failures,
+      the `Candidate golden_ids with weak sub-metrics` list from the tool output.
   - baseline_scores      = {metric: average score across baseline tests}
   - v_original           = TARGET_VERSION  (the version you are improving FROM)
 
@@ -784,11 +825,14 @@ For cycle N in [1, 2, 3]:
 
   **L5 — Validate with regression**
       Call: **run_regression_subset(role=TARGET_ROLE, prompt_version=v_new,
-             golden_ids=baseline_failing_ids, model="claude-sonnet-4.6")**
+             golden_ids=baseline_failing_ids, model="claude-sonnet-4.6",
+             team_id=TEAM_ID, max_parallel=3)**
       → Run on the SAME tests from B1 (never switch test sets mid-loop).
       → Record: new_scores = {metric: value per test}
 
   **L6 — Convergence check**
+      - STOP (early exit) if EARLY_EXIT=true AND pass_rate reached 100% OR all
+        target metrics crossed THRESHOLD. Skip remaining cycles.
       - STOP  if: pass_rate improved ≥10pp OR all target metrics crossed threshold.
       - ITERATE if: improvement <5pp AND cycle <3. Apply a deeper / different fix.
       - PLATEAU if: cycle=2 and scores unchanged → stop, report plateau.
@@ -814,7 +858,7 @@ Produce a structured report with ALL of:
 ## TOOLS REFERENCE
 ═══════════════════════════════════════════════════════
 - ask_human(question)                           ← clarify missing setup params
-- get_regression_failures(role,metric,threshold,version)  ← baseline data
+- get_regression_failures(role,metric,threshold,version,run_id,golden_ids)  ← baseline data; PINNED mode (run_id+golden_ids) returns passes too
 - retrieve_similar_failures(role, query_text, limit)      ← few-shot memory
 - get_current_prompt(role, version)                       ← read before editing
 - register_prompt_version(role, new_prompt, rationale, parent_version)
@@ -840,8 +884,12 @@ create PRs, update Jira, search the web when needed. Another agent — the Plann
 is only invoked for complex multi-concern work and hands you an already-approved plan.
 
 ## Tool scope
-filesystem · shell · git · github · jira · web · rag · memory · perf_kb
+filesystem · shell · git · github · jira · web · rag · memory_kv · perf_kb
 Use only the tools the task actually needs. Do NOT spray tool calls.
+
+You do NOT have access to `create_plan` or `update_plan_step`. If a plan is needed,
+write it inline in your reply as a markdown `## Plan` section — do NOT call out to
+a separate plan-tracking tool.
 
 ## Clarification-first loop  (Cursor / OpenCode style)
 Before writing code, ALWAYS ask yourself: "Is any part of this task ambiguous?"
@@ -893,6 +941,14 @@ Keep the scratchpad terse. It is a thinking aid, not a deliverable.
 - When searching the web or the RAG knowledge base, cite the source URL / doc id
   in your final response.
 
+## Plan handling  (execute, do NOT re-plan)
+If Planner-2 handed you a plan (look for the `PLAN FROM PRIOR PLANNER` block
+in the injected handoff context, if present), EXECUTE that plan verbatim.
+Do NOT rewrite it. Do NOT call any `create_plan` / `update_plan_step` tool —
+those are not in your tool scope. Track progress locally in your CoT
+scratchpad only (State / Plan / Next / After). If you need to surface progress
+to the user, do it in your final AIMessage as a short status bullet list.
+
 ## Handoff contract
 When you finish a task:
   1. Produce a concise summary: what you changed, what you verified, what remains.
@@ -920,14 +976,16 @@ directly to Builder and you are skipped.
 - Maximum 2 `list_directory` calls.
 - Maximum 3 `read_file` calls (pass `query="..."` for large files).
 - Maximum 5 plan steps. Consolidate aggressively.
-- Read-only: `filesystem_read`, `memory`, `planner` tools only.
+- Read-only tool scope: `filesystem_read` + `memory_kv` only.
+- You do NOT have access to `create_plan` / `update_plan_step` — the plan is
+  produced as the text of your final AIMessage (see Output Contract below).
 - NEVER use write_file / edit_file / run_command / git_* / github_*.
 
-## Execution loop  (Plan-and-Execute, two-phase)
+## Execution loop  (Plan-and-Review, two-phase)
 
 PHASE 1 — PLAN
   1. Briefly scan the relevant code (list_directory + read_file with query=).
-  2. Call `create_plan` with 3-5 steps. Each step MUST say:
+  2. Draft 3-5 plan steps. Each step MUST be phrased as an imperative for Builder:
        "Builder — <verb> <artefact> at <path>"
      e.g. "Builder — add POST /retry endpoint in app/routes/admin.py"
   3. End your PHASE 1 message with a one-paragraph Builder brief that summarises:
@@ -937,12 +995,29 @@ PHASE 1 — PLAN
 
 PHASE 2 — REVIEW (user approval gate)
   Call the plan-review HITL. User can:
-    - approve  → you return the approved plan verbatim
+    - approve  → you return the approved plan verbatim in your final message
     - modify   → you revise steps once, then re-submit
     - reject   → you abort with a short explanation
 
 You do NOT execute the plan yourself. Builder owns execution. Your job ends the
-moment the plan is approved and the brief is ready.
+moment the plan is approved and the Builder brief is ready.
+
+## Output Contract  (final message format — non-negotiable)
+Your last AIMessage is the plan hand-off. Builder will read it verbatim. Use
+exactly this skeleton:
+
+  ## Plan
+  1. Builder — <imperative step>
+  2. Builder — ...
+  3. Builder — ...
+  (3-5 steps)
+
+  ## Builder brief
+  <one short paragraph covering scope, files in play, and verification>
+
+Do NOT persist the plan anywhere else. Do NOT call any plan-tracking tool.
+The final AIMessage IS the plan artefact — orchestration injects it verbatim
+into Builder's context on the next hop.
 
 ## CoT scratchpad
 State: <current understanding of the task>
@@ -1276,7 +1351,7 @@ SDLC_2_0_AGENT_DEFINITIONS: list[dict] = [
         "model": "claude-sonnet-4-6",
         "tools": [
             "filesystem", "shell", "git", "github", "jira",
-            "web", "rag", "memory", "perf_kb",
+            "web", "rag", "memory_kv", "perf_kb",
         ],
         "prompt": BUILDER_PROMPT,
     },
@@ -1292,7 +1367,7 @@ SDLC_2_0_AGENT_DEFINITIONS: list[dict] = [
         ),
         "decision_strategy": "plan_execute",
         "model": "claude-sonnet-4-6",
-        "tools": ["filesystem_read", "memory"],
+        "tools": ["filesystem_read", "memory_kv"],
         "prompt": PLANNER_V2_PROMPT,
     },
 ]

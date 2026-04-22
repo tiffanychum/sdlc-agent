@@ -12,10 +12,13 @@ Provides REST APIs for:
 
 import asyncio
 import json
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +29,7 @@ from src.db.database import init_db, seed_defaults, update_agent_data, get_sessi
 from src.db.models import (
     Team, Agent, AgentToolMapping, Skill, AgentSkillMapping,
     Trace, Span, EvalRun, GoldenTestCase, RegressionResult, PromptVersion,
+    ABJudgeResult,
     RagConfig as RagConfigModel, RagSource, RagQuery,
 )
 from src.orchestrator import build_orchestrator_from_team, _extract_text, get_graph_config
@@ -247,7 +251,9 @@ AVAILABLE_MODELS = [
     # ── Anthropic — use Poe model names (not Anthropic-native IDs) ──
     {"id": "claude-haiku-3",          "name": "Claude Haiku 3",        "provider": "Anthropic",  "tier": "agent",  "thinking": False},
     {"id": "Claude-Haiku-3.5",        "name": "Claude Haiku 3.5",      "provider": "Anthropic",  "tier": "agent",  "thinking": False},
+    {"id": "claude-sonnet-4.6",       "name": "Claude Sonnet 4.6",     "provider": "Anthropic",  "tier": "agent",  "thinking": True},
     {"id": "Claude-Sonnet-4",         "name": "Claude Sonnet 4",       "provider": "Anthropic",  "tier": "agent",  "thinking": False},
+    {"id": "claude-opus-4.7",         "name": "Claude Opus 4.7",       "provider": "Anthropic",  "tier": "agent",  "thinking": False},
     {"id": "claude-opus-4.5",         "name": "Claude Opus 4.5",       "provider": "Anthropic",  "tier": "agent",  "thinking": False},
     {"id": "Claude-Opus-4",           "name": "Claude Opus 4",         "provider": "Anthropic",  "tier": "agent",  "thinking": False},
     # ── Google — ⚠️ may trigger safety blocks ──────────────────
@@ -1061,60 +1067,98 @@ def trace_stats(days: int = 30, team_id: str = None):
 # ── Prompt Registry API ─────────────────────────────────────────
 
 @app.get("/api/prompts/versions")
-async def prompt_versions(role: str = None):
-    """List all prompt versions. Optionally filter by role."""
+async def prompt_versions(role: str = None, team_id: str = None):
+    """List all prompt versions. Optionally filter by role and/or team.
+
+    Patch 5 scoping:
+      - team_id omitted → return global rows (backwards-compatible).
+      - team_id given  → for each role, return that team's rows (with
+        automatic fallback to global rows if the team has no row for the
+        role).  This is what the Regression UI passes so a user on the
+        sdlc_2_0 team sees sdlc_2_0's supervisor history, not the dev team's.
+    """
     try:
         from src.prompts.registry import get_registry
         reg = get_registry()
         if role:
-            return {"role": role, "versions": reg.list_versions(role)}
-        roles = reg.list_all_roles()
+            return {"role": role, "team_id": team_id, "versions": reg.list_versions(role, team_id=team_id)}
+        roles = reg.list_all_roles(team_id=team_id)
         return {
-            "roles": {r: reg.list_versions(r) for r in roles}
+            "team_id": team_id,
+            "roles": {r: reg.list_versions(r, team_id=team_id) for r in roles}
         }
     except Exception as e:
         return {"error": str(e), "roles": {}}
 
 
+_ROUTING_ROLES = ("supervisor", "meta_router", "router")
+# Roles whose rows are team-scoped.  meta_router stays global because its
+# template has no team-specific placeholders.
+_TEAM_SCOPED_ROUTING_ROLES = {"supervisor", "router"}
+
+
+def _scope_for_routing_role(role: str, team_id: str | None) -> str | None:
+    """Return the registry scope (team_id or None) used for a routing role."""
+    if role in _TEAM_SCOPED_ROUTING_ROLES:
+        return team_id
+    return None
+
+
 @app.get("/api/prompts/routing")
-async def get_routing_prompts():
-    """Return current routing prompt versions and text for supervisor, meta_router, and router."""
+async def get_routing_prompts(team_id: str = None):
+    """Return current routing prompt versions + text for supervisor, meta_router, router.
+
+    When team_id is provided, supervisor + router resolve at that team's
+    scope (with global fallback for brand-new teams before their first
+    orchestrator build).  meta_router is always resolved globally.
+    """
     try:
         from src.prompts.registry import get_registry
         reg = get_registry()
-        routing_roles = ("supervisor", "meta_router", "router")
         result = {}
-        for role in routing_roles:
-            versions = reg.list_versions(role)
-            latest_ver = reg.latest_version(role) if versions else None
-            text_val = reg.get_prompt(role, "latest") if latest_ver else None
+        for role in _ROUTING_ROLES:
+            scope = _scope_for_routing_role(role, team_id)
+            versions = reg.list_versions(role, team_id=scope)
+            latest_ver = reg.latest_version(role, team_id=scope) if versions else None
+            text_val = reg.get_prompt(role, "latest", team_id=scope) if latest_ver else None
             result[role] = {
                 "versions": versions,
                 "active_version": latest_ver,
                 "text": text_val or "",
+                "team_id": scope,
             }
-        return {"routing": result}
+        return {"routing": result, "team_id": team_id}
     except Exception as e:
         return {"error": str(e), "routing": {}}
 
 
 @app.put("/api/prompts/routing/{role}")
 async def set_routing_prompt_version(role: str, data: dict):
-    """Set the active version for a routing prompt role (supervisor/meta_router/router)."""
+    """Set the active version for a routing prompt role.
+
+    Accepts ``team_id`` in the request body.  For supervisor/router the
+    activation is scoped to that team.  For meta_router the team_id is
+    ignored and the activation always happens on the global row.
+    """
     try:
-        from src.prompts.registry import get_registry
-        reg = get_registry()
+        from src.prompts.registry import get_registry  # noqa: F401 (consistency)
         version = data.get("version")
+        team_id = data.get("team_id")
         if not version:
             raise HTTPException(400, "version is required")
-        if role not in ("supervisor", "meta_router", "router"):
+        if role not in _ROUTING_ROLES:
             raise HTTPException(400, f"Unknown routing role: {role}")
-        # Deactivate all versions for this role and activate the selected one
+        scope = _scope_for_routing_role(role, team_id)
         from src.db.models import PromptVersionEntry
         from src.db.database import get_session
         session = get_session()
         try:
-            entries = session.query(PromptVersionEntry).filter_by(role=role).all()
+            q = session.query(PromptVersionEntry).filter(PromptVersionEntry.role == role)
+            if scope is None:
+                q = q.filter(PromptVersionEntry.team_id.is_(None))
+            else:
+                q = q.filter(PromptVersionEntry.team_id == scope)
+            entries = q.all()
             for e in entries:
                 e.is_active = (e.version == version)
             session.commit()
@@ -1128,15 +1172,22 @@ async def set_routing_prompt_version(role: str, data: dict):
 
 
 @app.get("/api/prompts/text")
-async def prompt_text(role: str, version: str = "latest"):
-    """Return the full prompt text for a given role + version."""
+async def prompt_text(role: str, version: str = "latest", team_id: str = None):
+    """Return the full prompt text for a given role + version + optional team.
+
+    For team-scoped roles (supervisor, router) ``team_id`` routes the lookup
+    to that team's rows with automatic global fallback.  For everything else
+    (agent roles, meta_router) ``team_id`` has no effect today — those rows
+    are still global.
+    """
     try:
         from src.prompts.registry import get_registry
         reg = get_registry()
-        text_val = reg.get_prompt(role, version)
+        scope = _scope_for_routing_role(role, team_id) if role in _ROUTING_ROLES else team_id
+        text_val = reg.get_prompt(role, version, team_id=scope)
         if text_val is None:
-            return {"error": f"No prompt found for role={role} version={version}", "text": ""}
-        return {"role": role, "version": version, "text": text_val}
+            return {"error": f"No prompt found for role={role} version={version} team={scope}", "text": ""}
+        return {"role": role, "version": version, "team_id": scope, "text": text_val}
     except Exception as e:
         return {"error": str(e), "text": ""}
 
@@ -1308,14 +1359,20 @@ async def prompt_ab_compare(role: str, version_a: str = "v1", version_b: str = "
 
 
 @app.get("/api/prompts/diff")
-async def prompt_diff(role: str, version_old: str = "v1", version_new: str = "v2"):
-    """Return a unified diff between two prompt versions for a role."""
+async def prompt_diff(role: str, version_old: str = "v1", version_new: str = "v2", team_id: str = None):
+    """Return a unified diff between two prompt versions for a role.
+
+    team_id is threaded through the registry lookup for team-scoped roles so
+    the diff reflects the correct per-team prompt history (e.g. sdlc_2_0's
+    supervisor v1 → v2, not the dev team's).
+    """
     try:
         import difflib
         from src.prompts.registry import get_registry
         reg = get_registry()
-        old_p = reg.get_prompt(role, version_old) or ""
-        new_p = reg.get_prompt(role, version_new) or ""
+        scope = _scope_for_routing_role(role, team_id) if role in _ROUTING_ROLES else team_id
+        old_p = reg.get_prompt(role, version_old, team_id=scope) or ""
+        new_p = reg.get_prompt(role, version_new, team_id=scope) or ""
         if not old_p:
             return {"error": f"Version {version_old} not found for role={role}"}
         if not new_p:
@@ -1342,8 +1399,9 @@ async def prompt_diff(role: str, version_old: str = "v1", version_new: str = "v2
 @app.post("/api/prompts/optimize")
 async def prompt_optimize(request: Request):
     """
-    Non-streaming optimization endpoint (kept for backward compat).
-    Prefer /api/prompts/optimize/stream for real-time trajectory.
+    Non-streaming optimization endpoint — returns the full structured
+    OptimizationReport synchronously (no SSE). Shares the same implementation
+    as ``/stream``; use this for programmatic / scripted access.
     """
     try:
         body = await request.json()
@@ -1351,162 +1409,183 @@ async def prompt_optimize(request: Request):
         metric = body.get("metric", "step_efficiency")
         threshold = float(body.get("threshold", 0.7))
         model = body.get("model", "claude-sonnet-4.6")
-        version = body.get("version")  # target prompt version to optimize (optional)
+        version = body.get("version")
+        team_id = body.get("team_id") or "default"
+        baseline_run_id = body.get("baseline_run_id") or None
+        golden_ids = body.get("golden_ids") or []
+        early_exit = bool(body.get("early_exit", True))
+        commit_on_plateau = bool(body.get("commit_on_plateau", False))
+        dry_run = bool(body.get("dry_run", False))
 
-        prompt = _build_optimize_prompt(role, metric, threshold, version)
-
-        from src.orchestrator import build_orchestrator_from_team
-        orchestrator = await build_orchestrator_from_team(
-            team_id="default", model_override=model
+        from src.optimization.optimizer import run_optimization_loop
+        report = await run_optimization_loop(
+            role=role,
+            metric=metric,
+            threshold=threshold,
+            version=version,
+            team_id=team_id,
+            baseline_run_id=baseline_run_id,
+            golden_ids=list(golden_ids) if golden_ids else None,
+            early_exit=early_exit,
+            commit_on_plateau=commit_on_plateau,
+            dry_run=dry_run,
+            model=model,
         )
-        result = await orchestrator.ainvoke({
-            "messages": [{"role": "user", "content": prompt}],
-            "agent_trace": [],
-            "completed_steps": [],
-            "supervisor_iterations": 0,
-        })
-        last_msg = result["messages"][-1]
-        response_text = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
-        agents = list(dict.fromkeys([
-            e.get("agent") for e in result.get("agent_trace", [])
-            if e.get("step") == "execution"
-        ]))
-        return {
-            "status": "completed",
-            "role": role,
-            "metric": metric,
-            "agents_used": agents,
-            "response": response_text[:4000],
-        }
+        return {"status": "completed", "report": report.model_dump()}
     except Exception as e:
+        logger.exception("prompt_optimize failed")
         return {"status": "error", "error": str(e)}
-
-
-def _build_optimize_prompt(role: str, metric: str, threshold: float, version: str | None) -> str:
-    """Build the user prompt for the PromptOptimizer agent."""
-    version_clause = f"target prompt version: {version}" if version else "the latest available version"
-    return (
-        f"Run a full prompt optimization loop for the **{role}** agent ({version_clause}). "
-        f"Target metric: **{metric}** (improvement threshold: {threshold}). "
-        f"Follow the SETUP → LOOP (up to 3 cycles) → FINAL OUTPUT protocol exactly as specified in your instructions. "
-        f"Bootstrap note: if there are no regression records yet for role={role} version={version or 'latest'}, "
-        f"run a baseline regression first using golden_ids=['golden_001','golden_004','golden_005','golden_006','golden_021'] "
-        f"before starting the analysis. "
-        f"Report the full iteration summary, root cause, changes per cycle, and final diff."
-    )
 
 
 @app.post("/api/prompts/optimize/stream")
 async def prompt_optimize_stream(request: Request):
     """
-    SSE streaming version of the PromptOptimizer.
-    Emits real-time events: agent_start, tool_start, tool_end, thinking, version_registered,
-    regression_result, response, done.
+    SSE streaming endpoint for the global Prompt Optimizer function.
 
-    Body: {"role": "coder", "metric": "step_efficiency", "threshold": 0.7,
-           "model": "claude-sonnet-4.6", "version": "v4" (optional)}
+    Unlike the previous version, this does NOT build an agent orchestrator.
+    It calls ``src.optimization.optimizer.run_optimization_loop(...)`` directly,
+    which guarantees:
+      * No supervisor misrouting (no graph involved at all).
+      * One LLM call per cycle (the drafter) — deterministic control flow.
+      * At most ONE new ``PromptVersionEntry`` row per run (or zero if no
+        improvement).
+
+    Body (all legacy fields still accepted):
+      {
+        "roles":          ["coder", "planner"],
+        "metric":         "step_efficiency",
+        "threshold":      0.7,
+        "model":          "claude-sonnet-4.6",
+        "versions":       {"coder": "latest", "planner": "v2"},
+        "team_id":        "sdlc_2_0",
+        "baseline_run_id": "ab12cd34ef56" | null,
+        "golden_ids":     ["golden_001", "golden_004"],
+        "early_exit":     true,
+        "commit_on_plateau": false,
+        "dry_run":        false
+      }
+
+    Every SSE event is tagged with ``role`` so the UI can render per-role panels.
+    Roles run concurrently with a cap of 2.
     """
     body = await request.json()
-    role = body.get("role", "coder")
+
+    roles: list[str] = body.get("roles") or (
+        [body.get("role", "coder")] if body.get("role") else ["coder"]
+    )
+    roles = [r for r in roles if r]
+    if not roles:
+        return {"error": "no roles provided"}
+
     metric = body.get("metric", "step_efficiency")
     threshold = float(body.get("threshold", 0.7))
     model = body.get("model", "claude-sonnet-4.6")
-    version = body.get("version")
+    team_id = body.get("team_id") or "default"
+    baseline_run_id = body.get("baseline_run_id") or None
+    golden_ids = body.get("golden_ids") or []
+    early_exit = bool(body.get("early_exit", True))
+    commit_on_plateau = bool(body.get("commit_on_plateau", False))
+    dry_run = bool(body.get("dry_run", False))
 
-    user_prompt = _build_optimize_prompt(role, metric, threshold, version)
+    versions_map: dict[str, str | None] = body.get("versions") or {}
+    if not versions_map and body.get("version"):
+        versions_map = {roles[0]: body.get("version")}
 
-    from src.orchestrator import build_orchestrator_from_team
-    from langgraph.graph.state import CompiledStateGraph
+    from src.optimization.optimizer import run_optimization_loop
 
-    orchestrator = await build_orchestrator_from_team(
-        team_id="default", model_override=model
-    )
-    thread_id = uuid.uuid4().hex[:12]
-    config = get_graph_config(thread_id)
-    initial_input = {
-        "messages": [{"role": "user", "content": user_prompt}],
-        "agent_trace": [],
-        "completed_steps": [],
-        "supervisor_iterations": 0,
-    }
+    async def _run_one_role(
+        role: str,
+        emit_queue: asyncio.Queue,
+        sem: asyncio.Semaphore,
+    ) -> None:
+        async with sem:
+            version = versions_map.get(role)
+
+            async def emit(ev: str, payload: dict):
+                # Stamp every event with the role so the UI can route it to
+                # the correct per-role panel.
+                payload = {**payload, "role": role}
+                await emit_queue.put((ev, payload))
+
+            await emit("optimize_start", {
+                "metric": metric, "threshold": threshold,
+                "version": version or "latest", "model": model,
+                "team_id": team_id,
+                "baseline_run_id": baseline_run_id,
+                "golden_ids": list(golden_ids) if golden_ids else [],
+                "early_exit": early_exit,
+                "commit_on_plateau": commit_on_plateau,
+                "dry_run": dry_run,
+            })
+
+            try:
+                await run_optimization_loop(
+                    role=role,
+                    metric=metric,
+                    threshold=threshold,
+                    version=version,
+                    team_id=team_id,
+                    baseline_run_id=baseline_run_id,
+                    golden_ids=list(golden_ids) if golden_ids else None,
+                    early_exit=early_exit,
+                    commit_on_plateau=commit_on_plateau,
+                    dry_run=dry_run,
+                    model=model,
+                    progress_cb=emit,
+                )
+            except Exception as e:
+                await emit("error", {"message": str(e)})
 
     async def event_generator():
-        yield _sse_event("thread_id", {"thread_id": thread_id})
-        yield _sse_event("optimize_start", {
-            "role": role, "metric": metric, "threshold": threshold,
-            "version": version or "latest", "model": model,
+        sem = asyncio.Semaphore(2)
+        emit_queue: asyncio.Queue = asyncio.Queue()
+
+        _DONE_SENTINEL = ("__fanout_done__", None)
+
+        async def _producer():
+            try:
+                await asyncio.gather(
+                    *[_run_one_role(r, emit_queue, sem) for r in roles],
+                    return_exceptions=True,
+                )
+            finally:
+                await emit_queue.put(_DONE_SENTINEL)
+
+        producer = asyncio.create_task(_producer())
+
+        yield _sse_event("fanout_start", {
+            "roles": roles,
+            "parallel_cap": 2,
+            "team_id": team_id,
+            "baseline_run_id": baseline_run_id,
+            "golden_ids": list(golden_ids) if golden_ids else [],
+            "early_exit": early_exit,
+            "commit_on_plateau": commit_on_plateau,
+            "dry_run": dry_run,
         })
 
-        current_agent = ""
-        token_buf = ""
         try:
-            async for event in orchestrator.astream_events(
-                initial_input, config=config, version="v2"
-            ):
-                kind = event.get("event", "")
-                name = event.get("name", "")
-                data = event.get("data", {})
-                meta = event.get("metadata", {})
-                lg_node = meta.get("langgraph_node", "")
+            while True:
+                item = await emit_queue.get()
+                if item is _DONE_SENTINEL or (isinstance(item, tuple) and item[0] == "__fanout_done__"):
+                    break
+                ev, payload = item
+                yield _sse_event(ev, payload)
+        finally:
+            if not producer.done():
+                producer.cancel()
+                try:
+                    await producer
+                except (asyncio.CancelledError, Exception):
+                    pass
 
-                if kind == "on_chain_start" and lg_node and lg_node not in _GRAPH_SYSTEM_NODES and not lg_node.startswith("_") and name == lg_node:
-                    current_agent = lg_node
-                    yield _sse_event("agent_start", {"agent": lg_node})
+        yield _sse_event("fanout_done", {"status": "completed", "roles": roles})
 
-                elif kind == "on_tool_start":
-                    tool_input = data.get("input", {})
-                    safe_input = {k: str(v)[:300] for k, v in (tool_input.items() if isinstance(tool_input, dict) else {}.items())}
-                    yield _sse_event("tool_start", {
-                        "agent": current_agent, "tool": name, "args": safe_input,
-                    })
-                    # Special event for version registration so UI can highlight it
-                    if name == "register_prompt_version":
-                        yield _sse_event("version_registering", {
-                            "role": safe_input.get("role", role),
-                            "rationale": safe_input.get("rationale", "")[:200],
-                        })
-
-                elif kind == "on_tool_end":
-                    output = str(data.get("output", ""))
-                    yield _sse_event("tool_end", {
-                        "agent": current_agent, "tool": name,
-                        "output_preview": output[:400],
-                    })
-                    # Special event when regression subset completes
-                    if name == "run_regression_subset":
-                        yield _sse_event("regression_result", {
-                            "tool_output": output[:600],
-                        })
-                    elif name == "register_prompt_version":
-                        # Extract version label from tool output e.g. "✓ Registered coder prompt as v5."
-                        import re
-                        m = re.search(r'as\s+(v\d+)', output)
-                        if m:
-                            yield _sse_event("version_registered", {
-                                "role": role, "version": m.group(1),
-                            })
-
-                elif kind == "on_chat_model_stream":
-                    chunk = data.get("chunk")
-                    if chunk:
-                        token = chunk.content if hasattr(chunk, "content") else ""
-                        if token:
-                            token_buf += token
-                            if len(token_buf) >= 40 or token.endswith(("\n", ".")):
-                                yield _sse_event("thinking", {"delta": token_buf, "agent": current_agent})
-                                token_buf = ""
-
-        except Exception as e:
-            yield _sse_event("error", {"message": str(e)})
-            return
-
-        if token_buf:
-            yield _sse_event("thinking", {"delta": token_buf, "agent": current_agent})
-
-        yield _sse_event("done", {"status": "completed", "role": role, "metric": metric})
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── TraceAnalyzer Performance Report ────────────────────────────
@@ -2621,6 +2700,202 @@ def regression_ab_compare(
         "side_a": side_a,
         "side_b": side_b,
         "metric_diff": metric_diff,
+    }
+
+
+# ── A/B v2: cross-project picker + overlap + adaptive LLM judge ───
+
+
+@app.get("/api/regression/ab/runs")
+def ab_v2_runs(scope: str = "same", team_id: Optional[str] = None, limit: int = 80):
+    """
+    List regression runs available for the A/B picker.
+
+    - scope="same"  (default): runs filtered to the given team_id (or the
+                               caller can pass team_id=None for legacy/no-team runs)
+    - scope="cross": runs across ALL teams; each row carries its team_id so
+                     the UI can tag which project each run belongs to.
+
+    Returns newest-first. Each row includes lightweight summary for the dropdown.
+    """
+    session = get_session()
+    try:
+        # Only include EvalRuns that actually have regression results
+        reg_run_ids = {r[0] for r in session.query(RegressionResult.run_id).distinct().all()}
+        q = session.query(EvalRun).filter(EvalRun.id.in_(reg_run_ids))
+        if scope == "same" and team_id:
+            q = q.filter(EvalRun.team_id == team_id)
+        rows = q.order_by(EvalRun.created_at.desc()).limit(limit).all()
+
+        options = []
+        for r in rows:
+            cases = session.query(RegressionResult).filter_by(run_id=r.id).all()
+            total = len(cases)
+            passed = sum(1 for c in cases if c.overall_pass)
+            rj = r.results_json or {}
+            options.append({
+                "run_id": r.id,
+                "team_id": getattr(r, "team_id", None),
+                "model": r.model or "",
+                "prompt_version": r.prompt_version or "v1",
+                "passed": passed,
+                "failed": total - passed,
+                "total": total,
+                "pass_rate": round(passed / total, 2) if total else 0.0,
+                "avg_latency_ms": rj.get("avg_latency_ms", r.avg_latency_ms) or 0.0,
+                "total_cost": r.total_cost or 0.0,
+                "started_at": r.created_at.isoformat() if r.created_at else None,
+            })
+        return {"scope": scope, "team_id": team_id, "options": options}
+    finally:
+        session.close()
+
+
+@app.get("/api/regression/ab/overlap")
+def ab_v2_overlap(run_a: str, run_b: str):
+    """
+    Return goldens present in BOTH runs, with per-side pass/fail flags so the
+    dropdown can render entries like `#007 · Code review · A:✗ B:✓`.
+    """
+    session = get_session()
+    try:
+        a_rows = {r.golden_case_id: r for r in session.query(RegressionResult).filter_by(run_id=run_a).all()}
+        b_rows = {r.golden_case_id: r for r in session.query(RegressionResult).filter_by(run_id=run_b).all()}
+        overlap_ids = sorted(set(a_rows.keys()) & set(b_rows.keys()))
+
+        items = []
+        for gid in overlap_ids:
+            golden = session.query(GoldenTestCase).filter_by(id=gid).first()
+            items.append({
+                "golden_id": gid,
+                "name": golden.name if golden else gid,
+                "complexity": golden.complexity if golden else "",
+                "side_a_pass": bool(a_rows[gid].overall_pass),
+                "side_b_pass": bool(b_rows[gid].overall_pass),
+                "side_a_similarity": a_rows[gid].semantic_similarity,
+                "side_b_similarity": b_rows[gid].semantic_similarity,
+            })
+        return {
+            "run_a": run_a, "run_b": run_b,
+            "overlap_count": len(overlap_ids),
+            "only_in_a": sorted(set(a_rows.keys()) - set(b_rows.keys())),
+            "only_in_b": sorted(set(b_rows.keys()) - set(a_rows.keys())),
+            "items": items,
+        }
+    finally:
+        session.close()
+
+
+class AbJudgeRequest(BaseModel):
+    run_a: str
+    run_b: str
+    golden_id: str
+    force_refresh: bool = False
+
+
+@app.post("/api/regression/ab/judge")
+async def ab_v2_judge(req: AbJudgeRequest):
+    """
+    Run (or fetch from cache) the adaptive pairwise LLM judge for one
+    golden across two runs. Uses claude-opus-4.7 by default (configurable
+    via LLM_RUBRIC_JUDGE_MODEL).
+
+    Cache key: (run_a, run_b, golden_id). Set force_refresh=True to recompute.
+    """
+    from src.evaluation.judge_ab import (
+        judge_ab, build_golden_input, build_side_input,
+    )
+    from src.config import config as app_config
+
+    session = get_session()
+    try:
+        # Short-circuit: fetch cached result if any and not forcing refresh
+        existing = session.query(ABJudgeResult).filter_by(
+            run_a=req.run_a, run_b=req.run_b, golden_id=req.golden_id,
+        ).first()
+        if existing and not req.force_refresh:
+            return {
+                "cached": True,
+                "judge_model": existing.judge_model,
+                "payload": existing.payload,
+                "cross_team": bool(existing.cross_team),
+                "team_a": existing.team_a, "team_b": existing.team_b,
+                "created_at": existing.created_at.isoformat() if existing.created_at else None,
+                "updated_at": existing.updated_at.isoformat() if existing.updated_at else None,
+            }
+
+        # Fetch the two RegressionResult rows
+        a_row = session.query(RegressionResult).filter_by(
+            run_id=req.run_a, golden_case_id=req.golden_id,
+        ).first()
+        b_row = session.query(RegressionResult).filter_by(
+            run_id=req.run_b, golden_case_id=req.golden_id,
+        ).first()
+        if not a_row:
+            raise HTTPException(404, f"No RegressionResult for run_a={req.run_a}, golden={req.golden_id}")
+        if not b_row:
+            raise HTTPException(404, f"No RegressionResult for run_b={req.run_b}, golden={req.golden_id}")
+
+        golden_row = session.query(GoldenTestCase).filter_by(id=req.golden_id).first()
+        if not golden_row:
+            raise HTTPException(404, f"Golden {req.golden_id} not found")
+
+        # Attach team_ids via EvalRun for cross-team flag
+        a_eval = session.query(EvalRun).filter_by(id=req.run_a).first()
+        b_eval = session.query(EvalRun).filter_by(id=req.run_b).first()
+        team_a = getattr(a_eval, "team_id", None) if a_eval else None
+        team_b = getattr(b_eval, "team_id", None) if b_eval else None
+        cross_team = bool(team_a and team_b and team_a != team_b)
+
+        # Build judge inputs
+        golden_input = build_golden_input(golden_row)
+        a_input = build_side_input("A", a_row, team_a or "")
+        b_input = build_side_input("B", b_row, team_b or "")
+    finally:
+        session.close()
+
+    # Run the judge (outside the session — long-running Opus call)
+    try:
+        payload = await judge_ab(golden_input, a_input, b_input)
+    except Exception as exc:
+        logger.exception("ab_v2_judge failed for run_a=%s run_b=%s golden=%s", req.run_a, req.run_b, req.golden_id)
+        raise HTTPException(500, f"LLM judge failed: {type(exc).__name__}: {exc}")
+
+    # Persist (upsert)
+    session = get_session()
+    try:
+        existing = session.query(ABJudgeResult).filter_by(
+            run_a=req.run_a, run_b=req.run_b, golden_id=req.golden_id,
+        ).first()
+        rs = payload.get("rubric_score", {}) or {}
+        fields = dict(
+            judge_model=app_config.llm.rubric_judge_model,
+            payload=payload,
+            winner=payload.get("winner"),
+            confidence=payload.get("confidence"),
+            rubric_score_a=rs.get("side_a"),
+            rubric_score_b=rs.get("side_b"),
+            cross_team=cross_team,
+            team_a=team_a, team_b=team_b,
+        )
+        if existing:
+            for k, v in fields.items():
+                setattr(existing, k, v)
+        else:
+            session.add(ABJudgeResult(
+                run_a=req.run_a, run_b=req.run_b, golden_id=req.golden_id,
+                **fields,
+            ))
+        session.commit()
+    finally:
+        session.close()
+
+    return {
+        "cached": False,
+        "judge_model": app_config.llm.rubric_judge_model,
+        "payload": payload,
+        "cross_team": cross_team,
+        "team_a": team_a, "team_b": team_b,
     }
 
 

@@ -11,6 +11,9 @@ class LLMConfig:
     base_url: str = field(default_factory=lambda: os.getenv("LLM_BASE_URL", "https://api.poe.com/v1"))
     model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "gpt-5.3-codex"))
     judge_model: str = field(default_factory=lambda: os.getenv("LLM_JUDGE_MODEL", "gpt-4o"))
+    rubric_judge_model: str = field(
+        default_factory=lambda: os.getenv("LLM_RUBRIC_JUDGE_MODEL", "claude-opus-4.7")
+    )
     rca_model: str = field(default_factory=lambda: os.getenv("LLM_RCA_MODEL", "gpt-4o"))
     router_model: str = field(default_factory=lambda: os.getenv("LLM_ROUTER_MODEL", "claude-sonnet-4-6"))
     temperature: float = 0.0

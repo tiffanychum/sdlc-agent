@@ -27,10 +27,18 @@ from langgraph.checkpoint.memory import MemorySaver
 from src.llm.client import get_llm, get_router_llm
 from src.skills.engine import build_agent_prompt
 from src.tools.registry import get_all_tools
+from src.tools.read_dedup import (
+    DEDUPABLE_READ_TOOLS, activate_read_dedup, wrap_read_dedup,
+)
 from src.hitl import (
     ask_human, DANGEROUS_TOOLS, REVIEWABLE_TOOLS,
     wrap_dangerous_tool, wrap_reviewable_tool, make_planner_executor,
 )
+
+# Agent roles that activate per-turn read deduplication.  Keep tight: only the
+# sdlc_2_0 Builder benefits from this today (it occasionally re-reads files in
+# a single ReAct loop, inflating latency by ~1-3 s per duplicate read).
+_READ_DEDUP_ROLES = frozenset({"builder"})
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +78,150 @@ Decision rules (apply in order):
 User task: {prompt}
 
 Respond with ONLY one of: router_decides, sequential, parallel, supervisor"""
+
+
+# ── Routing-prompt templates (team-agnostic text + {placeholders} for roster) ──
+# These are stored in PromptRegistry as the canonical "v1" rows for the three
+# orchestration roles (supervisor / router / meta_router).  At runtime, the
+# graph builders pull the text from the registry and do .format(agent_descs=…,
+# agent_names=…) so team-specific roster info is interpolated fresh each build.
+# NOTE: two supervisor templates exist because the dev-team pipeline and the
+# sdlc_2_0 2-agent team have materially different routing rules.  Patch 5 will
+# make the registry rows team-scoped so each team's active template is chosen
+# cleanly; until then, _build_supervisor_graph picks between them based on the
+# is_sdlc_2_0 role-set sniff.
+_SUPERVISOR_PROMPT_DEV_TEMPLATE = """\
+You are a supervisor orchestrating a multi-agent workflow.
+
+Agents and their capabilities:
+{agent_descs}
+
+Tool routing rules (delegate only to agents that HAVE the right tools):
+- Writing source code files (.py, .html, .ts, .js, etc.) AND unit tests → "coder"
+  ❌ If source files need to be created and coder has NOT run yet → next agent MUST be "coder"
+  ❌ NEVER route file creation to planner, devops, or project_manager
+- Independent QA validation (E2E tests, performance tests, static analysis, QA report) → "qa"
+  ❌ qa runs AFTER coder — never before coder has implemented the code
+  ❌ qa NEVER writes production code; it only files defect reports
+  ✅ After qa emits NEEDS_FIX, route back to "coder" for fixes, then back to "qa" (max 3 rounds)
+  ✅ After qa emits APPROVED (or round 3 completes), proceed to "devops" or DONE
+- Git/GitHub (commit, push, PR, branch) → "devops"
+  devops runs LAST — only after coder (and qa if requested) have finished their work
+- Web research → "researcher"
+- Jira tickets (epics, stories, dev tasks, acceptance criteria) → "project_manager"
+- Multi-file analysis, architecture audit, cross-concern coordination → "planner"
+  planner reads files for context ONLY — it does NOT create or write files
+
+For full build/implementation tasks, enforce this STRICT sequential order:
+  1. planner        — FIRST: read architecture, create the step-by-step plan
+  2. project_manager — SECOND (if Jira work is requested): create epics/stories
+  3. coder          — THIRD: implement ALL source code files + unit tests
+  4. qa             — FOURTH (if QA is requested): E2E/perf/static QA pass; may cycle with coder
+  5. devops         — FIFTH/LAST: git commit + push + GitHub repo creation
+
+⚠️ If NO prior agent has run yet and the task involves planning + coding + deployment:
+   → ALWAYS start with "planner". Never start with coder when no plan exists yet.
+
+⚠️ If planner has run but coder has NOT run yet and source files still need to be written:
+   → Next agent MUST be "coder". Do not route to devops or qa before coder writes files.
+
+⚠️ If coder has run and qa is required but has NOT run yet:
+   → Next agent MUST be "qa". Do not route to devops before QA approves.
+
+Before deciding, answer these two questions internally:
+1. What has each prior agent actually completed? (check conversation above for tool calls made)
+2. Which step in the build pipeline is still missing?
+
+Then reply with EXACTLY ONE of:
+- "DONE" — if ALL deliverables are complete (plan created, Jira done, files written, QA approved, git pushed)
+- A single agent name — if any step remains
+
+Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
+
+
+_SUPERVISOR_PROMPT_SDLC_2_0_TEMPLATE = """\
+You are the supervisor of a simplified 2-agent team (sdlc_2_0).
+
+Agents and their capabilities:
+{agent_descs}
+
+Routing rules (apply in order):
+1. If the task is simple / single-concern (fix a bug, add an endpoint, run tests,
+   answer a question) → "builder".
+2. If the task is complex (≥3 concerns: implement + test + deploy, OR mentions
+   "plan", "design", "architect", "audit") AND planner_v2 has NOT run yet →
+   "planner_v2" FIRST, then "builder".
+3. If planner_v2 has already produced an approved plan → "builder".
+4. If builder has finished and all deliverables are complete → "DONE".
+
+Reply with EXACTLY ONE of: "DONE" or an agent name (builder / planner_v2).
+Do NOT explain your reasoning."""
+
+
+_ROUTER_PROMPT_TEMPLATE = """\
+You are a routing agent. Select the SINGLE best-fit agent for the FIRST step of the task.
+In a supervisor workflow, additional agents can be invoked afterward — you only choose the first.
+
+Available agents:
+{agent_descs}
+
+Routing rules (apply in strict priority order — STOP at the first match):
+
+## Running tests / test suites (HIGHEST PRIORITY for test execution)
+1. Task asks to run tests, run the test suite, execute pytest/jest/unittest, run `python -m pytest`,
+   verify tests, or check test results — **ALWAYS → "coder"**.
+   Devops does NOT run tests. Examples: "run the test suite", "run tests", "execute pytest",
+   "run python -m pytest foo_test.py", "verify the tests pass".
+
+## Jira operations
+2. Task involves ANY Jira work — creating/managing projects, epics, stories, tasks, assigning
+   tickets, updating status, OR decomposing a feature into dev tasks with acceptance criteria
+   → route to "project_manager".
+   (project_manager handles both project setup AND story decomposition)
+
+## Local file access (filesystem)
+3. Task asks to READ, OPEN, EXAMINE, SUMMARIZE, or INSPECT a local file or directory
+   (e.g. "read README.md", "open config.py", "show me the contents of X", "summarize file Y",
+   "list files in src/", "what does X.py do?") → "coder".
+   NOTE: This rule takes priority over research. Reading a local file is NOT a web search.
+
+## Data / metrics analysis (SQL + regression DB)
+4. Task asks to QUERY the regression database, compare eval runs, find which golden test
+   costs most, which metric scores lowest, which agent fails most, show cost/latency trends
+   from regression history, or do any SQL-based analysis of past runs → "data_analyst".
+   Keywords: "regression", "eval run", "golden test", "metric score", "cost trend",
+   "which agent failed", "compare run A vs run B", "faithfulness score", "deepeval".
+
+## Research (web / external sources only)
+5. Task requires SEARCHING THE WEB, fetching external URLs, finding real-time best practices,
+   or consulting the performance knowledge base about agentic system design → "researcher".
+   Do NOT route here if the task references a local file path or regression data.
+
+## Code quality / review
+6. Task says "review", "assess quality", "find bugs", "suggest improvements" for source code or
+   a git diff, with NO request to also run or change anything → "reviewer".
+
+## Source control & GitHub
+7. Task involves ONLY git or GitHub operations: commit, push, create branch, open PR, list repos,
+   check git status/log/diff — with no code to write and no tests to run → "devops".
+   (If the task mentions running tests, rule 1 applies — route to coder.)
+
+## Independent QA validation
+8. Task asks for QA, E2E testing, performance testing, load testing, or a QA report → "qa".
+
+## Implementation
+9. Task asks to write, edit, implement, or fix source code files → "coder".
+
+## Multi-step planning / analysis
+10. Task requires analyzing multiple files or areas without writing code (architecture audit,
+   dependency analysis, codebase overview) → "planner".
+
+## Defaults
+- If the task starts with implementation AND also mentions testing/git: route to "coder" first
+  (coder writes code + unit tests; supervisor will invoke "qa" and "devops" in subsequent turns).
+- If genuinely unclear: "planner".
+
+Respond with ONLY the agent name from: {agent_names}."""
 
 
 async def select_strategy_auto(
@@ -249,72 +401,183 @@ class OrchestratorState(TypedDict):
     qa_bug_report: Annotated[str, _take_last]
 
 
-def _build_router_prompt(agents_config: list[dict]) -> str:
+_SDLC_2_0_ROSTER = frozenset({"builder", "planner_v2"})
+
+
+# Roles that contribute to the pipeline without needing external tool groups
+# (they plan, research, or coordinate). These are allowed through the
+# tool-coverage filter even when they don't add any group from the required set.
+_COVERAGE_NEUTRAL_ROLES = frozenset({"planner", "planner_v2", "researcher", "project_manager"})
+
+
+def _infer_required_tool_groups(
+    text: str,
+    *,
+    is_build_task: bool,
+    needs_git: bool,
+    needs_jira: bool,
+    needs_research: bool,
+    needs_testing: bool,
+    needs_qa: bool,
+) -> set[str]:
+    """
+    Infer the minimum set of *tool groups* the task actually needs, independent
+    of agent-role keywords. Used to drop pipeline agents that can't contribute.
+
+    Keys are matched against `agent["tool_groups"]` values declared in the team
+    config (e.g. "github", "git", "filesystem", "shell", "web", "rag", "jira").
+    """
+    required: set[str] = set()
+
+    # Treat "github" prompts as needing the github tool group specifically.
+    # (git_commit / git_push alone don't require github REST access.)
+    if "github" in text or "pull request" in text or "open a pr" in text or "open pr" in text:
+        required.add("github")
+    # Bare-git operations (push/commit/clone without github) still need git.
+    if needs_git and "github" not in required:
+        required.add("git")
+
+    if needs_jira:
+        required.add("jira")
+
+    # Local filesystem writes — detect explicit local-path signals.
+    # We require a directory-like token (/tmp/, src/, tests/…) or a
+    # conventional package-manifest filename; bare file names with extensions
+    # like "test.py" don't count because GitHub-REST tasks also mention them.
+    local_path_signal = any(
+        tok in text for tok in (
+            "/tmp/", "./", " src/", " app/", " tests/", " lib/", " pkg/",
+            "src/", "tests/", "app/",  # leading allowed; still anchored by "/"
+            "requirements.txt", "package.json", "pyproject.toml",
+        )
+    )
+    # Pure-GitHub signal: the task works entirely on a remote repo with zero
+    # local path references (golden_020 style). In that case, filename tokens
+    # like "test.py" describe files to create via github_create_file, not local
+    # FS writes — so filesystem is NOT required.
+    pure_github_task = (
+        ("using only github" in text or "only the github" in text
+         or "github rest api" in text or "via the github" in text)
+        and not local_path_signal
+    )
+    if is_build_task and local_path_signal:
+        required.add("filesystem")
+
+    if needs_testing and not pure_github_task:
+        # Local test execution — coder/qa uses shell to run pytest etc.
+        required.add("shell")
+        if "filesystem" not in required and local_path_signal:
+            required.add("filesystem")
+
+    if needs_research:
+        # Research can be satisfied by web, rag, or either.
+        required.add("web_or_rag")
+
+    if needs_qa and "filesystem" not in required:
+        required.add("filesystem")
+
+    return required
+
+
+def _enforce_tool_coverage(
+    steps: list[str],
+    agents_config: list[dict],
+    required_groups: set[str],
+) -> list[str]:
+    """
+    Filter `steps` so only agents that contribute to `required_groups`
+    remain, preserving order. Coverage-neutral roles (planner/researcher/
+    project_manager) are retained when they were in the pipeline.
+
+    After filtering, if any required group is still uncovered, append the
+    first agent from `agents_config` that has that group.
+    """
+    if not required_groups:
+        return steps
+
+    def _agent_groups(role: str) -> set[str]:
+        agent = next((a for a in agents_config if a.get("role") == role), None)
+        return set((agent or {}).get("tool_groups") or [])
+
+    # Treat "web_or_rag" as satisfied by either "web" or "rag".
+    def _covers(group: str, agent_groups: set[str]) -> bool:
+        if group == "web_or_rag":
+            return "web" in agent_groups or "rag" in agent_groups
+        return group in agent_groups
+
+    covered: set[str] = set()
+    filtered: list[str] = []
+    for role in steps:
+        if role in _COVERAGE_NEUTRAL_ROLES:
+            filtered.append(role)
+            continue
+        agent_groups = _agent_groups(role)
+        contributes = {g for g in required_groups if _covers(g, agent_groups)}
+        new_coverage = contributes - covered
+        if new_coverage:
+            filtered.append(role)
+            covered |= new_coverage
+        else:
+            # Drop the agent — it cannot make progress on this task.
+            logger.info(
+                "Router: dropping %r from pipeline (tool_groups=%s don't cover any "
+                "of the task's required groups %s not already handled by %s).",
+                role, agent_groups, required_groups, covered,
+            )
+
+    # Ensure every required group is covered; otherwise append the first
+    # agent from the config that supplies it.
+    for group in required_groups:
+        if group == "web_or_rag":
+            if any(_covers(group, _agent_groups(r)) for r in filtered):
+                continue
+        elif any(group in _agent_groups(r) for r in filtered):
+            continue
+        for agent in agents_config:
+            role = agent.get("role")
+            if role in filtered or role is None:
+                continue
+            if _covers(group, set(agent.get("tool_groups") or [])):
+                logger.info(
+                    "Router: adding %r to cover required tool group %r.",
+                    role, group,
+                )
+                filtered.append(role)
+                break
+
+    return filtered
+
+
+def _pick_default_supervisor_template(agents_config: list[dict]) -> str:
+    """Return the correct supervisor template for a team's agent roster.
+
+    sdlc_2_0 has a strict {builder, planner_v2} roster and needs the 2-agent
+    supervisor template.  Every other team uses the full 5-step dev-team
+    pipeline template.  Used both by the seeder (to decide which template to
+    insert for a new team's v1 row) and the builder (as a safety fallback
+    when the registry lookup returns nothing).
+    """
+    roles = {a["role"] for a in agents_config}
+    if roles and roles.issubset(_SDLC_2_0_ROSTER):
+        return _SUPERVISOR_PROMPT_SDLC_2_0_TEMPLATE
+    return _SUPERVISOR_PROMPT_DEV_TEMPLATE
+
+
+def _build_router_prompt(
+    agents_config: list[dict],
+    template: str | None = None,
+) -> str:
+    """Render the router prompt for a team by interpolating a template.
+
+    When ``template`` is provided (Patch 5 path), it should be the team-scoped
+    template text fetched from the PromptRegistry at the version chosen for
+    this run.  When omitted, falls back to the module-constant template — used
+    by callers that have no team context (e.g. standalone tool tests).
+    """
+    tmpl = template if template is not None else _ROUTER_PROMPT_TEMPLATE
     agent_descs = "\n".join(f'- "{a["role"]}": {a["description"]}' for a in agents_config)
     agent_names = ", ".join(f'"{a["role"]}"' for a in agents_config)
-    return f"""You are a routing agent. Select the SINGLE best-fit agent for the FIRST step of the task.
-In a supervisor workflow, additional agents can be invoked afterward — you only choose the first.
-
-Available agents:
-{agent_descs}
-
-Routing rules (apply in strict priority order — STOP at the first match):
-
-## Running tests / test suites (HIGHEST PRIORITY for test execution)
-1. Task asks to run tests, run the test suite, execute pytest/jest/unittest, run `python -m pytest`,
-   verify tests, or check test results — **ALWAYS → "coder"**.
-   Devops does NOT run tests. Examples: "run the test suite", "run tests", "execute pytest",
-   "run python -m pytest foo_test.py", "verify the tests pass".
-
-## Jira operations
-2. Task involves ANY Jira work — creating/managing projects, epics, stories, tasks, assigning
-   tickets, updating status, OR decomposing a feature into dev tasks with acceptance criteria
-   → route to "project_manager".
-   (project_manager handles both project setup AND story decomposition)
-
-## Local file access (filesystem)
-3. Task asks to READ, OPEN, EXAMINE, SUMMARIZE, or INSPECT a local file or directory
-   (e.g. "read README.md", "open config.py", "show me the contents of X", "summarize file Y",
-   "list files in src/", "what does X.py do?") → "coder".
-   NOTE: This rule takes priority over research. Reading a local file is NOT a web search.
-
-## Data / metrics analysis (SQL + regression DB)
-4. Task asks to QUERY the regression database, compare eval runs, find which golden test
-   costs most, which metric scores lowest, which agent fails most, show cost/latency trends
-   from regression history, or do any SQL-based analysis of past runs → "data_analyst".
-   Keywords: "regression", "eval run", "golden test", "metric score", "cost trend",
-   "which agent failed", "compare run A vs run B", "faithfulness score", "deepeval".
-
-## Research (web / external sources only)
-5. Task requires SEARCHING THE WEB, fetching external URLs, finding real-time best practices,
-   or consulting the performance knowledge base about agentic system design → "researcher".
-   Do NOT route here if the task references a local file path or regression data.
-
-## Code quality / review
-6. Task says "review", "assess quality", "find bugs", "suggest improvements" for source code or
-   a git diff, with NO request to also run or change anything → "reviewer".
-
-## Source control & GitHub
-7. Task involves ONLY git or GitHub operations: commit, push, create branch, open PR, list repos,
-   check git status/log/diff — with no code to write and no tests to run → "devops".
-   (If the task mentions running tests, rule 1 applies — route to coder.)
-
-## Independent QA validation
-8. Task asks for QA, E2E testing, performance testing, load testing, or a QA report → "qa".
-
-## Implementation
-9. Task asks to write, edit, implement, or fix source code files → "coder".
-
-## Multi-step planning / analysis
-10. Task requires analyzing multiple files or areas without writing code (architecture audit,
-   dependency analysis, codebase overview) → "planner".
-
-## Defaults
-- If the task starts with implementation AND also mentions testing/git: route to "coder" first
-  (coder writes code + unit tests; supervisor will invoke "qa" and "devops" in subsequent turns).
-- If genuinely unclear: "planner".
-
-Respond with ONLY the agent name from: {agent_names}."""
+    return tmpl.format(agent_descs=agent_descs, agent_names=agent_names)
 
 
 def _get_executor(role: str, built_agents: dict, exec_agents=None,
@@ -370,6 +633,29 @@ def _build_handoff_context(state: OrchestratorState, current_role: str) -> str |
                         f"  ✓ {agent} asked: \"{question[:120]}\" — already answered/approved"
                     )
 
+    # Fix #1 (plan-in-handoff): when the most recent prior agent was a planner,
+    # surface its final AIMessage verbatim so the next agent (builder / coder)
+    # executes the plan instead of re-planning.  Mirrors how `default`'s coder
+    # picks up the plan from message history — but makes it explicit in the
+    # handoff so the next agent cannot miss it even when the message history is
+    # large.  Planner roles: dev-team "planner" and sdlc_2_0 "planner_v2".
+    plan_section = ""
+    last_exec = completed[-1] if completed else None
+    last_agent_role = (last_exec or {}).get("agent", "")
+    if last_agent_role in ("planner", "planner_v2"):
+        last_plan_text = _extract_last_ai_text(msgs)
+        if last_plan_text:
+            # Truncate very long plans to keep the handoff prompt focused; real
+            # plans are short (<2k chars). Cap at 4k just in case.
+            truncated = last_plan_text if len(last_plan_text) <= 4000 else (
+                last_plan_text[:4000] + "\n… (truncated)"
+            )
+            plan_section = (
+                f"PLAN FROM PRIOR {last_agent_role.upper()} "
+                "(do NOT re-plan — execute these steps verbatim):\n"
+                f"{truncated}\n\n"
+            )
+
     header = ""
     if original_request:
         header = f"ORIGINAL REQUEST: {original_request}\n\n"
@@ -399,6 +685,7 @@ def _build_handoff_context(state: OrchestratorState, current_role: str) -> str |
 
     return (
         header
+        + plan_section
         + "WORKFLOW CONTEXT — completed by prior agents (do NOT repeat this work):\n"
         + "\n".join(lines)
         + hitl_section
@@ -408,8 +695,75 @@ def _build_handoff_context(state: OrchestratorState, current_role: str) -> str |
     )
 
 
+def _extract_last_ai_text(msgs: list[BaseMessage]) -> str:
+    """Return the text content of the most recent non-empty AIMessage, or ''.
+
+    Used by Fix #1 (plan-in-handoff) to pull the planner's final message
+    verbatim.  Skips empty / tool-call-only AIMessages where `content` is blank
+    because the assistant only emitted tool_calls.  Handles both string and
+    list-of-content-blocks shapes (Anthropic-style) by concatenating text parts.
+    """
+    for m in reversed(msgs):
+        if not isinstance(m, AIMessage):
+            continue
+        content = m.content
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    t = part.get("text") or part.get("content") or ""
+                    if t:
+                        parts.append(str(t))
+                elif isinstance(part, str):
+                    parts.append(part)
+            text = "\n".join(parts).strip()
+        else:
+            text = str(content or "").strip()
+        if text:
+            return text
+    return ""
+
+
+_NARRATION_PATTERNS = (
+    re.compile(r"\bnow writing\b", re.I),
+    re.compile(r"\babout to (write|produce|generate|compile|finalize)\b", re.I),
+    re.compile(r"\bi will now\b", re.I),
+    re.compile(r"\b(let me|i'll|i will) (start|begin) (writing|the report|preparing)\b", re.I),
+    re.compile(r"^confidence[:\s]+\d+\s*/\s*\d+\s*[—-]?\s*$", re.I | re.M),
+    re.compile(r"\bpreparing (the )?(final )?(report|summary|review)\b", re.I),
+)
+
+
+def _looks_like_narration(text: str) -> bool:
+    """Heuristic: did the agent announce a deliverable but not actually produce one?
+
+    True only for SHORT messages that match a narration pattern.  Real review /
+    report deliverables from our agents are consistently ≥ 250 chars; anything
+    shorter that talks about "writing the report" is almost certainly a
+    premature stop.
+    """
+    t = (text or "").strip()
+    if not t or len(t) >= 250:
+        return False
+    return any(p.search(t) for p in _NARRATION_PATTERNS)
+
+
 def _make_agent_executor(role: str, built_agents: dict):
     """Create an executor closure for a given agent role."""
+    import contextlib as _contextlib
+
+    def _dedup_scope():
+        # Activate per-turn read dedup only for agents in _READ_DEDUP_ROLES.
+        # Outside that set we return a nullcontext so there is zero overhead
+        # and identical behaviour.  A fresh scope is created per `execute`
+        # call — both the primary ainvoke and the narration-guard retry
+        # share the same cache.
+        if role in _READ_DEDUP_ROLES:
+            return activate_read_dedup()
+        return _contextlib.nullcontext()
+
     async def execute(state: OrchestratorState) -> OrchestratorState:
         import time as _time
         msgs = _ensure_messages(state["messages"])
@@ -426,10 +780,46 @@ def _make_agent_executor(role: str, built_agents: dict):
             # HumanMessage to keep the API happy.
             msgs = [*msgs, HumanMessage(content="Continue with your part of the task.")]
 
-        _t0 = _time.time()
-        result = await built_agents[role].ainvoke({"messages": msgs})
-        _latency_ms = (_time.time() - _t0) * 1000
+        # Fix #3: enter the read-dedup scope ONCE so the primary ainvoke and
+        # any narration-guard retry share a single cache.  Outside
+        # _READ_DEDUP_ROLES this is a nullcontext — free.
+        with _dedup_scope():
+            _t0 = _time.time()
+            result = await built_agents[role].ainvoke({"messages": msgs})
+            _latency_ms = (_time.time() - _t0) * 1000
 
+            # Narration guard: some agents (reviewer, qa) occasionally stop
+            # early with a message like "Now writing the report..." that contains no
+            # tool calls and no actual deliverable — LangGraph treats that as a
+            # terminal state and the graph ends.  Detect that single failure mode
+            # and re-invoke the agent ONCE with a direct nudge.  Capped at 1 retry
+            # per executor call so we never loop.
+            out_messages = _ensure_messages(result.get("messages", []))
+            last = out_messages[-1] if out_messages else None
+            if (
+                last is not None
+                and isinstance(last, AIMessage)
+                and not getattr(last, "tool_calls", None)
+                and _looks_like_narration(_extract_text(last.content))
+            ):
+                nudge = SystemMessage(content=(
+                    "Your previous message was narration, not a deliverable. "
+                    "Produce the COMPLETE output NOW as your next message: follow the "
+                    "output format in your system prompt, include every required "
+                    "section in full, and do not announce what you are about to do — "
+                    "just do it.  No placeholders, no 'I will now...' preamble."
+                ))
+                logger.info(
+                    "[%s] narration guard fired (len=%d); re-invoking with nudge.",
+                    role, len(_extract_text(last.content)),
+                )
+                _t1 = _time.time()
+                result = await built_agents[role].ainvoke(
+                    {"messages": [*out_messages, nudge]}
+                )
+                _latency_ms += (_time.time() - _t1) * 1000
+
+        # Re-read out_messages after any narration-guard re-invocation above.
         out_messages = _ensure_messages(result.get("messages", []))
         tool_calls = []
         tokens_in = 0
@@ -505,7 +895,16 @@ async def build_orchestrator_from_team(
     strategy_override: str = None,
     prompt_versions_by_role: dict = None,
     routing_prompt_versions: dict = None,
+    prompt_text_overrides: dict = None,
 ):
+    """Build an orchestrator graph for a team.
+
+    ``prompt_text_overrides`` (optional) maps ``role → prompt_text`` and takes
+    precedence over both ``prompt_versions_by_role`` and the registry lookup.
+    Used by the global Prompt Optimizer to validate a candidate prompt in memory
+    without registering it — the orchestrator sees the raw text for that role
+    and the rest of the team uses their registered versions.
+    """
     # Deferred imports to avoid circular imports at module load time.
     from src.db.database import get_session
     from src.db.models import Team, Agent, AgentToolMapping
@@ -552,6 +951,13 @@ async def build_orchestrator_from_team(
                 except Exception:
                     pass  # fall back to DB value
 
+            # In-memory prompt-text override — beats registry lookup and pv map.
+            # Used by the global Prompt Optimizer to validate an unregistered
+            # candidate prompt against the regression suite.
+            if prompt_text_overrides and a.role in prompt_text_overrides:
+                system_prompt = prompt_text_overrides[a.role]
+                pv = f"{pv}+override"
+
             agents_config.append({
                 "id": a.id, "name": a.name, "role": a.role,
                 "description": a.description, "system_prompt": system_prompt,
@@ -590,11 +996,18 @@ async def build_orchestrator_from_team(
 
         # Apply HITL wrappers — use elif so a tool can't be double-wrapped.
         hitl_tools: list[StructuredTool] = []
+        dedup_this_agent = ac["role"] in _READ_DEDUP_ROLES
         for t in agent_tools:
             if t.name in DANGEROUS_TOOLS:
                 t = wrap_dangerous_tool(t, agent_role=ac["role"])
             elif t.name in REVIEWABLE_TOOLS:
                 t = wrap_reviewable_tool(t, agent_role=ac["role"])
+            # Fix #3: wrap read-style tools with a per-turn dedup cache for
+            # agents in _READ_DEDUP_ROLES (currently just builder).  Safe —
+            # the wrapper is a no-op outside an active activate_read_dedup()
+            # scope, so other agents still behave identically.
+            if dedup_this_agent and t.name in DEDUPABLE_READ_TOOLS:
+                t = wrap_read_dedup(t)
             hitl_tools.append(t)
 
         # Append ask_human only if it is not already present in the tool list.
@@ -615,29 +1028,75 @@ async def build_orchestrator_from_team(
             )
 
     # ── Seed and resolve routing prompt versions ──────────────────────────────
-    # Load the supervisor/router/meta_router prompt from the registry so that
-    # versioned routing prompts can be tracked, A/B tested, and optimized.
+    # Load the supervisor/router/meta_router template from the PromptRegistry
+    # so routing prompts are versioned, A/B-testable, and team-scoped.
+    #
+    # Patch 5 semantics:
+    #   - supervisor + router are SEEDED PER TEAM on first build.  Each team
+    #     gets its own v1 row (e.g. sdlc_2_0 gets the 2-agent template,
+    #     dev-team gets the 5-step pipeline template).  Optimizer / manual
+    #     bumps create new rows at (team_id, role, vN) without touching other
+    #     teams' version history.
+    #   - meta_router stays GLOBAL (single shared row, team_id=NULL).  Its
+    #     text has no team-specific placeholders — it only routes among
+    #     strategies, not agent roles — so there is nothing to scope.
     resolved_routing_versions = {"supervisor": "v1", "meta_router": "v1", "router": "v1"}
+    supervisor_template_text: str | None = None
+    router_template_text: str | None = None
     try:
         from src.prompts.registry import get_registry as _get_registry
         _reg = _get_registry()
-        # Seed routing prompts on first run (idempotent) using module-level prompt templates
-        _router_prompt_text = _build_router_prompt(agents_config)
+
+        # Ensure meta_router has a global v1 (shared by every team).
         _reg.seed_routing_prompts(
-            supervisor_prompt=_META_ROUTER_PROMPT,   # meta-router strategy selection
-            meta_router_prompt=_META_ROUTER_PROMPT,  # same template, versioned separately
-            router_prompt=_router_prompt_text,        # single-agent router
-        )
-        # Drift detection — bump to a new version if the code prompt has changed
-        # (e.g. after the tester→coder/qa merge the router prompt was updated).
-        _reg.sync_routing_prompts(
-            supervisor_prompt=_META_ROUTER_PROMPT,
+            supervisor_prompt="",  # ignored when team_id is set below
             meta_router_prompt=_META_ROUTER_PROMPT,
-            router_prompt=_router_prompt_text,
+            router_prompt="",      # ignored when team_id is set below
+            team_id=None,
         )
-        for role in ("supervisor", "meta_router", "router"):
-            ver = (routing_prompt_versions or {}).get(role)
-            resolved_routing_versions[role] = ver if ver else _reg.latest_version(role)
+        # Per-team seed for supervisor + router.  The supervisor template
+        # choice depends on the team's roster (dev vs sdlc_2_0); router is
+        # the same template for every team today but still team-scoped so
+        # each team owns its own version history.
+        default_supervisor_tmpl = _pick_default_supervisor_template(agents_config)
+        _reg.seed_routing_prompts(
+            supervisor_prompt=default_supervisor_tmpl,
+            meta_router_prompt="",  # ignored for team-scoped seed
+            router_prompt=_ROUTER_PROMPT_TEMPLATE,
+            team_id=team_id,
+        )
+
+        # Resolve the effective version for each routing role.  Caller can
+        # pin a specific version via routing_prompt_versions; otherwise we
+        # serve "latest" at the team's scope (with global fallback for
+        # meta_router, and for brand-new teams whose seed just ran).
+        ver_overrides = routing_prompt_versions or {}
+        resolved_routing_versions["supervisor"] = (
+            ver_overrides.get("supervisor")
+            or _reg.latest_version("supervisor", team_id=team_id)
+        )
+        resolved_routing_versions["meta_router"] = (
+            ver_overrides.get("meta_router")
+            or _reg.latest_version("meta_router")
+        )
+        resolved_routing_versions["router"] = (
+            ver_overrides.get("router")
+            or _reg.latest_version("router", team_id=team_id)
+        )
+
+        # Fetch the actual template text at the resolved versions.  These
+        # still contain {agent_descs} / {agent_names} placeholders — the
+        # builders call .format(...) to interpolate the live team roster.
+        supervisor_template_text = _reg.get_prompt(
+            "supervisor",
+            resolved_routing_versions["supervisor"],
+            team_id=team_id,
+        )
+        router_template_text = _reg.get_prompt(
+            "router",
+            resolved_routing_versions["router"],
+            team_id=team_id,
+        )
     except Exception as _e:
         logger.debug("Routing prompt versioning unavailable: %s", _e)
 
@@ -648,8 +1107,14 @@ async def build_orchestrator_from_team(
         "supervisor": _build_supervisor_graph,
     }
     builder_fn = builders.get(strategy, _build_router_graph)
-    graph = builder_fn(agents_config, built_agents, checkpointer=checkpointer,
-                       exec_agents=exec_agents)
+    graph = builder_fn(
+        agents_config,
+        built_agents,
+        checkpointer=checkpointer,
+        exec_agents=exec_agents,
+        supervisor_prompt_template=supervisor_template_text,
+        router_prompt_template=router_template_text,
+    )
     # Attach resolved routing prompt versions as metadata on the compiled graph
     # so callers (regression runner) can read them back.
     graph.__routing_prompt_versions__ = resolved_routing_versions
@@ -657,9 +1122,11 @@ async def build_orchestrator_from_team(
 
 
 def _build_router_graph(agents_config, built_agents, checkpointer=None,
-                        exec_agents=None):
+                        exec_agents=None,
+                        supervisor_prompt_template: str | None = None,  # unused (supervisor-strategy only)
+                        router_prompt_template: str | None = None):
     router_llm = get_router_llm()
-    router_prompt = _build_router_prompt(agents_config)
+    router_prompt = _build_router_prompt(agents_config, template=router_prompt_template)
     valid_roles = {a["role"] for a in agents_config}
     default_role = agents_config[0]["role"]
 
@@ -763,7 +1230,9 @@ async def _synthesize_outputs(state: OrchestratorState, mode: str) -> Orchestrat
 
 
 def _build_sequential_graph(agents_config, built_agents, checkpointer=None,
-                            exec_agents=None):
+                            exec_agents=None,
+                            supervisor_prompt_template: str | None = None,  # unused
+                            router_prompt_template: str | None = None):     # unused
     roles = [ac["role"] for ac in agents_config]
     if not roles:
         raise ValueError("Sequential strategy requires at least one agent with a role set.")
@@ -790,7 +1259,9 @@ def _build_sequential_graph(agents_config, built_agents, checkpointer=None,
 
 
 def _build_parallel_graph(agents_config, built_agents, checkpointer=None,
-                          exec_agents=None):
+                          exec_agents=None,
+                          supervisor_prompt_template: str | None = None,  # unused
+                          router_prompt_template: str | None = None):     # unused
     """Fan-out to all agents in parallel, then fan-in to a merge node before END.
 
     The merge node is a no-op pass-through: LangGraph's operator.add reducer on
@@ -852,16 +1323,18 @@ def _build_parallel_graph(agents_config, built_agents, checkpointer=None,
 
 
 def _build_supervisor_graph(agents_config, built_agents, checkpointer=None,
-                            exec_agents=None):
+                            exec_agents=None,
+                            supervisor_prompt_template: str | None = None,
+                            router_prompt_template: str | None = None):  # unused
     router_llm = get_router_llm()
     valid_roles = {a["role"] for a in agents_config}
 
-    # Detect which team we are orchestrating based on the agent roster.
-    # sdlc_2_0 has a strict roster of {builder, planner_v2} — when we see that,
-    # switch to a concise 2-agent supervisor prompt + derive logic. Everything
-    # else falls through to the full 9-role dev-team pipeline.
-    _SDLC_2_0_ROLES = {"builder", "planner_v2"}
-    is_sdlc_2_0 = bool(valid_roles) and valid_roles.issubset(_SDLC_2_0_ROLES)
+    # sdlc_2_0 has a strict roster of {builder, planner_v2}; the logic below
+    # that _derive_required_steps uses to compare completed vs. required
+    # pipeline stages branches on this flag.  The prompt text itself is
+    # resolved separately from the registry so each team's supervisor prompt
+    # can be optimised independently.
+    is_sdlc_2_0 = bool(valid_roles) and valid_roles.issubset(_SDLC_2_0_ROSTER)
 
     def _tool_hint(a: dict) -> str:
         """Return a parenthetical hint listing the tool groups an agent has access to."""
@@ -874,72 +1347,20 @@ def _build_supervisor_graph(agents_config, built_agents, checkpointer=None,
     agent_descs = "\n".join(
         f'- "{a["role"]}"{_tool_hint(a)}: {a["description"]}' for a in agents_config
     )
-    agent_names = ", ".join(f'"{a["role"]}"' for a in agents_config)
 
-    if is_sdlc_2_0:
-        supervisor_prompt = f"""You are the supervisor of a simplified 2-agent team (sdlc_2_0).
-
-Agents and their capabilities:
-{agent_descs}
-
-Routing rules (apply in order):
-1. If the task is simple / single-concern (fix a bug, add an endpoint, run tests,
-   answer a question) → "builder".
-2. If the task is complex (≥3 concerns: implement + test + deploy, OR mentions
-   "plan", "design", "architect", "audit") AND planner_v2 has NOT run yet →
-   "planner_v2" FIRST, then "builder".
-3. If planner_v2 has already produced an approved plan → "builder".
-4. If builder has finished and all deliverables are complete → "DONE".
-
-Reply with EXACTLY ONE of: "DONE" or an agent name (builder / planner_v2).
-Do NOT explain your reasoning."""
+    # Template precedence (Patch 5):
+    #   1. Explicit template passed in (from build_orchestrator_from_team's
+    #      team-scoped registry lookup, including any user-pinned version).
+    #   2. The team-appropriate module-constant template (safety fallback for
+    #      callers that build this graph directly without going through
+    #      build_orchestrator_from_team).
+    if supervisor_prompt_template is not None:
+        tmpl = supervisor_prompt_template
+    elif is_sdlc_2_0:
+        tmpl = _SUPERVISOR_PROMPT_SDLC_2_0_TEMPLATE
     else:
-        supervisor_prompt = f"""You are a supervisor orchestrating a multi-agent workflow.
-
-Agents and their capabilities:
-{agent_descs}
-
-Tool routing rules (delegate only to agents that HAVE the right tools):
-- Writing source code files (.py, .html, .ts, .js, etc.) AND unit tests → "coder"
-  ❌ If source files need to be created and coder has NOT run yet → next agent MUST be "coder"
-  ❌ NEVER route file creation to planner, devops, or project_manager
-- Independent QA validation (E2E tests, performance tests, static analysis, QA report) → "qa"
-  ❌ qa runs AFTER coder — never before coder has implemented the code
-  ❌ qa NEVER writes production code; it only files defect reports
-  ✅ After qa emits NEEDS_FIX, route back to "coder" for fixes, then back to "qa" (max 3 rounds)
-  ✅ After qa emits APPROVED (or round 3 completes), proceed to "devops" or DONE
-- Git/GitHub (commit, push, PR, branch) → "devops"
-  devops runs LAST — only after coder (and qa if requested) have finished their work
-- Web research → "researcher"
-- Jira tickets (epics, stories, dev tasks, acceptance criteria) → "project_manager"
-- Multi-file analysis, architecture audit, cross-concern coordination → "planner"
-  planner reads files for context ONLY — it does NOT create or write files
-
-For full build/implementation tasks, enforce this STRICT sequential order:
-  1. planner        — FIRST: read architecture, create the step-by-step plan
-  2. project_manager — SECOND (if Jira work is requested): create epics/stories
-  3. coder          — THIRD: implement ALL source code files + unit tests
-  4. qa             — FOURTH (if QA is requested): E2E/perf/static QA pass; may cycle with coder
-  5. devops         — FIFTH/LAST: git commit + push + GitHub repo creation
-
-⚠️ If NO prior agent has run yet and the task involves planning + coding + deployment:
-   → ALWAYS start with "planner". Never start with coder when no plan exists yet.
-
-⚠️ If planner has run but coder has NOT run yet and source files still need to be written:
-   → Next agent MUST be "coder". Do not route to devops or qa before coder writes files.
-
-⚠️ If coder has run and qa is required but has NOT run yet:
-   → Next agent MUST be "qa". Do not route to devops before QA approves.
-
-Before deciding, answer these two questions internally:
-1. What has each prior agent actually completed? (check conversation above for tool calls made)
-2. Which step in the build pipeline is still missing?
-
-Then reply with EXACTLY ONE of:
-- "DONE" — if ALL deliverables are complete (plan created, Jira done, files written, QA approved, git pushed)
-- A single agent name — if any step remains
-
-Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
+        tmpl = _SUPERVISOR_PROMPT_DEV_TEMPLATE
+    supervisor_prompt = tmpl.format(agent_descs=agent_descs)
 
     def _derive_required_steps(user_request: str) -> list[str]:
         """
@@ -1074,6 +1495,27 @@ Do NOT explain your reasoning. Reply with ONLY "DONE" or one agent name."""
             steps.append("qa")
         if needs_git:
             steps.append("devops")
+
+        # ── Tool-coverage gate ────────────────────────────────────────────────
+        # Before returning the pipeline, verify that each agent it contains
+        # actually has the tool groups needed to make progress on THIS task.
+        # Without this, we produce pipelines like [coder, devops] for a
+        # "create branch + file + PR via GitHub REST" task — coder then
+        # narrates (no github tools), which pollutes the handoff context so
+        # devops also narrates. Filter agents that add no coverage for the
+        # task's required tool groups; keep coverage-neutral roles
+        # (planner/researcher/project_manager) when they were added above.
+        required_groups = _infer_required_tool_groups(
+            text,
+            is_build_task=is_build_task,
+            needs_git=needs_git,
+            needs_jira=needs_jira,
+            needs_research=needs_research,
+            needs_testing=needs_testing,
+            needs_qa=needs_qa,
+        )
+        if required_groups:
+            steps = _enforce_tool_coverage(steps, agents_config, required_groups)
 
         # If no steps derived, return empty (supervisor falls back to LLM routing)
         return steps

@@ -300,18 +300,29 @@ export default function StudioPage() {
 
   useEffect(() => { load(); }, []);
 
+  // Re-fetch the routing-prompt panel whenever the active team changes so
+  // supervisor/router rows show the team-scoped versions (Patch 5).  Each
+  // team has its own supervisor/router rows in the registry; meta_router is
+  // global but the endpoint still returns it here for a single combined view.
+  useEffect(() => {
+    if (!team?.id) return;
+    api.prompts.routing(team.id)
+      .then(routing => {
+        if (routing?.routing) setRoutingPrompts(routing.routing);
+      })
+      .catch(() => { /* ignore — panel keeps previous state */ });
+  }, [team?.id]);
+
   async function load() {
-    const [t, s, tl, models, llmCfg, allVersions, routing] = await Promise.all([
+    const [t, s, tl, models, llmCfg, allVersions] = await Promise.all([
       refreshTeams(), api.skills.list(), api.tools.list(),
       api.models.list(), api.config.llm(),
       api.prompts.versions().catch(() => ({ roles: {} })),
-      fetch("/api/prompts/routing").then(r => r.json()).catch(() => ({ routing: {} })),
     ]);
     setSkills(s); setTools(tl);
     setAvailableModels(models);
     setDefaultModelName(llmCfg.default_model_name || llmCfg.default_model || "from .env");
     if (allVersions?.roles) setAgentVersions(allVersions.roles);
-    if (routing?.routing) setRoutingPrompts(routing.routing);
     if (t.length > 0 && !team) {
       // Prefer whatever the global context was already showing so navigation
       // from another page keeps the same team active here.
@@ -461,12 +472,12 @@ export default function StudioPage() {
     if (!version) return;
     setSavingRouting(role);
     try {
-      await fetch(`/api/prompts/routing/${role}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ version }),
-      });
-      const routing = await fetch("/api/prompts/routing").then(r => r.json()).catch(() => ({ routing: {} }));
+      // Scope the activation to the current team.  For supervisor/router
+      // this flips is_active only on that team's rows; for meta_router the
+      // backend silently ignores team_id and flips the global row.
+      const tid = team?.id || undefined;
+      await api.prompts.setRoutingVersion(role, version, tid);
+      const routing = await api.prompts.routing(tid).catch(() => ({ routing: {} }));
       if (routing?.routing) setRoutingPrompts(routing.routing);
       setRoutingPendingVersion(prev => { const n = { ...prev }; delete n[role]; return n; });
     } finally {

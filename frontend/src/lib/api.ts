@@ -155,6 +155,22 @@ export const api = {
       if (params.version_b) q.set("version_b", params.version_b);
       return fetchJSON(`/api/regression/ab?${q}`);
     },
+    // v2 A/B picker: cross-project scope + overlap + adaptive LLM judge.
+    abV2Runs: (params: { scope: "same" | "cross"; team_id?: string; limit?: number }) => {
+      const q = new URLSearchParams({ scope: params.scope });
+      if (params.team_id) q.set("team_id", params.team_id);
+      if (params.limit) q.set("limit", String(params.limit));
+      return fetchJSON(`/api/regression/ab/runs?${q.toString()}`);
+    },
+    abV2Overlap: (run_a: string, run_b: string) => {
+      const q = new URLSearchParams({ run_a, run_b });
+      return fetchJSON(`/api/regression/ab/overlap?${q.toString()}`);
+    },
+    abV2Judge: (body: { run_a: string; run_b: string; golden_id: string; force_refresh?: boolean }) =>
+      fetchJSON("/api/regression/ab/judge", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
   },
   models: {
     list: () => fetchJSON("/api/models"),
@@ -170,9 +186,41 @@ export const api = {
     current: () => fetchJSON("/api/prompt-versions/current"),
   },
   prompts: {
-    versions: (role?: string) => fetchJSON(`/api/prompts/versions${role ? `?role=${encodeURIComponent(role)}` : ""}`),
-    text: (role: string, version: string) => fetchJSON(`/api/prompts/text?role=${encodeURIComponent(role)}&version=${encodeURIComponent(version)}`),
-    diff: (role: string, vOld: string, vNew: string) => fetchJSON(`/api/prompts/diff?role=${encodeURIComponent(role)}&version_old=${encodeURIComponent(vOld)}&version_new=${encodeURIComponent(vNew)}`),
+    // Every prompts.* helper accepts an optional teamId so team-scoped
+    // routing-prompt rows (supervisor, router) resolve correctly.  Agent-role
+    // prompts are still global; the backend silently ignores team_id for
+    // those rows so passing it is always safe.
+    versions: (role?: string, teamId?: string) => {
+      const params = new URLSearchParams();
+      if (role) params.set("role", role);
+      if (teamId) params.set("team_id", teamId);
+      const qs = params.toString();
+      return fetchJSON(`/api/prompts/versions${qs ? `?${qs}` : ""}`);
+    },
+    text: (role: string, version: string, teamId?: string) => {
+      const params = new URLSearchParams({ role, version });
+      if (teamId) params.set("team_id", teamId);
+      return fetchJSON(`/api/prompts/text?${params.toString()}`);
+    },
+    diff: (role: string, vOld: string, vNew: string, teamId?: string) => {
+      const params = new URLSearchParams({
+        role, version_old: vOld, version_new: vNew,
+      });
+      if (teamId) params.set("team_id", teamId);
+      return fetchJSON(`/api/prompts/diff?${params.toString()}`);
+    },
     abCompare: (role: string, va: string, vb: string) => fetchJSON(`/api/prompts/ab-compare?role=${encodeURIComponent(role)}&version_a=${encodeURIComponent(va)}&version_b=${encodeURIComponent(vb)}`),
+    // Combined routing-prompt view (supervisor / meta_router / router).
+    // Pass teamId so supervisor and router rows resolve to the team's scope
+    // (meta_router is global regardless).
+    routing: (teamId?: string) => {
+      const qs = teamId ? `?team_id=${encodeURIComponent(teamId)}` : "";
+      return fetchJSON(`/api/prompts/routing${qs}`);
+    },
+    setRoutingVersion: (role: string, version: string, teamId?: string) =>
+      fetchJSON(`/api/prompts/routing/${encodeURIComponent(role)}`, {
+        method: "PUT",
+        body: JSON.stringify({ version, team_id: teamId }),
+      }),
   },
 };
