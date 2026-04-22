@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.db.database import init_db, seed_defaults, update_agent_data, get_session
 from src.db.models import (
@@ -31,6 +31,7 @@ from src.db.models import (
     Trace, Span, EvalRun, GoldenTestCase, RegressionResult, PromptVersion,
     ABJudgeResult,
     RagConfig as RagConfigModel, RagSource, RagQuery,
+    WorkflowDefinition, WorkflowRun,
 )
 from src.orchestrator import build_orchestrator_from_team, _extract_text, get_graph_config
 from src.tracing.collector import TraceCollector, _flush_pending_spans, estimate_cost
@@ -696,10 +697,21 @@ async def chat_stream(team_id: str, request: ChatStreamRequest):
     graph = orchestrators[team_id]
     thread_id = request.thread_id or uuid.uuid4().hex[:12]
 
-    span_queue: asyncio.Queue = asyncio.Queue()
+    # A4: bounded queue applies back-pressure instead of growing unbounded when
+    # the frontend consumer stalls.  512 is generous for a single chat turn (a
+    # busy multi-agent run emits ~50-100 span events); at the cap we drop rather
+    # than OOM the worker.
+    span_queue: asyncio.Queue = asyncio.Queue(maxsize=512)
 
     def on_span_event(event_type: str, span_data: dict):
-        span_queue.put_nowait({"event": event_type, "span": span_data})
+        try:
+            span_queue.put_nowait({"event": event_type, "span": span_data})
+        except asyncio.QueueFull:
+            # Trace events are telemetry, not data — dropping is preferable to
+            # blocking the tracing callback (which runs on the event loop or a
+            # LangChain worker thread depending on the provider).
+            logger.warning("chat_stream span_queue full (team=%s); dropping span event %s",
+                           team_id, event_type)
 
     collector = TraceCollector(team_id=team_id, user_prompt=request.message,
                                on_span_event=on_span_event)
@@ -786,7 +798,9 @@ async def chat_stream(team_id: str, request: ChatStreamRequest):
             while not span_queue.empty():
                 sq = span_queue.get_nowait()
                 yield _sse_event("trace_span", sq)
-            collector.save()
+            # A2: offload sync SQLAlchemy write so other concurrent streams
+            # keep progressing on the event loop during the commit.
+            await asyncio.to_thread(collector.save)
             yield _sse_event("done", {"thread_id": thread_id, "partial": True})
             return
 
@@ -829,7 +843,8 @@ async def chat_stream(team_id: str, request: ChatStreamRequest):
                     last.content if hasattr(last, "content") else str(last)
                 )
 
-            collector.save()
+            # A2: offload sync SQLAlchemy write — same rationale as above.
+            await asyncio.to_thread(collector.save)
 
             yield _sse_event("response", {
                 "content": response_text,
@@ -859,10 +874,15 @@ async def chat_resume(team_id: str, request: ChatResumeRequest):
 
     from langgraph.types import Command
 
-    span_queue: asyncio.Queue = asyncio.Queue()
+    # A4: bounded queue — see chat_stream for rationale.
+    span_queue: asyncio.Queue = asyncio.Queue(maxsize=512)
 
     def on_span_event(event_type: str, span_data: dict):
-        span_queue.put_nowait({"event": event_type, "span": span_data})
+        try:
+            span_queue.put_nowait({"event": event_type, "span": span_data})
+        except asyncio.QueueFull:
+            logger.warning("chat_resume span_queue full (team=%s); dropping span event %s",
+                           team_id, event_type)
 
     collector = TraceCollector(team_id=team_id, user_prompt="[HITL resume]",
                                on_span_event=on_span_event)
@@ -914,7 +934,7 @@ async def chat_resume(team_id: str, request: ChatResumeRequest):
             while not span_queue.empty():
                 sq = span_queue.get_nowait()
                 yield _sse_event("trace_span", sq)
-            collector.save()
+            await asyncio.to_thread(collector.save)
             yield _sse_event("done", {"thread_id": thread_id, "partial": True})
             return
 
@@ -955,7 +975,7 @@ async def chat_resume(team_id: str, request: ChatResumeRequest):
                     last.content if hasattr(last, "content") else str(last)
                 )
 
-            collector.save()
+            await asyncio.to_thread(collector.save)
 
             yield _sse_event("response", {
                 "content": response_text,
@@ -3882,6 +3902,379 @@ def list_rag_queries(days: int = 30, limit: int = 100):
         return [_query_to_dict(r) for r in rows]
     finally:
         session.close()
+
+
+# ── No-Code Workflow Builder API ─────────────────────────────────
+#
+# LangFlow-style DAG builder.  Routes under /api/workflows/* — none of
+# the existing route prefixes collide.  The graph payload is stored as
+# JSON (matching React Flow's wire format) in `WorkflowDefinition.graph_json`
+# and executed server-side by `src.workflow.executor.WorkflowExecutor`.
+
+class _WorkflowCreate(BaseModel):
+    name: str
+    description: str = ""
+    graph: dict = Field(default_factory=dict)
+    team_id: Optional[str] = None
+
+
+class _WorkflowUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    graph: Optional[dict] = None
+
+
+class _WorkflowRunRequest(BaseModel):
+    mode: str = Field(..., description="ingest | query")
+    input: dict = Field(default_factory=dict)
+
+
+def _wf_row_to_dict(row: WorkflowDefinition, *, include_graph: bool = True) -> dict:
+    out = {
+        "id": row.id,
+        "name": row.name,
+        "description": row.description or "",
+        "team_id": row.team_id,
+        "is_active": bool(row.is_active),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+    if include_graph:
+        out["graph"] = row.graph_json or {"nodes": [], "edges": []}
+    return out
+
+
+def _wf_run_to_dict(row: WorkflowRun) -> dict:
+    return {
+        "id": row.id,
+        "workflow_id": row.workflow_id,
+        "mode": row.mode,
+        "status": row.status,
+        "input": row.input_json or {},
+        "output": row.output_json or {},
+        "node_log": row.node_log_json or [],
+        "error": row.error,
+        "duration_ms": row.duration_ms or 0,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@app.get("/api/workflows/catalog")
+def get_workflow_catalog():
+    """Return the node type catalogue for the frontend palette + inspector."""
+    from src.workflow.schema import NODE_TYPE_CATALOG, REQUIRED_DATA_KEYS
+    from src.rag.embeddings import EMBEDDING_MODELS
+    from src.rag.vectorstore import VECTOR_STORES
+    return {
+        "node_types": NODE_TYPE_CATALOG,
+        "required_fields": REQUIRED_DATA_KEYS,
+        "embedding_models": {k: v for k, v in EMBEDDING_MODELS.items()},
+        "vector_stores": VECTOR_STORES,
+        "chunk_strategies": ["recursive", "fixed", "semantic", "code"],
+        "source_types": ["text", "file", "url"],
+    }
+
+
+@app.get("/api/workflows")
+def list_workflows(team_id: Optional[str] = None):
+    """List workflows, optionally scoped to a team.
+
+    Matches the RAG pattern: rows with team_id IS NULL are visible to
+    everyone (shared) and team-tagged rows are only visible to matching
+    teams.
+    """
+    session = get_session()
+    try:
+        q = session.query(WorkflowDefinition)
+        if team_id:
+            q = q.filter(
+                (WorkflowDefinition.team_id == team_id)
+                | (WorkflowDefinition.team_id.is_(None))
+            )
+        rows = q.order_by(WorkflowDefinition.updated_at.desc()).all()
+        return [_wf_row_to_dict(r, include_graph=False) for r in rows]
+    finally:
+        session.close()
+
+
+@app.post("/api/workflows", status_code=201)
+def create_workflow(body: _WorkflowCreate):
+    from src.workflow.schema import validate_graph, GraphValidationError
+    # Allow empty graphs on create — UI saves a skeleton before any wiring.
+    if body.graph and (body.graph.get("nodes") or body.graph.get("edges")):
+        try:
+            validate_graph(body.graph)
+        except GraphValidationError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    session = get_session()
+    try:
+        row = WorkflowDefinition(
+            name=body.name,
+            description=body.description or "",
+            graph_json=body.graph or {"nodes": [], "edges": []},
+            team_id=body.team_id,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return _wf_row_to_dict(row)
+    finally:
+        session.close()
+
+
+@app.get("/api/workflows/{workflow_id}")
+def get_workflow(workflow_id: str):
+    session = get_session()
+    try:
+        row = session.query(WorkflowDefinition).filter_by(id=workflow_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        return _wf_row_to_dict(row)
+    finally:
+        session.close()
+
+
+@app.put("/api/workflows/{workflow_id}")
+def update_workflow(workflow_id: str, body: _WorkflowUpdate):
+    from src.workflow.schema import validate_graph, GraphValidationError
+    session = get_session()
+    try:
+        row = session.query(WorkflowDefinition).filter_by(id=workflow_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        if body.name is not None:
+            row.name = body.name
+        if body.description is not None:
+            row.description = body.description
+        if body.graph is not None:
+            if body.graph.get("nodes") or body.graph.get("edges"):
+                try:
+                    validate_graph(body.graph)
+                except GraphValidationError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
+            row.graph_json = body.graph
+        session.commit()
+        session.refresh(row)
+        return _wf_row_to_dict(row)
+    finally:
+        session.close()
+
+
+@app.delete("/api/workflows/{workflow_id}", status_code=204)
+def delete_workflow(workflow_id: str):
+    session = get_session()
+    try:
+        row = session.query(WorkflowDefinition).filter_by(id=workflow_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        session.delete(row)
+        session.commit()
+        return None
+    finally:
+        session.close()
+
+
+@app.post("/api/workflows/{workflow_id}/run")
+async def run_workflow(workflow_id: str, body: _WorkflowRunRequest):
+    """Execute a workflow in ingest or query mode.
+
+    Runs synchronously (awaited) for v1 — the layered executor handles
+    parallel same-layer nodes internally.  For long ingests we'd add
+    SSE streaming later; v1 returns the full payload on completion.
+    """
+    from src.workflow.executor import WorkflowExecutor
+    from src.workflow.schema import GraphValidationError
+
+    if body.mode not in ("ingest", "query"):
+        raise HTTPException(status_code=400, detail="mode must be 'ingest' or 'query'")
+
+    session = get_session()
+    try:
+        row = session.query(WorkflowDefinition).filter_by(id=workflow_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        graph = row.graph_json or {"nodes": [], "edges": []}
+    finally:
+        session.close()
+
+    executor = WorkflowExecutor()
+    try:
+        result = await executor.execute(graph, mode=body.mode, user_input=body.input)
+    except GraphValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        # Any runtime error → record a failed run row + propagate 500 so
+        # the UI can surface a banner.
+        _persist_workflow_run(
+            workflow_id=workflow_id, mode=body.mode, input_json=body.input,
+            output_json={}, node_log=[], status="error",
+            error=str(e), duration_ms=0,
+        )
+        raise HTTPException(status_code=500, detail=f"workflow execution failed: {e}")
+
+    run_row = _persist_workflow_run(
+        workflow_id=workflow_id, mode=body.mode, input_json=body.input,
+        output_json=result.get("output") or {},
+        node_log=result.get("node_log") or [],
+        status=result["status"],
+        error=result.get("error"),
+        duration_ms=result.get("duration_ms", 0),
+    )
+    return {"run_id": run_row["id"], **result}
+
+
+@app.post("/api/workflows/{workflow_id}/run/stream")
+async def run_workflow_stream(workflow_id: str, body: _WorkflowRunRequest):
+    """Execute a workflow with live-trajectory SSE events.
+
+    The executor pushes ``run_start / node_start / node_end / run_end``
+    events as they happen; the UI renders node colours + edge animation
+    in real time instead of waiting for the full response.  On
+    completion we persist the same ``WorkflowRun`` row as the non-stream
+    sibling so the History / Trajectory view stays consistent.
+    """
+    from src.workflow.executor import WorkflowExecutor
+    from src.workflow.schema import GraphValidationError
+
+    if body.mode not in ("ingest", "query"):
+        raise HTTPException(status_code=400, detail="mode must be 'ingest' or 'query'")
+
+    session = get_session()
+    try:
+        row = session.query(WorkflowDefinition).filter_by(id=workflow_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        graph = row.graph_json or {"nodes": [], "edges": []}
+    finally:
+        session.close()
+
+    # Bridge: executor's `on_event` callback pushes into an asyncio.Queue,
+    # the SSE generator drains the queue.  `None` sentinel = stream end.
+    queue: "asyncio.Queue[Optional[dict]]" = asyncio.Queue()
+
+    async def _emit(evt: dict) -> None:
+        # _json_safe strips live Chunk / store-handle objects from the
+        # preview so they can be JSON-encoded for SSE.
+        await queue.put(_json_safe(evt))
+
+    async def _run() -> None:
+        executor = WorkflowExecutor()
+        try:
+            result = await executor.execute(
+                graph, mode=body.mode, user_input=body.input, on_event=_emit,
+            )
+            run_row = _persist_workflow_run(
+                workflow_id=workflow_id, mode=body.mode, input_json=body.input,
+                output_json=result.get("output") or {},
+                node_log=result.get("node_log") or [],
+                status=result["status"],
+                error=result.get("error"),
+                duration_ms=result.get("duration_ms", 0),
+            )
+            await queue.put({"event": "run_persisted", "run_id": run_row["id"]})
+        except GraphValidationError as e:
+            await queue.put({"event": "run_end", "status": "error", "error": str(e)})
+        except Exception as e:
+            _persist_workflow_run(
+                workflow_id=workflow_id, mode=body.mode, input_json=body.input,
+                output_json={}, node_log=[], status="error",
+                error=str(e), duration_ms=0,
+            )
+            await queue.put({"event": "run_end", "status": "error", "error": str(e)})
+        finally:
+            await queue.put(None)
+
+    async def event_generator():
+        task = asyncio.create_task(_run())
+        try:
+            while True:
+                evt = await queue.get()
+                if evt is None:
+                    break
+                yield _sse_event(evt.get("event", "message"), evt)
+            yield _sse_event("done", {})
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/workflows/{workflow_id}/runs")
+def list_workflow_runs(workflow_id: str, limit: int = 50):
+    session = get_session()
+    try:
+        rows = (
+            session.query(WorkflowRun)
+            .filter_by(workflow_id=workflow_id)
+            .order_by(WorkflowRun.created_at.desc())
+            .limit(max(1, min(limit, 500)))
+            .all()
+        )
+        return [_wf_run_to_dict(r) for r in rows]
+    finally:
+        session.close()
+
+
+def _persist_workflow_run(
+    *, workflow_id: str, mode: str, input_json: dict, output_json: dict,
+    node_log: list, status: str, error: Optional[str], duration_ms: int,
+) -> dict:
+    session = get_session()
+    try:
+        row = WorkflowRun(
+            workflow_id=workflow_id,
+            mode=mode,
+            status=status,
+            input_json=input_json or {},
+            output_json=_json_safe(output_json or {}),
+            node_log_json=_json_safe(node_log or []),
+            error=error,
+            duration_ms=int(duration_ms or 0),
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return _wf_run_to_dict(row)
+    finally:
+        session.close()
+
+
+def _json_safe(value):
+    """Strip non-JSON-serialisable objects (Chunks, store handles) from run outputs.
+
+    The executor returns live Chunk objects / store handles in a couple of
+    intermediate node payloads — fine for in-process use but those can't
+    be JSON-encoded for DB storage or the HTTP response.  We keep
+    primitives + dict/list recursion and stringify everything else.
+    """
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "text") and hasattr(value, "source"):
+        # src.rag.chunker.Chunk dataclass
+        return {
+            "text": value.text[:500],
+            "source": value.source,
+            "chunk_index": getattr(value, "chunk_index", 0),
+        }
+    if hasattr(value, "text") and hasattr(value, "score"):
+        # src.rag.vectorstore.SearchResult dataclass
+        return {
+            "text": value.text[:500],
+            "source": value.source,
+            "score": float(value.score),
+            "chunk_index": getattr(value, "chunk_index", 0),
+        }
+    return str(value)[:500]
 
 
 if __name__ == "__main__":

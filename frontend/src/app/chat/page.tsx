@@ -1,103 +1,32 @@
 "use client";
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { api, SSEEvent } from "@/lib/api";
+import { api } from "@/lib/api";
 import { useTeam } from "@/contexts/TeamContext";
-
-// ── Types ────────────────────────────────────────────────────────
-
-interface ToolCall { tool: string; args: Record<string, any>; agent?: string }
-interface SpanInfo {
-  id: string; name: string; span_type: string;
-  tokens_in: number; tokens_out: number; cost: number;
-  model: string; status: string; error?: string | null;
-  agent?: string;
-}
-interface TraceInfo { trace_id: string; total_latency_ms: number; total_tokens: number; total_cost: number; spans: SpanInfo[] }
-
-/** A single agent's thinking block within a multi-agent turn. */
-interface ThinkingSegment {
-  agent: string;   // role name, e.g. "planner", "coder", "supervisor"
-  text: string;
-}
-
-interface Message {
-  role: "user" | "assistant" | "hitl";
-  content: string;
-  agent?: string;
-  toolCalls?: ToolCall[];
-  trace?: TraceInfo;
-  hitl?: HITLData;
-  /** JSON-serialised ThinkingSegment[] for new messages; plain string for legacy. */
-  thinkingContent?: string;
-}
-
-interface HITLData {
-  type: "clarification" | "plan_review" | "action_confirmation" | "tool_review";
-  thread_id: string;
-  question?: string;
-  options?: string[];
-  plan?: PlanStep[];
-  tool_name?: string;
-  args?: Record<string, any>;
-  risk_level?: string;
-  reason?: string;
-  output?: string;
-  message?: string;
-  agent?: string;
-}
-
-interface PlanStep { step: number; description: string; status: string }
-
-interface TrajectoryStep {
-  agent: string;
-  action: string;
-  status: "active" | "completed" | "error";
-  timestamp: number;
-}
-
-interface LiveSpan extends SpanInfo { agent?: string }
-
-interface Conversation {
-  id: string;
-  title: string;
-  teamId: string;
-  threadId: string | null;
-  messages: Message[];
-  createdAt: number;
-  updatedAt: number;
-}
+import {
+  useChatSession,
+  type Message,
+  type ToolCall,
+  type SpanInfo,
+  type TraceInfo,
+  type ThinkingSegment,
+  type HITLData,
+  type PlanStep,
+  type TrajectoryStep,
+  type LiveSpan,
+  type Conversation,
+} from "@/contexts/ChatSessionContext";
 
 // ── Constants & helpers ──────────────────────────────────────────
 
-const CONVOS_KEY = "sdlc_conversations";
-const LAST_TRACE_KEY = "sdlc_last_trace";
 const CHAT_MODEL_KEY = "sdlc_chat_model";
 const TYPE_DOT: Record<string, string> = {
   routing: "bg-blue-400", llm_call: "bg-violet-400", tool_call: "bg-emerald-400",
   agent_execution: "bg-sky-400", hitl: "bg-orange-400", supervisor: "bg-amber-400",
 };
 
-function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
-
-function loadConversations(): Conversation[] {
-  if (typeof window === "undefined") return [];
-  try { return JSON.parse(localStorage.getItem(CONVOS_KEY) || "[]"); }
-  catch { return []; }
-}
-
-function saveConversations(convos: Conversation[]) {
-  try { localStorage.setItem(CONVOS_KEY, JSON.stringify(convos.slice(0, 50))); }
-  catch { /* quota */ }
-}
-
-function titleFromMessages(msgs: Message[]): string {
-  const first = msgs.find(m => m.role === "user");
-  if (!first) return "New Chat";
-  const t = first.content.slice(0, 40);
-  return t.length < first.content.length ? t + "..." : t;
-}
+// Conversation persistence + id generation live in ChatSessionContext now.
 
 /**
  * Human-readable label for a span row.
@@ -220,44 +149,64 @@ export default function ChatPage() {
   const [defaultModelName, setDefaultModelName] = useState("from .env");
   const [chatModel, setChatModel] = useState("");
 
-  // Conversation list
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [activeConvoId, setActiveConvoId] = useState<string | null>(null);
+  // Persistent chat state + live-stream state (C1-C3): everything that used to
+  // be `useState` inside this component now lives in <ChatSessionProvider>,
+  // keyed by teamId.  Navigating away and back no longer resets the chat, and
+  // switching teams lets both streams run in parallel.
+  const {
+    conversations,
+    createConversation: providerCreateConversation,
+    deleteConversation: providerDeleteConversation,
+    getSession,
+    sendMessage: providerSendMessage,
+    resumeHITL: providerResumeHITL,
+    stopSession: providerStopSession,
+    clearLiveStateForTeam,
+    runningTeamIds,
+  } = useChatSession();
 
-  // Current chat state
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [activeConvoId, setActiveConvoId] = useState<string | null>(null);
   const [input, setInput] = useState("");
-  const [threadId, setThreadId] = useState<string | null>(null);
 
   // Which assistant message is selected (its trace shows in inspector)
   const [selectedMsgIndex, setSelectedMsgIndex] = useState<number | null>(null);
 
-  const [queryActive, setQueryActive] = useState(false);
-  const [inputLocked, setInputLocked] = useState(false);
-  const [statusText, setStatusText] = useState("Working...");
-  const [resolvedStrategy, setResolvedStrategy] = useState<string | null>(null);
-
-  // Trace state
-  const [liveSpans, setLiveSpans] = useState<LiveSpan[]>([]);
-  const [trajectory, setTrajectory] = useState<TrajectoryStep[]>([]);
-  const [activeAgent, setActiveAgent] = useState<string | null>(null);
-  const [activeTool, setActiveTool] = useState<string | null>(null);
-  const [liveTokens, setLiveTokens] = useState(0);
-  const [liveCost, setLiveCost] = useState(0);
-  const [liveStartTime, setLiveStartTime] = useState(0);
-  const [elapsedFinal, setElapsedFinal] = useState(0);
-  const [thinkingSegments, setThinkingSegments] = useState<ThinkingSegment[]>([]);
+  // UI-only preference (not streaming state — stays local).
   const [thinkingCollapsed, setThinkingCollapsed] = useState(false);
-  const [pendingHITL, setPendingHITL] = useState<HITLData | null>(null);
-  const [activeTrace, setActiveTrace] = useState<TraceInfo | null>(null);
 
-  // Ref mirrors for stale-closure-safe reads inside the SSE callback
-  const agentRef = useRef<string | null>(null);
-  const thinkingSegmentsRef = useRef<ThinkingSegment[]>([]);
+  // When the user clicks a past assistant message in the chat log, show that
+  // message's trace in the right panel instead of the live stream's trace.
+  // This overrides `session.activeTrace` until they click elsewhere.
+  const [historicalTrace, setHistoricalTrace] = useState<TraceInfo | null>(null);
+
+  // Derive everything stream-related from the provider so that the chat keeps
+  // updating in the background when the user is on another page.
+  const session = getSession(teamId);
+  const queryActive = session.queryActive;
+  const inputLocked = session.inputLocked;
+  const statusText = session.statusText;
+  const resolvedStrategy = session.resolvedStrategy;
+  const liveSpans = session.liveSpans;
+  const trajectory = session.trajectory;
+  const activeAgent = session.activeAgent;
+  const activeTool = session.activeTool;
+  const liveTokens = session.liveTokens;
+  const liveCost = session.liveCost;
+  const liveStartTime = session.liveStartTime;
+  const elapsedFinal = session.elapsedFinal;
+  const thinkingSegments = session.thinkingSegments;
+  const pendingHITL = session.pendingHITL;
+  const activeTrace = session.activeTrace;
+
+  // Current conversation's messages + threadId are derived from the provider's
+  // conversation list (the provider appends incoming `response` events while we
+  // may be unmounted, so deriving here means "always up to date").
+  const activeConversation = conversations.find(c => c.id === activeConvoId) || null;
+  const messages: Message[] = activeConversation?.messages || [];
+  const threadId: string | null = activeConversation?.threadId ?? session.threadId;
 
   const endRef = useRef<HTMLDivElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
-  const abortRef = useRef<AbortController | null>(null);
   const userNearBottom = useRef(true);
 
   // ── Hydration ──────────────────────────────────────────────
@@ -268,26 +217,23 @@ export default function ChatPage() {
     });
   }, []);
 
+  // Wait until the provider has finished loading conversations from
+  // localStorage, then pick an initial active conversation.  We can't read
+  // conversations immediately on first render — they start empty until the
+  // provider's hydration effect fires.
   useEffect(() => {
-    const convos = loadConversations();
-    setConversations(convos);
-    if (convos.length > 0) {
+    if (hydrated) return;
+    if (conversations.length > 0) {
       // Try to honour the globally-selected team: prefer the most recent
       // conversation on that team; fall back to the absolute latest.
-      const onTeam = globalTeamId ? convos.find(c => c.teamId === globalTeamId) : undefined;
-      const latest = onTeam || convos[0];
+      const onTeam = globalTeamId ? conversations.find(c => c.teamId === globalTeamId) : undefined;
+      const latest = onTeam || conversations[0];
       setActiveConvoId(latest.id);
-      setMessages(latest.messages);
-      setThreadId(latest.threadId);
       setTeamIdState(latest.teamId);
     } else if (globalTeamId) {
       // No conversations yet — start new chats against the currently-selected team.
       setTeamIdState(globalTeamId);
     }
-    try {
-      const saved = localStorage.getItem(LAST_TRACE_KEY);
-      if (saved) setActiveTrace(JSON.parse(saved));
-    } catch { /* ignore */ }
     try {
       const savedModel = localStorage.getItem(CHAT_MODEL_KEY);
       if (savedModel !== null) setChatModel(savedModel);
@@ -295,13 +241,8 @@ export default function ChatPage() {
     setHydrated(true);
   }, []);
 
-  // Persist last trace
-  useEffect(() => {
-    if (!hydrated) return;
-    try {
-      if (activeTrace) localStorage.setItem(LAST_TRACE_KEY, JSON.stringify(activeTrace));
-    } catch { /* quota */ }
-  }, [activeTrace, hydrated]);
+  // `activeTrace` persistence to localStorage now happens inside the
+  // ChatSessionProvider on every `response` event — no effect needed here.
 
   // Persist model preference
   useEffect(() => {
@@ -309,20 +250,9 @@ export default function ChatPage() {
     try { localStorage.setItem(CHAT_MODEL_KEY, chatModel); } catch { /* quota */ }
   }, [chatModel, hydrated]);
 
-  // Persist conversations when messages change
-  useEffect(() => {
-    if (!hydrated || !activeConvoId) return;
-    setConversations(prev => {
-      const updated = prev.map(c =>
-        c.id === activeConvoId
-          ? { ...c, messages, threadId, title: titleFromMessages(messages), updatedAt: Date.now() }
-          : c
-      );
-      saveConversations(updated);
-      return updated;
-    });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages, threadId, hydrated, activeConvoId]);
+  // Persistence of conversations + messages lives inside ChatSessionProvider
+  // now (it auto-saves on every mutation), so there is no local "persist
+  // messages" effect here anymore.
 
   useEffect(() => {
     if (userNearBottom.current) endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -334,217 +264,60 @@ export default function ChatPage() {
     userNearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
   }
 
-  // ── Reset helpers ──────────────────────────────────────────
-  const resetLiveState = useCallback(() => {
-    setLiveSpans([]); setTrajectory([]); setActiveAgent(null); setActiveTool(null);
-    setLiveTokens(0); setLiveCost(0);
-    setThinkingSegments([]); thinkingSegmentsRef.current = [];
-    setThinkingCollapsed(false);
-    setPendingHITL(null); setElapsedFinal(0); setActiveTrace(null);
-    setSelectedMsgIndex(null);
-    setResolvedStrategy(null);
-    agentRef.current = null;
-  }, []);
+  // Dropped: local `resetLiveState` / `handleSSEEvent`.
+  // Both live in ChatSessionProvider so they survive page navigation.
 
   // ── SSE handler ────────────────────────────────────────────
   // Uses refs for values that need to be current inside the stable callback
-  const handleSSEEvent = useCallback((event: SSEEvent) => {
-    const { type, data } = event;
-    switch (type) {
-      case "thread_id":
-        setThreadId(data.thread_id);
-        break;
-
-      case "strategy_selected":
-        setResolvedStrategy(data.strategy);
-        setStatusText(`Strategy: ${data.strategy} (auto-selected)`);
-        break;
-
-      case "agent_start":
-        agentRef.current = data.agent;
-        setActiveAgent(data.agent);
-        setStatusText(`${data.agent} is working...`);
-        setTrajectory(prev => [...prev, {
-          agent: data.agent, action: "thinking",
-          status: "active", timestamp: Date.now(),
-        }]);
-        // Start a fresh thinking segment for this agent
-        thinkingSegmentsRef.current = [
-          ...thinkingSegmentsRef.current,
-          { agent: data.agent, text: "" },
-        ];
-        setThinkingSegments([...thinkingSegmentsRef.current]);
-        break;
-
-      case "agent_end":
-        setTrajectory(prev => prev.map(t =>
-          t.agent === data.agent && t.status === "active"
-            ? { ...t, status: "completed" as const } : t
-        ));
-        setActiveAgent(null);
-        agentRef.current = null;
-        break;
-
-      case "tool_start":
-        setActiveTool(data.tool);
-        setStatusText(`${data.agent || "Agent"}: ${data.tool}...`);
-        setTrajectory(prev => [...prev, {
-          agent: data.agent || agentRef.current || "", action: `tool:${data.tool}`,
-          status: "active", timestamp: Date.now(),
-        }]);
-        break;
-
-      case "tool_end":
-        setActiveTool(null);
-        setTrajectory(prev => prev.map(t =>
-          t.action === `tool:${data.tool}` && t.status === "active"
-            ? { ...t, status: "completed" as const } : t
-        ));
-        break;
-
-      case "llm_token": {
-        const tokenAgent = data.agent || agentRef.current || "unknown";
-        const segs = thinkingSegmentsRef.current;
-        const last = segs[segs.length - 1];
-        if (last && last.agent === tokenAgent) {
-          last.text += data.token;
-        } else {
-          // New agent mid-stream (e.g. supervisor interleaved) — open a new segment
-          segs.push({ agent: tokenAgent, text: data.token });
-        }
-        setThinkingSegments([...segs]);
-        break;
-      }
-
-      case "trace_span": {
-        const spanEvent = data.event;
-        const spanData: LiveSpan = { ...data.span, agent: data.span?.agent || agentRef.current || undefined };
-        if (spanEvent === "span_start") {
-          setLiveSpans(prev => [...prev.filter(s => s.id !== spanData.id), spanData]);
-        } else {
-          setLiveSpans(prev => prev.map(s => s.id === spanData.id ? { ...spanData, agent: s.agent || spanData.agent } : s));
-          if (spanData.tokens_in || spanData.tokens_out)
-            setLiveTokens(prev => prev + (spanData.tokens_in || 0) + (spanData.tokens_out || 0));
-          if (spanData.cost)
-            setLiveCost(prev => prev + spanData.cost);
-        }
-        break;
-      }
-
-      case "hitl_request": {
-        const capturedSegsHITL = thinkingSegmentsRef.current.filter(s => s.text.trim());
-        setInputLocked(false);
-        setStatusText("Waiting for your input...");
-        setPendingHITL(data as HITLData);
-        setTrajectory(prev => [...prev, {
-          agent: data.agent || "", action: `hitl:${data.type}`,
-          status: "active", timestamp: Date.now(),
-        }]);
-        setMessages(prev => [
-          ...prev,
-          ...(capturedSegsHITL.length > 0 ? [{
-            role: "assistant" as const,
-            content: "",
-            thinkingContent: JSON.stringify(capturedSegsHITL),
-          }] : []),
-          {
-            role: "hitl" as const, content: data.message || "Agent needs your input",
-            hitl: data as HITLData,
-          },
-        ]);
-        thinkingSegmentsRef.current = [];
-        setThinkingSegments([]);
-        break;
-      }
-
-      case "response": {
-        const capturedSegs = thinkingSegmentsRef.current.filter(s => s.text.trim());
-        setMessages(prev => {
-          const next = [...prev, {
-            role: "assistant" as const,
-            content: data.content,
-            agent: data.agent_used,
-            toolCalls: data.tool_calls,
-            trace: data.trace,
-            thinkingContent: capturedSegs.length > 0
-              ? JSON.stringify(capturedSegs)
-              : undefined,
-          }];
-          setSelectedMsgIndex(next.length - 1);
-          return next;
-        });
-        setActiveTrace(data.trace || null);
-        thinkingSegmentsRef.current = [];
-        setThinkingSegments([]);
-        break;
-      }
-
-      case "error":
-        setMessages(prev => [...prev, { role: "assistant", content: `Error: ${data.message}` }]);
-        thinkingSegmentsRef.current = [];
-        setThinkingSegments([]);
-        break;
-
-      case "done":
-        setQueryActive(false); setInputLocked(false);
-        setStatusText("Working..."); setElapsedFinal(Date.now());
-        break;
-
-      case "resumed":
-        setInputLocked(true); setStatusText("Resuming...");
-        setTrajectory(prev => prev.map(t =>
-          t.action.startsWith("hitl:") && t.status === "active"
-            ? { ...t, status: "completed" as const } : t
-        ));
-        break;
-    }
-  // Stable callback — all mutable values read through refs
-  }, []);
-
   // ── Conversation management ────────────────────────────────
+  // All mutations go through the provider so conversations + live state stay
+  // in sync across tabs/pages.
   function createConversation() {
-    stopProcessing();
-    const c: Conversation = { id: genId(), title: "New Chat", teamId, threadId: null, messages: [], createdAt: Date.now(), updatedAt: Date.now() };
-    setConversations(prev => { const next = [c, ...prev]; saveConversations(next); return next; });
+    providerStopSession(teamId);
+    clearLiveStateForTeam(teamId);
+    const c = providerCreateConversation(teamId);
     switchToConversation(c);
   }
 
   function switchToConversation(c: Conversation) {
-    stopProcessing();
-    resetLiveState();
+    // Stopping an in-flight stream on the OLD team?  No — we deliberately
+    // don't: the user wants background streams to keep running (C1 promise).
+    // We just switch the "viewed" conversation + team here.
     setActiveConvoId(c.id);
-    setMessages(c.messages);
-    setThreadId(c.threadId);
     setTeamId(c.teamId);
-    setQueryActive(false); setInputLocked(false);
     setSelectedMsgIndex(null);
-    // Restore the last assistant message's trace for this conversation
-    const lastAssistant = [...c.messages].reverse().find(m => m.role === "assistant" && m.trace);
-    if (lastAssistant?.trace) setActiveTrace(lastAssistant.trace);
   }
 
   function deleteConversation(id: string) {
-    setConversations(prev => {
-      const next = prev.filter(c => c.id !== id);
-      saveConversations(next);
-      if (id === activeConvoId) {
-        if (next.length > 0) { switchToConversation(next[0]); }
-        else { setActiveConvoId(null); setMessages([]); setThreadId(null); resetLiveState(); }
+    providerDeleteConversation(id);
+    if (id === activeConvoId) {
+      // Pick a new active convo from what's left, or clear selection.
+      const remaining = conversations.filter(c => c.id !== id);
+      if (remaining.length > 0) switchToConversation(remaining[0]);
+      else {
+        setActiveConvoId(null);
+        clearLiveStateForTeam(teamId);
       }
-      return next;
-    });
+    }
   }
 
   function clearCurrentChat() {
-    setMessages([]); setThreadId(null); resetLiveState();
+    if (activeConvoId) {
+      // Replace messages with empty via the provider API (no direct setState).
+      // We don't expose a helper for this — the simplest equivalent is to
+      // stop the session + create a fresh conversation.
+      providerStopSession(teamId);
+      clearLiveStateForTeam(teamId);
+      const c = providerCreateConversation(teamId);
+      switchToConversation(c);
+    }
   }
 
   // ── Send / resume / stop ───────────────────────────────────
+  // All three just delegate to the provider.  The provider owns the
+  // AbortController and the SSE loop, so navigating away doesn't abort.
   function stopProcessing() {
-    abortRef.current?.abort();
-    setQueryActive(false); setInputLocked(false);
-    thinkingSegmentsRef.current = [];
-    setThinkingSegments([]); setStatusText("Working...");
+    providerStopSession(teamId);
   }
 
   async function send() {
@@ -552,53 +325,51 @@ export default function ChatPage() {
     const msg = input.trim();
     setInput("");
 
-    if (!activeConvoId) {
-      const c: Conversation = { id: genId(), title: msg.slice(0, 40), teamId, threadId: null, messages: [], createdAt: Date.now(), updatedAt: Date.now() };
-      setConversations(prev => { const next = [c, ...prev]; saveConversations(next); return next; });
-      setActiveConvoId(c.id);
+    let convoId = activeConvoId;
+    if (!convoId) {
+      const c = providerCreateConversation(teamId, msg.slice(0, 40));
+      convoId = c.id;
+      setActiveConvoId(convoId);
     }
-
-    setMessages(prev => [...prev, { role: "user", content: msg }]);
-    setQueryActive(true); setInputLocked(true);
-    resetLiveState(); setLiveStartTime(Date.now());
     userNearBottom.current = true;
-
-    abortRef.current = new AbortController();
-    try {
-      await api.teams.chatStream(teamId, msg, handleSSEEvent, threadId || undefined, abortRef.current.signal, chatModel || undefined);
-    } catch (e: any) {
-      if (e.name !== "AbortError")
-        setMessages(prev => [...prev, { role: "assistant", content: `Error: ${e.message}` }]);
-      setQueryActive(false); setInputLocked(false);
-    }
+    await providerSendMessage(teamId, convoId, msg, {
+      threadId: threadId || null,
+      model: chatModel || undefined,
+    });
   }
 
   async function resumeHITL(response: Record<string, any>) {
     if (!threadId) return;
-    setPendingHITL(null); setInputLocked(true);
-    setStatusText("Resuming after your input..."); thinkingSegmentsRef.current = []; setThinkingSegments([]);
     userNearBottom.current = true;
-    abortRef.current = new AbortController();
-    try {
-      await api.teams.chatResume(teamId, threadId, response, handleSSEEvent, abortRef.current.signal);
-    } catch (e: any) {
-      if (e.name !== "AbortError")
-        setMessages(prev => [...prev, { role: "assistant", content: `Error: ${e.message}` }]);
-      setQueryActive(false); setInputLocked(false);
-    }
+    await providerResumeHITL(teamId, threadId, response);
   }
 
   // ── Trace panel selection ──────────────────────────────────
+  // Selecting a historical message's trace is purely local UI — the provider
+  // keeps its own `activeTrace` for the current stream, so we only update the
+  // selected-index here.  The render path prefers historical trace when no
+  // live data is present.
   function selectMessage(i: number, m: Message) {
     if (m.role !== "assistant" || !m.trace) return;
     setSelectedMsgIndex(i);
-    setActiveTrace(m.trace);
-    // Clear live overlay so the historical trace renders
-    setLiveSpans([]); setTrajectory([]);
+    setHistoricalTrace(m.trace || null);
   }
 
-  const hasLiveData = liveSpans.length > 0 || trajectory.length > 0;
+  // When user switches to a new conversation, drop the historical override.
+  useEffect(() => {
+    setHistoricalTrace(null);
+    setSelectedMsgIndex(null);
+  }, [activeConvoId]);
+
+  // When the user clicks a historical message to inspect its trace, we
+  // suppress the live overlay so the clicked trace is clearly rendered.
+  const hasLiveData = historicalTrace
+    ? false
+    : (liveSpans.length > 0 || trajectory.length > 0);
   const showTrace = queryActive || hasLiveData;
+  // The trace the right panel should display: historical override wins over
+  // provider's running `activeTrace`.
+  const displayTrace = historicalTrace ?? activeTrace;
   const elapsedMs = liveStartTime
     ? (queryActive ? Date.now() - liveStartTime : (elapsedFinal || Date.now()) - liveStartTime)
     : 0;
@@ -697,8 +468,27 @@ export default function ChatPage() {
                 ));
               })()}
             </select>
+            {/* C4: when another team has a live stream (not the currently-viewed
+                one), show a tiny live dot next to the switcher so the user knows
+                "something is running in the background". */}
+            {runningTeamIds.some(id => id !== teamId) && (
+              <span
+                className="relative inline-flex h-2 w-2"
+                title={`Live chat on: ${runningTeamIds.filter(id => id !== teamId).join(", ")}`}
+              >
+                <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-500 opacity-60 animate-ping" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+              </span>
+            )}
             <select value={teamId} onChange={e => setTeamId(e.target.value)} className="input !w-auto !text-[12px]">
-              {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+              {teams.map(t => {
+                const live = runningTeamIds.includes(t.id);
+                return (
+                  <option key={t.id} value={t.id}>
+                    {live ? "● " : ""}{t.name}
+                  </option>
+                );
+              })}
             </select>
           </div>
         </div>
@@ -912,11 +702,11 @@ export default function ChatPage() {
         )}
 
         {/* Historical trace — clicked message or last response */}
-        {!hasLiveData && activeTrace && (
-          <CompletedTrace trace={activeTrace} />
+        {!hasLiveData && displayTrace && (
+          <CompletedTrace trace={displayTrace} />
         )}
 
-        {!showTrace && !activeTrace && (
+        {!showTrace && !displayTrace && (
           <div className="text-[12px] text-[var(--text-muted)] text-center py-10">
             Send a message — or click any response to inspect its trace
           </div>

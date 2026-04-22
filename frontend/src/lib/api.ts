@@ -223,4 +223,37 @@ export const api = {
         body: JSON.stringify({ version, team_id: teamId }),
       }),
   },
+  workflows: {
+    // Node-type catalogue + supported models / stores.  Drives the
+    // palette on the left and the inspector's dropdowns on the right.
+    catalog: () => fetchJSON("/api/workflows/catalog"),
+    list: (teamId?: string) => {
+      const qs = teamId ? `?team_id=${encodeURIComponent(teamId)}` : "";
+      return fetchJSON(`/api/workflows${qs}`);
+    },
+    get: (id: string) => fetchJSON(`/api/workflows/${id}`),
+    create: (data: { name: string; description?: string; graph?: any; team_id?: string | null }) =>
+      fetchJSON("/api/workflows", { method: "POST", body: JSON.stringify(data) }),
+    update: (id: string, data: { name?: string; description?: string; graph?: any }) =>
+      fetchJSON(`/api/workflows/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+    delete: (id: string) =>
+      fetch(`${API_BASE}/api/workflows/${id}`, { method: "DELETE" }).then((r) => {
+        if (!r.ok) throw new Error(`API error: ${r.status}`);
+      }),
+    run: (id: string, mode: "ingest" | "query", input: Record<string, any>) =>
+      fetchJSON(`/api/workflows/${id}/run`, {
+        method: "POST",
+        body: JSON.stringify({ mode, input }),
+      }),
+    // Live-trajectory run: emits run_start / node_start / node_end / run_end
+    // SSE events so the UI can light up nodes + animate edges as they fire.
+    runStream: (
+      id: string,
+      mode: "ingest" | "query",
+      input: Record<string, any>,
+      onEvent: SSECallback,
+      signal?: AbortSignal,
+    ) => consumeSSE(`/api/workflows/${id}/run/stream`, { mode, input }, onEvent, signal),
+    runs: (id: string, limit = 50) => fetchJSON(`/api/workflows/${id}/runs?limit=${limit}`),
+  },
 };
