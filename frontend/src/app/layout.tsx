@@ -5,7 +5,9 @@ import { usePathname } from "next/navigation";
 import "./globals.css";
 import { RegressionRunProvider } from "@/contexts/RegressionRunContext";
 import { TeamProvider } from "@/contexts/TeamContext";
+import { ChatSessionProvider } from "@/contexts/ChatSessionContext";
 import RegressionRunWidget from "@/components/RegressionRunWidget";
+import ChatLiveBadge from "@/components/ChatLiveBadge";
 
 const inter = Inter({ subsets: ["latin"] });
 
@@ -13,6 +15,7 @@ const NAV = [
   { href: "/", label: "Studio" },
   { href: "/chat", label: "Chat" },
   { href: "/rag", label: "RAG" },
+  { href: "/workflow", label: "Workflow" },
   { href: "/monitoring", label: "Monitoring" },
   { href: "/regression", label: "Regression" },
   { href: "/evaluation", label: "Evaluation" },
@@ -33,13 +36,17 @@ function NavBar() {
             <Link
               key={item.href}
               href={item.href}
-              className={`flex items-center px-3 py-2 rounded-lg text-[13px] font-medium transition-all ${
+              className={`flex items-center justify-between px-3 py-2 rounded-lg text-[13px] font-medium transition-all ${
                 active
                   ? "bg-[var(--text)] text-white"
                   : "text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-[var(--bg-hover)]"
               }`}
             >
-              {item.label}
+              <span>{item.label}</span>
+              {/* C4: live-chat indicator dot surfaces on the /chat nav item
+                  whenever ANY team is streaming, so users on other pages
+                  know a background chat is still running. */}
+              {item.href === "/chat" && <ChatLiveBadge showCount />}
             </Link>
           );
         })}
@@ -57,10 +64,12 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className={`${inter.className} min-h-screen flex`}>
         <TeamProvider>
           <RegressionRunProvider>
-            <NavBar />
-            <main className="ml-52 flex-1 p-7 min-h-screen bg-[var(--bg)]">{children}</main>
-            {/* Floating widget — persists across all pages */}
-            <RegressionRunWidget />
+            <ChatSessionProvider>
+              <NavBar />
+              <main className="ml-52 flex-1 p-7 min-h-screen bg-[var(--bg)]">{children}</main>
+              {/* Floating widget — persists across all pages */}
+              <RegressionRunWidget />
+            </ChatSessionProvider>
           </RegressionRunProvider>
         </TeamProvider>
       </body>

@@ -408,3 +408,52 @@ class PromptFeedback(Base):
     overall_pass = Column(Boolean, default=True)
     embedding_text = Column(Text, default="")               # text indexed in ChromaDB
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ── No-Code Workflow Builder ─────────────────────────────────────
+
+class WorkflowDefinition(Base):
+    """LangFlow-style DAG definition for a RAG / GenAI workflow.
+
+    The `graph_json` payload is the exact shape React Flow emits on the
+    frontend: `{"nodes": [...], "edges": [...]}`.  Nodes carry their own
+    `type` + `data` (typed config) so the server-side executor can dispatch
+    without needing a parallel schema.  See `src/workflow/schema.py` for
+    the pydantic validators and `src/workflow/executor.py` for the layered
+    topological runner.
+    """
+    __tablename__ = "workflow_definitions"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    team_id = Column(String, nullable=True, index=True)     # None = global / shared
+    name = Column(String, nullable=False)
+    description = Column(Text, default="")
+    graph_json = Column(JSON, nullable=False, default=dict) # {"nodes": [...], "edges": [...]}
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    runs = relationship("WorkflowRun", back_populates="workflow", cascade="all, delete-orphan")
+
+
+class WorkflowRun(Base):
+    """One execution of a WorkflowDefinition.
+
+    Records the ingest-or-query mode, the user-supplied input, the final
+    output, and a per-node log (with timings + output previews) so the
+    Studio UI can render a post-run trace without re-executing.
+    """
+    __tablename__ = "workflow_runs"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    workflow_id = Column(String, ForeignKey("workflow_definitions.id"), nullable=False, index=True)
+    mode = Column(String, nullable=False)                   # "ingest" | "query"
+    status = Column(String, default="running")              # running | success | error
+    input_json = Column(JSON, default=dict)                 # user-supplied input
+    output_json = Column(JSON, default=dict)                # final node's output (answer / ingest stats)
+    node_log_json = Column(JSON, default=list)              # [{node_id, node_type, status, duration_ms, preview, ...}]
+    error = Column(Text, nullable=True)
+    duration_ms = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    workflow = relationship("WorkflowDefinition", back_populates="runs")

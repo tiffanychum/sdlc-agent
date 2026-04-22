@@ -14,6 +14,7 @@ Key capabilities:
 - **Multi-strategy orchestration** — router_decides, sequential, parallel, supervisor (with ReAct step tracking + QA iteration cycle), and **auto** (LLM selects best strategy)
 - **Human-in-the-Loop (HITL)** — plan review, action confirmation, clarification, and tool output review via SSE interrupts
 - **RAG pipeline** — configurable embedding model, vector DB, chunking, and retrieval strategy with a chat interface
+- **GenAI Workflow builder** — LangFlow-style visual DAG for composing RAG / agent pipelines. Drag-and-drop components, typed per-port handles, server-side executor with layered topological scheduling, SSE live trajectory with per-node status animations, and JSON graphs persisted per team
 - **DeepEval-powered evaluation** — answer relevancy, faithfulness, and 8 agentic metrics with reasoning
 - **Golden dataset regression testing** — trace-level assertions, per-role prompt versioning, A/B comparison across model × prompt-version sets, and LLM-powered root cause analysis
 - **Prompt drift detection** — `sync_from_definitions` and `sync_routing_prompts` auto-bump a new version whenever code-level prompts diverge from the database, so `latest` always serves the current code
@@ -96,6 +97,18 @@ Configurable pipeline (embedding model, vector DB, chunking, retrieval strategy)
 
 ![RAG](docs/screenshots/rag.png)
 
+### GenAI Workflow
+LangFlow-style visual builder for composing RAG / agent pipelines from reusable components. Drag **Data Source → Chunker → Embedder → Vector Store → Retriever → Prompt → LLM → Output** onto the canvas, wire up the typed ports, save as a versioned graph, and run it server-side in either **ingest** or **query** mode. The canvas streams a **live trajectory** (per-node spinner → ✓/✗, animated edges, and a timeline panel) powered by SSE events from the executor.
+
+![Workflow](docs/screenshots/workflow.png)
+
+Highlights:
+- **Minimalist node UI** — flat line-art icons in accent-tinted squares, color-coded handles keyed by data type (`docs`, `chunks`, `embeddings`, `store`, `context`, `prompt`, `answer`), vivid per-node selection glow
+- **Typed graph model** — schema-validated nodes + edges; Pydantic validation rejects cycles, dangling refs, duplicate ids, and missing required fields before execution
+- **Layered topological scheduler** — `layered_topo_sort` runs independent nodes in the same level concurrently via `asyncio.gather`; mode-aware filtering skips ingest nodes for query runs and vice-versa
+- **Reuses existing RAG primitives** — the executor composes `src/rag/chunker.py`, `src/rag/embeddings.py`, and `src/rag/vectorstore.py` so a workflow run produces the same artifacts as the RAG pipeline page
+- **JSON-first, team-scoped** — every graph is stored in `workflow_definitions.graph_json` and visible via "View JSON"; runs are persisted to `workflow_runs` with full node-level logs for debugging
+
 ### Monitoring
 Overview metrics, OTel span statistics, token/cost breakdown by model and agent, latency percentiles.
 
@@ -154,6 +167,50 @@ Golden Case ──► Agent Execution ──► HITL Auto-Approve ──► Trac
 - **Prompt versioning**: create/edit named versions per agent role (plus supervisor / meta-router / router), A/B test them across regression runs, and compare "prompt version sets" in the dedicated A/B tab
 - **Live regression widget**: floating, always-visible chatbot-style widget that streams agent thinking, tool bubbles, and final output for any number of parallel test cases. Supports per-session inspection and a stop button; persists across page navigation.
 - **ReAct step tracking**: the supervisor derives a required pipeline (`required_steps`) from the prompt, diffs it against `completed_steps`, and picks the next agent deterministically instead of relying on every-turn LLM reasoning. Includes an automatic `QA → Coder → QA` iteration cycle (up to 3 rounds) when QA emits `NEEDS_FIX`.
+
+---
+
+## GenAI Workflow Engine
+
+```
+┌────────────────── React Flow canvas ──────────────────┐
+│  Palette  │        DAG (typed ports)        │ Inspector│
+│           │                                 │          │
+│  drag ──► │  Data ─► Chunk ─► Embed ─► VS   │ node cfg │
+│           │                         │        │          │
+│           │                    Query         │          │
+│           │                         ▼        │          │
+│           │        Retrieve ─► Prompt ─► LLM │          │
+│           │                            │     │          │
+│           │                            ▼     │          │
+│           │                         Output   │          │
+└────────────┬──────────────────────────────────┬────────┘
+             │                                  │
+             ▼                                  ▼
+     toWire(graph)                  SSE /run/stream
+             │                                  ▲
+             ▼                                  │
+  POST /api/workflows ───► WorkflowExecutor ────┘
+                                 │
+              ┌──────────────────┼──────────────────┐
+              ▼                  ▼                  ▼
+        validate_graph    layered_topo_sort   filter_graph_for_mode
+        (cycles, refs,    (level-by-level     (ingest vs query
+         required cfg)    asyncio.gather)     active subgraph)
+                                 │
+                                 ▼
+              ┌──────────────────┼──────────────────┐
+              ▼                  ▼                  ▼
+          data_source         chunker             embedder   ─► emits
+          vector_store        retriever           prompt_tmpl   on_event
+          llm                 output                            payloads
+                                 │
+                                 ▼
+                    persist to workflow_runs
+                    (status, node_log, output)
+```
+
+Executor events stream as SSE (`run_start`, `node_start`, `node_end`, `run_end`) to the frontend, which updates node status pills, animates the active edges, and appends rows to a live trajectory panel.
 
 ---
 
@@ -251,14 +308,15 @@ cd frontend && npm run dev
 | HITL | LangGraph `interrupt()` / `Command(resume=)` over SSE |
 | Tool protocol | MCP — filesystem, shell, git, web, memory, github, jira, planner |
 | RAG | LangChain chunkers + ChromaDB/FAISS + rank_bm25 |
+| Workflow engine | Typed Pydantic graph + layered topological `asyncio.gather` executor with SSE event streaming |
 | LLM client | LangChain `ChatOpenAI` (any OpenAI-compatible API) |
-| Backend | FastAPI + Uvicorn (50+ REST + SSE endpoints) |
-| Database | SQLite + SQLAlchemy (auto-migration + prompt sync on startup) |
+| Backend | FastAPI + Uvicorn (60+ REST + SSE endpoints, incl. `/api/workflows/*`) |
+| Database | SQLite + SQLAlchemy (auto-migration + prompt sync on startup; `workflow_definitions` + `workflow_runs` tables) |
 | Evaluation | Rule-based + DeepEval (8 agentic + 5 RAG metrics) with reasoning |
 | Prompt management | DB-backed PromptRegistry with drift detection (`sync_from_definitions`, `sync_routing_prompts`), ChromaDB FeedbackStore, PromptOptimizer meta-agent |
 | Observability | OpenTelemetry + OpenInference + Langfuse + real-time SSE spans |
-| Frontend | Next.js 16 · React 19 · Tailwind CSS 4 · Recharts · react-markdown |
-| Testing | pytest — MCP E2E, eval unit, golden integration runners |
+| Frontend | Next.js 16 · React 19 · Tailwind CSS 4 · Recharts · react-markdown · **`@xyflow/react` (React Flow)** |
+| Testing | pytest — MCP E2E, eval unit, golden integration runners, workflow executor unit + async-parallelism suites |
 
 ---
 
@@ -282,6 +340,9 @@ sdlc-agent/
 │   │   ├── pipeline.py        # RAG pipeline: chunk, embed, retrieve, generate
 │   │   ├── chunker.py         # LangChain-backed chunking strategies
 │   │   └── evaluation.py      # DeepEval RAG metrics (5 metrics)
+│   ├── workflow/
+│   │   ├── schema.py          # Pydantic Graph / Node / Edge + validate_graph + topo sort
+│   │   └── executor.py        # WorkflowExecutor — mode-aware, streams on_event lifecycle
 │   ├── evaluation/
 │   │   ├── metrics.py         # Rule-based metrics (tool accuracy, delegation, etc.)
 │   │   ├── integrations.py    # DeepEval (8 agentic metrics) + Langfuse
@@ -303,6 +364,7 @@ sdlc-agent/
     ├── page.tsx               # Agent Studio
     ├── chat/                  # Chat with HITL + trace inspector
     ├── rag/                   # RAG chat + compare + pipeline config
+    ├── workflow/              # GenAI Workflow builder (React Flow DAG + live trajectory)
     ├── monitoring/            # OTel metrics + overview dashboard
     ├── regression/            # Regression testing + trace diff + RCA
     └── evaluation/            # Agent + RAG evaluation history
@@ -311,6 +373,18 @@ sdlc-agent/
 ---
 
 ## Recent Improvements
+
+### GenAI Workflow builder — visual RAG/agent pipeline composer
+
+A new **LangFlow-style studio** (`/workflow`) lets teams compose and execute RAG-style pipelines without touching code.
+
+- **Schema-first graph model** — `src/workflow/schema.py` defines Pydantic `Graph`, `Node`, and `Edge` models plus `validate_graph` (no cycles, no dangling refs, no duplicate ids, required config present) and `layered_topo_sort` (returns levels for parallel scheduling).
+- **Async executor** — `WorkflowExecutor` walks the DAG level-by-level, running independent nodes with `asyncio.gather`. Each supported node type (`data_source`, `chunker`, `embedder`, `vector_store`, `retriever`, `prompt_template`, `llm`, `output`) is implemented on top of the existing RAG primitives so workflow runs are artifact-compatible with the RAG pipeline page.
+- **Mode-aware filtering** — `filter_graph_for_mode` drops ingest-only or query-only subgraphs per run so the same graph can power both ingestion and retrieval. Validation runs against the filtered subgraph.
+- **Live trajectory via SSE** — the executor takes an optional `on_event` async callback that emits `run_start`, `node_start`, `node_end`, and `run_end` events. `POST /api/workflows/{id}/run/stream` bridges that to Server-Sent Events; the frontend subscribes and drives per-node spinners, ✓/✗ status pills, animated edges, and a rolling timeline panel.
+- **Minimalist node UI** — custom `FlowNode` component with flat line-art SVG icons on accent-tinted squares, typed per-port handles color-coded by data type (`docs`, `chunks`, `embeddings`, `store`, `context`, `prompt`, `answer`), and vivid per-node selection glow driven by a `--wf-accent` CSS custom property. Palette + inspector share the same visual language.
+- **Team-scoped persistence** — graphs save to `workflow_definitions.graph_json`; each run persists to `workflow_runs` with status, per-node log, and final output. A "View JSON" button exposes the raw graph for copy/paste or audit.
+- **Test coverage** — `tests/test_workflow_executor.py` covers schema validation, mode filtering, and happy-path execution; `tests/test_async_parallelism.py` asserts that same-level nodes actually run concurrently via `asyncio.gather`.
 
 ### Supervisor routing — lessons from debugging `67d59cee802a`
 
@@ -326,6 +400,10 @@ sdlc-agent/
 - **Graceful degradation in MCP servers.**
   - `list_directory` returns an informative empty-state string when the target path doesn't exist yet, instead of raising `NotADirectoryError` and crashing the supervisor flow.
   - `git_commit` returns a soft note ("target path is outside the main repository — skip git") when operating on scratch projects like `/tmp/calc-app/`, instead of raising `RuntimeError`.
+
+### Cross-team live chat indicator
+
+A `ChatSessionProvider` now tracks in-flight chat streams per team. The `ChatLiveBadge` (an emerald pulsing dot with an optional running-team count) is rendered next to the **Chat** nav item and any team switcher, so a user browsing `/regression` or `/workflow` can see at a glance that a background chat stream is still running on team A. Inside `/chat/page.tsx` the streaming logic was refactored to push state into the shared context, enabling this visibility without extra subscriptions.
 
 ### Frontend: live regression widget
 

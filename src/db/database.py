@@ -110,6 +110,16 @@ def _migrate(engine):
                 conn.execute(text("ALTER TABLE agents ADD COLUMN prompt_version TEXT DEFAULT 'v1'"))
             conn.commit()
 
+    # Workflow tables — created by Base.metadata.create_all.  Migration
+    # block kept for future column additions (matches the RAG pattern above).
+    # No-op on fresh DBs; safe to leave in place.
+    if "workflow_definitions" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("workflow_definitions")}
+        with engine.connect() as conn:
+            if "is_active" not in cols:
+                conn.execute(text("ALTER TABLE workflow_definitions ADD COLUMN is_active BOOLEAN DEFAULT 1"))
+            conn.commit()
+
     # Patch 5: team-scope PromptVersionEntry.  Existing rows keep team_id = NULL
     # (= "global"), which is the correct default — the agent-role prompts were
     # never team-specific anyway, and the first orchestrator build after this

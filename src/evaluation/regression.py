@@ -375,7 +375,10 @@ class RegressionRunner:
 
         summary = self._build_summary(run_id, results, cases)
         if self.persist:
-            self._persist(run_id, results, summary)
+            # A2: sync SQLAlchemy writes go to a worker thread so a long commit
+            # doesn't block the event loop (other concurrent runs, chat SSE
+            # streams, and health checks keep progressing).
+            await asyncio.to_thread(self._persist, run_id, results, summary)
 
         return {
             "run_id": run_id,
@@ -538,7 +541,8 @@ class RegressionRunner:
 
         summary = self._build_summary(run_id, results, cases)
         if self.persist:
-            self._persist(run_id, results, summary)
+            # A2: offload SQLAlchemy writes so SSE event delivery stays smooth.
+            await asyncio.to_thread(self._persist, run_id, results, summary)
 
         await emit("run_done", {
             "run_id": run_id,
@@ -677,7 +681,15 @@ class RegressionRunner:
         tokens_in, tokens_out, model_used = _extract_token_meta(messages)
         total_cost = estimate_cost(model_used or self.model, tokens_in, tokens_out)
 
-        collector.save()
+        # A1 + A2: run the two independent eval LLMs concurrently, then push the
+        # sync SQLAlchemy save off the event loop.  See the detailed comment in
+        # `_run_single_case` for why `save()` runs *after* the gather (avoids a
+        # `collector.spans` mutation race with `_run_deepeval`).
+        similarity, deepeval_scores = await asyncio.gather(
+            self._compute_semantic_similarity(case.reference_output, actual_output),
+            self._run_deepeval(case.prompt, actual_output, agent_trace, collector),
+        )
+        await asyncio.to_thread(collector.save)
 
         span_data = [s.copy() for s in collector.spans]
         for s in span_data:
@@ -685,8 +697,6 @@ class RegressionRunner:
                 if isinstance(s.get(k), datetime):
                     s[k] = s[k].isoformat()
 
-        similarity = await self._compute_semantic_similarity(case.reference_output, actual_output)
-        deepeval_scores = await self._run_deepeval(case.prompt, actual_output, agent_trace, collector)
         quality_scores: dict = {}
         eval_reasoning: dict = {}
 
@@ -863,7 +873,22 @@ class RegressionRunner:
         tokens_in, tokens_out, model_used = _extract_token_meta(messages)
         total_cost = estimate_cost(model_used or self.model, tokens_in, tokens_out)
 
-        collector.save()
+        # A1: semantic similarity and DeepEval are independent LLM calls — run
+        # them concurrently instead of awaiting one after the other (~40-50% cut
+        # on the eval phase per case).
+        #
+        # Note: we intentionally do NOT launch `collector.save()` concurrently
+        # here — `save()` calls `_merge_otel_span_data(self.spans, …)` which
+        # mutates `collector.spans`, and `_run_deepeval` iterates the same list
+        # to extract tool outputs.  Concurrent mutation would race.  Instead we
+        # let both evals finish, THEN push the DB write off the event loop (A2)
+        # so other cases on the same loop can keep progressing while SQLite is
+        # being written.
+        similarity, deepeval_scores = await asyncio.gather(
+            self._compute_semantic_similarity(case.reference_output, actual_output),
+            self._run_deepeval(case.prompt, actual_output, agent_trace, collector),
+        )
+        await asyncio.to_thread(collector.save)
 
         span_data = [s.copy() for s in collector.spans]
         for s in span_data:
@@ -871,9 +896,6 @@ class RegressionRunner:
                 if isinstance(s.get(k), datetime):
                     s[k] = s[k].isoformat()
 
-        similarity = await self._compute_semantic_similarity(case.reference_output, actual_output)
-
-        deepeval_scores = await self._run_deepeval(case.prompt, actual_output, agent_trace, collector)
         quality_scores: dict = {}   # G-Eval removed; kept for DB compat only
         eval_reasoning: dict = {}
 
