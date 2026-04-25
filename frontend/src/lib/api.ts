@@ -256,4 +256,37 @@ export const api = {
     ) => consumeSSE(`/api/workflows/${id}/run/stream`, { mode, input }, onEvent, signal),
     runs: (id: string, limit = 50) => fetchJSON(`/api/workflows/${id}/runs?limit=${limit}`),
   },
+  // Manage collections consumed by workflow vector_store nodes. Persist_dir
+  // and store_type come straight from the node config so the UI reads/writes
+  // the same store the executor uses.
+  vectorstores: {
+    listCollections: (storeType = "chroma", persistDir?: string) => {
+      const qs = new URLSearchParams({ store_type: storeType });
+      if (persistDir) qs.set("persist_dir", persistDir);
+      return fetchJSON(`/api/vectorstores/collections?${qs.toString()}`);
+    },
+    getCollection: (name: string, storeType = "chroma", persistDir?: string) => {
+      const qs = new URLSearchParams({ store_type: storeType });
+      if (persistDir) qs.set("persist_dir", persistDir);
+      return fetchJSON(`/api/vectorstores/collections/${encodeURIComponent(name)}?${qs.toString()}`);
+    },
+    deleteCollection: (name: string, storeType = "chroma", persistDir?: string) => {
+      const qs = new URLSearchParams({ store_type: storeType });
+      if (persistDir) qs.set("persist_dir", persistDir);
+      return fetch(
+        `${API_BASE}/api/vectorstores/collections/${encodeURIComponent(name)}?${qs.toString()}`,
+        { method: "DELETE" },
+      ).then((r) => {
+        if (!r.ok) throw new Error(`API error: ${r.status}`);
+      });
+    },
+    deleteSource: (name: string, source: string, storeType = "chroma", persistDir?: string) => {
+      const qs = new URLSearchParams({ store_type: storeType, source });
+      if (persistDir) qs.set("persist_dir", persistDir);
+      return fetchJSON(
+        `/api/vectorstores/collections/${encodeURIComponent(name)}/sources?${qs.toString()}`,
+        { method: "DELETE" },
+      );
+    },
+  },
 };

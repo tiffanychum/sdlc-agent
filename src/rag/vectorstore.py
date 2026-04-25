@@ -7,12 +7,15 @@ Three free/local options:
   - qdrant  : Qdrant   — enterprise-grade, in-memory mode, best for production
 
 All stores implement the same VectorStore interface:
-  add(chunks, embeddings)
+  add(chunks, embeddings)          # idempotent upsert by (source, chunk_index)
   query(query_embedding, top_k, filter) -> list[SearchResult]
-  delete_collection(collection_id)
+  delete_collection()              # drop the whole collection
+  delete_by_source(source)         # drop just the rows whose source metadata matches
+  list_sources() -> list[{source, count}]
   count() -> int
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -64,10 +67,17 @@ class ChromaStore:
         )
 
     def add(self, texts: list[str], embeddings: list[list[float]], metadatas: list[dict]) -> None:
+        """Idempotent upsert.
+
+        IDs are derived from (source, chunk_index) so re-ingesting the same
+        content produces the same IDs; ``upsert`` then replaces rows instead
+        of raising DuplicateIDError and avoids duplicate vectors.
+        """
         if not texts:
             return
-        ids = [f"{metadatas[i].get('source','src')}_{i}_{hash(texts[i]) & 0xFFFFFF}" for i in range(len(texts))]
-        self._col.add(
+        ids = [_stable_chunk_id(metadatas[i].get("source", "src"), metadatas[i].get("chunk_index", i))
+               for i in range(len(texts))]
+        self._col.upsert(
             ids=ids,
             documents=texts,
             embeddings=embeddings,
@@ -96,6 +106,26 @@ class ChromaStore:
 
     def delete_collection(self) -> None:
         self._client.delete_collection(self._col.name)
+
+    def delete_by_source(self, source: str) -> int:
+        """Remove every chunk whose 'source' metadata matches. Returns deleted count."""
+        before = self._col.count()
+        # Chroma supports where-filtered delete natively.
+        self._col.delete(where={"source": source})
+        after = self._col.count()
+        return max(0, before - after)
+
+    def list_sources(self) -> list[dict]:
+        """Return [{source, count}] grouped by the 'source' metadata field."""
+        # chromadb has no group-by, so pull metadatas and tally in memory.
+        # Good enough for dev / prototyping scale; for huge stores we'd
+        # paginate with .get(offset=,limit=).
+        got = self._col.get(include=["metadatas"])
+        buckets: dict[str, int] = {}
+        for m in got.get("metadatas") or []:
+            s = str((m or {}).get("source", ""))
+            buckets[s] = buckets.get(s, 0) + 1
+        return [{"source": k, "count": v} for k, v in sorted(buckets.items())]
 
     def count(self) -> int:
         return self._col.count()
@@ -138,11 +168,25 @@ class FAISSStore:
                 json.dump({"texts": self._texts, "metadatas": self._metadatas}, f)
 
     def add(self, texts: list[str], embeddings: list[list[float]], metadatas: list[dict]) -> None:
+        """Idempotent: drop any existing rows for each new source first.
+
+        FAISS has no native upsert; we delete-then-append by rebuilding the
+        index minus the old source. Cheap for prototype-sized stores.
+        """
         if not texts:
             return
         import numpy as np  # type: ignore
+
+        # Purge existing rows for any source in the new batch so re-ingest
+        # doesn't duplicate vectors.
+        new_sources = {str((m or {}).get("source", "")) for m in metadatas}
+        if self._index is not None and self._texts and new_sources:
+            keep_idx = [i for i, m in enumerate(self._metadatas)
+                        if str((m or {}).get("source", "")) not in new_sources]
+            if len(keep_idx) != len(self._texts):
+                self._rebuild_from_indices(keep_idx)
+
         vecs = np.array(embeddings, dtype="float32")
-        # Normalise for cosine similarity
         norms = np.linalg.norm(vecs, axis=1, keepdims=True)
         vecs = vecs / np.clip(norms, 1e-10, None)
         if self._index is None:
@@ -152,6 +196,26 @@ class FAISSStore:
         self._texts.extend(texts)
         self._metadatas.extend(metadatas)
         self._save()
+
+    def _rebuild_from_indices(self, keep_idx: list[int]) -> None:
+        """Rebuild the FAISS index keeping only the rows in ``keep_idx``."""
+        import numpy as np  # type: ignore
+        if not keep_idx:
+            self._index = None
+            self._texts = []
+            self._metadatas = []
+            return
+        # Extract the kept vectors from the existing index.
+        all_vecs = self._index.reconstruct_n(0, self._index.ntotal) if self._index is not None else np.zeros((0, 0))
+        kept_vecs = all_vecs[keep_idx]
+        kept_texts = [self._texts[i] for i in keep_idx]
+        kept_metas = [self._metadatas[i] for i in keep_idx]
+        dim = kept_vecs.shape[1]
+        new_index = self._faiss.IndexFlatIP(dim)
+        new_index.add(kept_vecs)
+        self._index = new_index
+        self._texts = kept_texts
+        self._metadatas = kept_metas
 
     def query(self, embedding: list[float], top_k: int = 5, where: Optional[dict] = None) -> list[SearchResult]:
         if self._index is None or self._index.ntotal == 0:
@@ -185,6 +249,23 @@ class FAISSStore:
         self._texts = []
         self._metadatas = []
 
+    def delete_by_source(self, source: str) -> int:
+        before = len(self._texts)
+        keep_idx = [i for i, m in enumerate(self._metadatas)
+                    if str((m or {}).get("source", "")) != source]
+        if len(keep_idx) == before:
+            return 0
+        self._rebuild_from_indices(keep_idx)
+        self._save()
+        return before - len(self._texts)
+
+    def list_sources(self) -> list[dict]:
+        buckets: dict[str, int] = {}
+        for m in self._metadatas:
+            s = str((m or {}).get("source", ""))
+            buckets[s] = buckets.get(s, 0) + 1
+        return [{"source": k, "count": v} for k, v in sorted(buckets.items())]
+
     def count(self) -> int:
         return self._index.ntotal if self._index else 0
 
@@ -203,9 +284,9 @@ class QdrantStore:
                 collection_name=self._name,
                 vectors_config=VectorParams(size=dimensions, distance=Distance.COSINE),
             )
-        self._counter = 0
 
     def add(self, texts: list[str], embeddings: list[list[float]], metadatas: list[dict]) -> None:
+        """Idempotent upsert using stable (source, chunk_index)-derived IDs."""
         if not texts:
             return
         from qdrant_client.models import PointStruct
@@ -213,8 +294,8 @@ class QdrantStore:
         for text, emb, meta in zip(texts, embeddings, metadatas):
             safe_meta = {k: str(v) if not isinstance(v, (str, int, float, bool)) else v for k, v in meta.items()}
             safe_meta["_text"] = text
-            points.append(PointStruct(id=self._counter, vector=emb, payload=safe_meta))
-            self._counter += 1
+            pid = _stable_chunk_uint(meta.get("source", "src"), meta.get("chunk_index", 0))
+            points.append(PointStruct(id=pid, vector=emb, payload=safe_meta))
         self._client.upsert(collection_name=self._name, points=points)
 
     def query(self, embedding: list[float], top_k: int = 5, where: Optional[dict] = None) -> list[SearchResult]:
@@ -248,16 +329,106 @@ class QdrantStore:
 
     def delete_collection(self) -> None:
         self._client.delete_collection(self._name)
-        self._counter = 0
+
+    def delete_by_source(self, source: str) -> int:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue, FilterSelector
+        before = self.count()
+        self._client.delete(
+            collection_name=self._name,
+            points_selector=FilterSelector(
+                filter=Filter(must=[FieldCondition(key="source", match=MatchValue(value=source))]),
+            ),
+        )
+        after = self.count()
+        return max(0, before - after)
+
+    def list_sources(self) -> list[dict]:
+        """Group-by source via scroll — fine for prototype scale."""
+        buckets: dict[str, int] = {}
+        offset = None
+        while True:
+            points, offset = self._client.scroll(
+                collection_name=self._name,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for p in points:
+                s = str((p.payload or {}).get("source", ""))
+                buckets[s] = buckets.get(s, 0) + 1
+            if not offset:
+                break
+        return [{"source": k, "count": v} for k, v in sorted(buckets.items())]
 
     def count(self) -> int:
         info = self._client.get_collection(self._name)
         return info.points_count or 0
 
 
-# ── Factory ───────────────────────────────────────────────────────────────────
+# ── Stable ID helpers ─────────────────────────────────────────────────────────
+
+
+def _stable_chunk_id(source: str, chunk_index: Any) -> str:
+    """Deterministic string ID for a (source, chunk_index) pair.
+
+    Used by Chroma. Same content → same ID → ``upsert`` replaces rather
+    than duplicates.
+    """
+    key = f"{source}|{chunk_index}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+
+def _stable_chunk_uint(source: str, chunk_index: Any) -> int:
+    """Deterministic uint64 ID for a (source, chunk_index) pair.
+
+    Used by Qdrant — it only accepts int or uuid IDs for points.
+    """
+    key = f"{source}|{chunk_index}"
+    h = hashlib.sha256(key.encode("utf-8")).digest()
+    # Take the top 63 bits so the result fits in a signed int64 without
+    # overflowing Qdrant's id field on the wire.
+    return int.from_bytes(h[:8], "big") >> 1
+
+
+# ── Factory / discovery ───────────────────────────────────────────────────────
 
 _qdrant_instances: dict[str, QdrantStore] = {}  # keep in-memory Qdrant alive
+
+
+def list_collections(store_type: str, persist_dir: str = "./data/vectorstore") -> list[dict]:
+    """Enumerate collections known to a given store backend.
+
+    Returns ``[{name, count}]``. For in-memory Qdrant we can only see
+    collections created in this process.
+    """
+    if store_type == "chroma":
+        import chromadb
+        path = os.path.join(persist_dir, "chroma")
+        if not os.path.isdir(path):
+            return []
+        client = chromadb.PersistentClient(path=path)
+        out = []
+        for c in client.list_collections():
+            col = client.get_collection(c.name)
+            out.append({"name": c.name, "count": col.count()})
+        return out
+    if store_type == "faiss":
+        path = os.path.join(persist_dir, "faiss")
+        if not os.path.isdir(path):
+            return []
+        names = sorted({
+            f[: -len(".index")] for f in os.listdir(path)
+            if f.endswith(".index")
+        })
+        out = []
+        for n in names:
+            s = FAISSStore(n, persist_dir=path)
+            out.append({"name": n, "count": s.count()})
+        return out
+    if store_type == "qdrant":
+        return [{"name": n, "count": s.count()} for n, s in _qdrant_instances.items()]
+    raise ValueError(f"Unknown store_type '{store_type}'")
 
 
 def create_store(
