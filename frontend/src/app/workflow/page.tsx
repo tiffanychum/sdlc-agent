@@ -20,6 +20,7 @@ import {
   ReactFlow,
   ReactFlowProvider,
   addEdge,
+  reconnectEdge,
   Background,
   BackgroundVariant,
   Controls,
@@ -28,7 +29,9 @@ import {
   useNodesState,
   type Connection,
   type Edge,
+  type EdgeChange,
   type Node,
+  type NodeChange,
   type NodeProps,
   Handle,
   Position,
@@ -529,9 +532,10 @@ function WorkflowBuilder() {
   const [name, setName] = useState("Untitled Workflow");
   const [description, setDescription] = useState("");
 
-  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+  const [nodes, setNodes, onNodesChangeInner] = useNodesState<Node>([]);
+  const [edges, setEdges, onEdgesChangeInner] = useEdgesState<Edge>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
 
   const [jsonOpen, setJsonOpen] = useState(false);
   const [status, setStatus] = useState<string>("");
@@ -544,6 +548,28 @@ function WorkflowBuilder() {
   const idCounterRef = useRef(0);
   const runAbortRef = useRef<AbortController | null>(null);
   const runStartRef = useRef<number>(0);
+
+  // ── History: snapshot (nodes, edges) for Cmd/Ctrl+Z / Shift+Z ─────
+  // Snapshots are taken BEFORE any structural mutation (add/remove node,
+  // add/remove/reconnect edge, inspector commit) so an undo pops back to
+  // the exact canvas shape the user saw a moment ago.
+  const historyRef = useRef<{
+    past: { nodes: Node[]; edges: Edge[] }[];
+    future: { nodes: Node[]; edges: Edge[] }[];
+  }>({ past: [], future: [] });
+  // Current state mirror so pushHistory (stable identity) can read it
+  // without re-creating a new closure on every render.
+  const stateMirrorRef = useRef<{ nodes: Node[]; edges: Edge[] }>({ nodes: [], edges: [] });
+  useEffect(() => {
+    stateMirrorRef.current = { nodes, edges };
+  }, [nodes, edges]);
+
+  // Keep deleted-node data (config) keyed by id so if the user re-adds a
+  // node with the same id (or undoes the delete) we restore their config.
+  const deletedDataRef = useRef<Record<string, any>>({});
+  // Force-set version — bumped whenever we call setNodes/setEdges directly
+  // (undo/redo) so memoised derived panels refresh.
+  const [histVersion, setHistVersion] = useState(0);
 
   // Initial load — catalog + saved workflows + LLM models
   useEffect(() => {
@@ -575,6 +601,115 @@ function WorkflowBuilder() {
     })();
   }, [teamId || undefined]);
 
+  // ── History helpers ──────────────────────────────────────────
+  // pushHistory() is called just before any structural mutation so that
+  // undo() can restore the previous canvas state. We keep at most 100
+  // snapshots to bound memory.
+
+  // Collapse multiple mutations within ~80ms into one snapshot (e.g. when
+  // deleting a node cascade-removes its edges in a follow-up change set,
+  // or when typing quickly in the Inspector).
+  const lastPushRef = useRef(0);
+  const pushHistory = useCallback(() => {
+    const now = performance.now();
+    if (now - lastPushRef.current < 80) return;
+    lastPushRef.current = now;
+    const cur = stateMirrorRef.current;
+    historyRef.current.past.push({
+      nodes: cur.nodes.map((n) => ({ ...n, data: { ...(n.data as any) } })),
+      edges: cur.edges.map((e) => ({ ...e })),
+    });
+    if (historyRef.current.past.length > 100) historyRef.current.past.shift();
+    historyRef.current.future = [];
+    setHistVersion((v) => v + 1);
+  }, []);
+
+  const undo = useCallback(() => {
+    const { past, future } = historyRef.current;
+    if (!past.length) return;
+    const prev = past.pop()!;
+    const cur = stateMirrorRef.current;
+    future.push({
+      nodes: cur.nodes.map((n) => ({ ...n, data: { ...(n.data as any) } })),
+      edges: cur.edges.map((e) => ({ ...e })),
+    });
+    setNodes(prev.nodes);
+    setEdges(prev.edges);
+    setHistVersion((v) => v + 1);
+  }, [setNodes, setEdges]);
+
+  const redo = useCallback(() => {
+    const { past, future } = historyRef.current;
+    if (!future.length) return;
+    const next = future.pop()!;
+    const cur = stateMirrorRef.current;
+    past.push({
+      nodes: cur.nodes.map((n) => ({ ...n, data: { ...(n.data as any) } })),
+      edges: cur.edges.map((e) => ({ ...e })),
+    });
+    setNodes(next.nodes);
+    setEdges(next.edges);
+    setHistVersion((v) => v + 1);
+  }, [setNodes, setEdges]);
+
+  // Hook global keyboard shortcuts. We intentionally ignore events whose
+  // target is an <input>/<textarea>/contenteditable so typing Cmd+Z in an
+  // inspector field still undoes the text, not the graph.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const t = e.target as HTMLElement | null;
+      const tag = (t?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || t?.isContentEditable) return;
+      const key = e.key.toLowerCase();
+      if (key === "z" && e.shiftKey) { e.preventDefault(); redo(); return; }
+      if (key === "z")               { e.preventDefault(); undo(); return; }
+      if (key === "y")               { e.preventDefault(); redo(); return; }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [undo, redo]);
+
+  // Remember config of nodes that are about to be removed so a re-add
+  // with the same id reuses it (protects against accidental del+re-add).
+  const rememberDeletions = useCallback((changes: NodeChange[]) => {
+    for (const c of changes) {
+      if ((c as any).type === "remove") {
+        const id = (c as any).id as string;
+        const n = stateMirrorRef.current.nodes.find((x) => x.id === id);
+        if (n) deletedDataRef.current[id] = { ...(n.data as any) };
+      }
+    }
+  }, []);
+
+  // Wrap onNodesChange / onEdgesChange so structural edits push history.
+  // Position / selection / dimension changes are NOT snapshotted (would
+  // produce 60 frames per drag and make undo useless).
+  const onNodesChange = useCallback(
+    (changes: NodeChange[]) => {
+      const structural = changes.some(
+        (c: any) => c.type === "add" || c.type === "remove" || c.type === "replace",
+      );
+      if (structural) {
+        pushHistory();
+        rememberDeletions(changes);
+      }
+      onNodesChangeInner(changes);
+    },
+    [onNodesChangeInner, pushHistory, rememberDeletions],
+  );
+
+  const onEdgesChange = useCallback(
+    (changes: EdgeChange[]) => {
+      const structural = changes.some(
+        (c: any) => c.type === "add" || c.type === "remove" || c.type === "replace",
+      );
+      if (structural) pushHistory();
+      onEdgesChangeInner(changes);
+    },
+    [onEdgesChangeInner, pushHistory],
+  );
+
   // ── Drag from palette → drop on canvas ────────────────────────
 
   const onDragStart = (e: React.DragEvent, nodeType: string) => {
@@ -595,24 +730,36 @@ function WorkflowBuilder() {
       const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
       idCounterRef.current += 1;
       const baseId = nodeType.split("_")[0];
-      const id = `${baseId}_${idCounterRef.current}`;
+      let id = `${baseId}_${idCounterRef.current}`;
+      // If a node with this id existed before (deleted), bump until free.
+      while (stateMirrorRef.current.nodes.some((n) => n.id === id)) {
+        idCounterRef.current += 1;
+        id = `${baseId}_${idCounterRef.current}`;
+      }
       const position = { x: e.clientX - rect.left - 100, y: e.clientY - rect.top - 30 };
+      // Restore saved config if user previously deleted a node with this id.
+      const prevData = deletedDataRef.current[id];
+      const dataBase = prevData && prevData.nodeType === nodeType
+        ? prevData
+        : { nodeType, ...defaultDataFor(nodeType) };
+      pushHistory();
       setNodes((nds) => [
         ...nds,
         {
           id,
           type: "flow",
           position,
-          data: { nodeType, ...defaultDataFor(nodeType) },
+          data: { ...dataBase },
         },
       ]);
       setSelectedId(id);
     },
-    [setNodes],
+    [setNodes, pushHistory],
   );
 
   const onConnect = useCallback(
-    (conn: Connection) =>
+    (conn: Connection) => {
+      pushHistory();
       setEdges((eds) =>
         addEdge(
           {
@@ -623,8 +770,35 @@ function WorkflowBuilder() {
           },
           eds,
         ),
-      ),
-    [setEdges],
+      );
+    },
+    [setEdges, pushHistory],
+  );
+
+  // Edge editing: drag an edge endpoint to another handle to re-target it.
+  const edgeReconnectSuccessRef = useRef(true);
+  const onReconnectStart = useCallback(() => {
+    edgeReconnectSuccessRef.current = false;
+  }, []);
+  const onReconnect = useCallback(
+    (oldEdge: Edge, newConnection: Connection) => {
+      edgeReconnectSuccessRef.current = true;
+      pushHistory();
+      setEdges((eds) => reconnectEdge(oldEdge, newConnection, eds));
+    },
+    [setEdges, pushHistory],
+  );
+  const onReconnectEnd = useCallback(
+    (_: unknown, edge: Edge) => {
+      // If the endpoint was released in empty space, delete the edge —
+      // matches LangFlow's "drag off to remove" UX.
+      if (!edgeReconnectSuccessRef.current) {
+        pushHistory();
+        setEdges((eds) => eds.filter((e) => e.id !== edge.id));
+      }
+      edgeReconnectSuccessRef.current = true;
+    },
+    [setEdges, pushHistory],
   );
 
   // ── Run-state overlay helpers ────────────────────────────────
@@ -881,6 +1055,7 @@ function WorkflowBuilder() {
 
   function updateSelectedData(patch: Record<string, any>) {
     if (!selectedNode) return;
+    pushHistory();
     setNodes((nds) =>
       nds.map((n) =>
         n.id === selectedNode.id
@@ -894,6 +1069,7 @@ function WorkflowBuilder() {
     if (!selectedNode) return;
     if (!newId || nodes.some((n) => n.id === newId && n.id !== selectedNode.id)) return;
     const oldId = selectedNode.id;
+    pushHistory();
     setNodes((nds) => nds.map((n) => (n.id === oldId ? { ...n, id: newId } : n)));
     setEdges((eds) =>
       eds.map((e) => ({
@@ -908,14 +1084,29 @@ function WorkflowBuilder() {
   function deleteSelected() {
     if (!selectedNode) return;
     const id = selectedNode.id;
+    // Stash the config so if the user recreates a node with the same id
+    // they get their settings back.
+    deletedDataRef.current[id] = { ...(selectedNode.data as any) };
+    pushHistory();
     setNodes((nds) => nds.filter((n) => n.id !== id));
     setEdges((eds) => eds.filter((e) => e.source !== id && e.target !== id));
     setSelectedId(null);
   }
 
+  function deleteSelectedEdge() {
+    if (!selectedEdgeId) return;
+    pushHistory();
+    setEdges((eds) => eds.filter((e) => e.id !== selectedEdgeId));
+    setSelectedEdgeId(null);
+  }
+
   // ── Render ────────────────────────────────────────────────────
 
   const wire = useMemo(() => toWire(nodes, edges), [nodes, edges]);
+  // histVersion → recompute so buttons' disabled state reflects reality.
+  const canUndo = historyRef.current.past.length > 0;
+  const canRedo = historyRef.current.future.length > 0;
+  void histVersion; // read so lint doesn't flag it as unused
 
   return (
     <div className="flex h-[calc(100vh-56px)] gap-3 text-[13px]">
@@ -1013,6 +1204,24 @@ function WorkflowBuilder() {
           >
             View JSON
           </button>
+          <div className="flex items-center">
+            <button
+              onClick={undo}
+              disabled={!canUndo}
+              title="Undo (⌘Z)"
+              className="px-2 py-1.5 rounded-l-md border border-[var(--border)] bg-white text-[12px] disabled:opacity-40"
+            >
+              ↶
+            </button>
+            <button
+              onClick={redo}
+              disabled={!canRedo}
+              title="Redo (⇧⌘Z)"
+              className="px-2 py-1.5 rounded-r-md border border-l-0 border-[var(--border)] bg-white text-[12px] disabled:opacity-40"
+            >
+              ↷
+            </button>
+          </div>
           {loaded && (
             <button
               onClick={deleteLoaded}
@@ -1044,9 +1253,17 @@ function WorkflowBuilder() {
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
             onConnect={onConnect}
+            onReconnect={onReconnect}
+            onReconnectStart={onReconnectStart}
+            onReconnectEnd={onReconnectEnd}
             nodeTypes={nodeTypes}
-            onNodeClick={(_, n) => setSelectedId(n.id)}
-            onPaneClick={() => setSelectedId(null)}
+            onNodeClick={(_, n) => { setSelectedId(n.id); setSelectedEdgeId(null); }}
+            onEdgeClick={(_, e) => { setSelectedEdgeId(e.id); setSelectedId(null); }}
+            onPaneClick={() => { setSelectedId(null); setSelectedEdgeId(null); }}
+            edgesReconnectable
+            elementsSelectable
+            nodesDraggable
+            deleteKeyCode={["Backspace", "Delete"]}
             fitView
             defaultEdgeOptions={{ type: "smoothstep" }}
             proOptions={{ hideAttribution: true }}
@@ -1132,9 +1349,22 @@ function WorkflowBuilder() {
               catalog={catalog}
               llmModels={llmModels}
             />
+          ) : selectedEdgeId ? (
+            <EdgeInspector
+              edge={edges.find((e) => e.id === selectedEdgeId)}
+              nodes={nodes}
+              onDelete={deleteSelectedEdge}
+            />
           ) : (
-            <div className="text-[12px] text-[var(--text-muted)]">
+            <div className="text-[12px] text-[var(--text-muted)] leading-relaxed">
               Click a node on the canvas to edit it, or drag a new node from the palette.
+              <br /><br />
+              <span className="text-[11px]">
+                <strong>Tips:</strong> drag an edge endpoint onto another handle to reconnect it,
+                or release in empty space to remove it. <kbd className="px-1 border rounded">Del</kbd>
+                {" "}deletes the selected node/edge. <kbd className="px-1 border rounded">⌘Z</kbd>
+                {" "}undoes, <kbd className="px-1 border rounded">⇧⌘Z</kbd> redoes.
+              </span>
             </div>
           )}
         </div>
@@ -1421,6 +1651,13 @@ function Inspector({
               className="wf-input mono"
             />
           </Field>
+
+          {/* Live management: list sources, delete per-source, drop collection */}
+          <ManageCollection
+            storeType={data.store_type ?? "chroma"}
+            collectionName={data.collection_name ?? ""}
+            persistDir={data.persist_dir || undefined}
+          />
         </>
       )}
 
@@ -1501,6 +1738,206 @@ function Field({
         {hint && <span className="wf-row__info" title={hint}>i</span>}
       </div>
       {children}
+    </div>
+  );
+}
+
+// ── Edge inspector — shown when the user clicks an edge on the canvas ──
+
+function EdgeInspector({
+  edge,
+  nodes,
+  onDelete,
+}: {
+  edge: Edge | undefined;
+  nodes: Node[];
+  onDelete: () => void;
+}) {
+  if (!edge) {
+    return (
+      <div className="text-[12px] text-[var(--text-muted)]">Edge not found.</div>
+    );
+  }
+  const src = nodes.find((n) => n.id === edge.source);
+  const tgt = nodes.find((n) => n.id === edge.target);
+  const srcMeta = NODE_META[(src?.data as any)?.nodeType ?? "output"];
+  const tgtMeta = NODE_META[(tgt?.data as any)?.nodeType ?? "output"];
+  return (
+    <div className="wf-inspector flex flex-col gap-3">
+      <div className="wf-inspector__head" style={{ ["--wf-accent" as any]: "#52525b" } as React.CSSProperties}>
+        <span className="wf-node__icon" style={{ color: "#52525b" }}>
+          <svg viewBox="0 0 20 20" width={15} height={15} fill="none" stroke="currentColor" strokeWidth={1.5}>
+            <path d="M3 10h14M13 6l4 4-4 4" />
+          </svg>
+        </span>
+        <div className="wf-inspector__head-text">
+          <div className="wf-inspector__title">Connection</div>
+          <div className="wf-inspector__sub">{edge.id}</div>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-1 text-[11.5px]">
+        <div className="text-[10.5px] uppercase tracking-wide text-[var(--text-muted)]">From</div>
+        <div className="flex items-center gap-2 px-2 py-1.5 rounded-md bg-[var(--bg-hover)]">
+          <span className="w-3 h-3 rounded-full border" style={{ background: srcMeta.color }} />
+          <div className="flex-1 min-w-0">
+            <div className="truncate font-medium">{srcMeta.label}</div>
+            <div className="text-[10px] text-[var(--text-muted)] font-mono truncate">
+              {edge.source}{edge.sourceHandle ? ` · ${edge.sourceHandle}` : ""}
+            </div>
+          </div>
+        </div>
+
+        <div className="text-[10.5px] uppercase tracking-wide text-[var(--text-muted)] mt-2">To</div>
+        <div className="flex items-center gap-2 px-2 py-1.5 rounded-md bg-[var(--bg-hover)]">
+          <span className="w-3 h-3 rounded-full border" style={{ background: tgtMeta.color }} />
+          <div className="flex-1 min-w-0">
+            <div className="truncate font-medium">{tgtMeta.label}</div>
+            <div className="text-[10px] text-[var(--text-muted)] font-mono truncate">
+              {edge.target}{edge.targetHandle ? ` · ${edge.targetHandle}` : ""}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="text-[11px] text-[var(--text-muted)] leading-relaxed">
+        Drag either endpoint on the canvas to re-target this connection, or release in empty space to remove it.
+      </div>
+
+      <button onClick={onDelete} className="wf-delete-btn">
+        Delete edge
+      </button>
+    </div>
+  );
+}
+
+// ── Vector store collection manager ───────────────────────────────────
+// Shown inside the Inspector when a vector_store node is selected.
+// Talks to /api/vectorstores/* — lets the user see what's in the
+// collection, drop a single source, or nuke the whole thing.
+
+function ManageCollection({
+  storeType,
+  collectionName,
+  persistDir,
+}: {
+  storeType: string;
+  collectionName: string;
+  persistDir?: string;
+}) {
+  const [info, setInfo] = useState<{
+    count: number;
+    sources: { source: string; count: number }[];
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    setErr(null);
+    setMsg(null);
+    if (!collectionName) { setInfo(null); return; }
+    setLoading(true);
+    try {
+      const r = await api.vectorstores.getCollection(collectionName, storeType, persistDir);
+      setInfo({ count: r.count ?? 0, sources: r.sources ?? [] });
+    } catch (e: any) {
+      // 404 / 500 here just means the collection hasn't been ingested yet —
+      // surface as empty, not an error.
+      setInfo({ count: 0, sources: [] });
+    } finally {
+      setLoading(false);
+    }
+  }, [collectionName, storeType, persistDir]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  async function dropSource(src: string) {
+    if (!collectionName) return;
+    if (!confirm(`Remove all chunks from source "${src}"?`)) return;
+    try {
+      const r = await api.vectorstores.deleteSource(collectionName, src, storeType, persistDir);
+      setMsg(`Removed ${r.removed} chunks (${r.remaining} left).`);
+      await refresh();
+    } catch (e: any) {
+      setErr(`delete failed: ${e.message ?? e}`);
+    }
+  }
+
+  async function dropAll() {
+    if (!collectionName) return;
+    if (!confirm(`Drop the ENTIRE collection "${collectionName}"? This cannot be undone.`)) return;
+    try {
+      await api.vectorstores.deleteCollection(collectionName, storeType, persistDir);
+      setMsg("Collection dropped.");
+      await refresh();
+    } catch (e: any) {
+      setErr(`drop failed: ${e.message ?? e}`);
+    }
+  }
+
+  return (
+    <div className="wf-field">
+      <div className="wf-field__label flex items-center justify-between">
+        <span>Manage Collection</span>
+        <button
+          onClick={refresh}
+          disabled={loading || !collectionName}
+          className="text-[10.5px] text-[var(--text-muted)] hover:text-[var(--text)] disabled:opacity-40"
+          title="Reload stats"
+        >
+          {loading ? "refreshing…" : "refresh"}
+        </button>
+      </div>
+
+      <div className="border border-[var(--border)] rounded-lg bg-[var(--bg-card)] overflow-hidden">
+        <div className="px-3 py-2 border-b border-[var(--border)] text-[11px] text-[var(--text-muted)] flex items-center justify-between">
+          <span>
+            {collectionName ? (
+              <>
+                <span className="font-mono">{collectionName}</span>
+                {" · "}
+                <span>{info?.count ?? 0} chunks</span>
+              </>
+            ) : (
+              "Set a collection name above"
+            )}
+          </span>
+          <button
+            onClick={dropAll}
+            disabled={!collectionName || (info?.count ?? 0) === 0}
+            className="text-[10.5px] text-red-600 hover:text-red-700 disabled:opacity-40"
+          >
+            drop all
+          </button>
+        </div>
+
+        {(!info || info.sources.length === 0) ? (
+          <div className="px-3 py-3 text-[11px] text-[var(--text-muted)]">
+            {collectionName ? "No ingested sources yet." : "—"}
+          </div>
+        ) : (
+          <ul className="divide-y divide-[var(--border)] max-h-60 overflow-y-auto">
+            {info.sources.map((s) => (
+              <li key={s.source} className="flex items-center gap-2 px-3 py-2">
+                <span className="flex-1 min-w-0">
+                  <span className="block text-[11.5px] font-mono truncate">{s.source || "(unknown)"}</span>
+                  <span className="block text-[10.5px] text-[var(--text-muted)]">{s.count} chunks</span>
+                </span>
+                <button
+                  onClick={() => dropSource(s.source)}
+                  className="text-[10.5px] text-red-600 hover:text-red-700 px-2 py-1 rounded-md border border-transparent hover:border-red-100"
+                >
+                  remove
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {msg && <div className="text-[10.5px] text-emerald-600 mt-1">{msg}</div>}
+      {err && <div className="text-[10.5px] text-red-600 mt-1">{err}</div>}
     </div>
   );
 }

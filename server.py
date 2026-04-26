@@ -13,6 +13,7 @@ Provides REST APIs for:
 import asyncio
 import json
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -4073,6 +4074,92 @@ def delete_workflow(workflow_id: str):
         return None
     finally:
         session.close()
+
+
+# ── Vector store management (for workflow vector_store nodes) ─────
+#
+# These endpoints give the workflow Inspector a "Manage Collection" pane
+# without requiring a full ingest re-run. They wrap the same
+# `src.rag.vectorstore` factory the executor uses, so a collection opened
+# here is the same one the workflow writes/reads.
+
+
+class _VectorStoreQuery(BaseModel):
+    store_type: str = "chroma"
+    persist_dir: Optional[str] = None
+
+
+@app.get("/api/vectorstores/collections")
+def list_vs_collections(store_type: str = "chroma", persist_dir: Optional[str] = None):
+    from src.rag.vectorstore import list_collections
+    pd = persist_dir or os.getenv("WORKFLOW_PERSIST_DIR", "./data/workflow_vs")
+    try:
+        return {
+            "store_type": store_type,
+            "persist_dir": pd,
+            "collections": list_collections(store_type, persist_dir=pd),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"list_collections failed: {e}")
+
+
+@app.get("/api/vectorstores/collections/{collection}")
+def get_vs_collection(
+    collection: str,
+    store_type: str = "chroma",
+    persist_dir: Optional[str] = None,
+):
+    """Return per-source counts + total row count for a collection."""
+    from src.rag.vectorstore import create_store
+    pd = persist_dir or os.getenv("WORKFLOW_PERSIST_DIR", "./data/workflow_vs")
+    try:
+        store = create_store(store_type=store_type, collection_id=collection, persist_dir=pd)
+        return {
+            "name": collection,
+            "store_type": store_type,
+            "persist_dir": pd,
+            "count": store.count(),
+            "sources": store.list_sources(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"get_vs_collection failed: {e}")
+
+
+@app.delete("/api/vectorstores/collections/{collection}", status_code=204)
+def delete_vs_collection(
+    collection: str,
+    store_type: str = "chroma",
+    persist_dir: Optional[str] = None,
+):
+    """Drop an entire collection."""
+    from src.rag.vectorstore import create_store
+    pd = persist_dir or os.getenv("WORKFLOW_PERSIST_DIR", "./data/workflow_vs")
+    try:
+        store = create_store(store_type=store_type, collection_id=collection, persist_dir=pd)
+        store.delete_collection()
+        return None
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"delete_collection failed: {e}")
+
+
+@app.delete("/api/vectorstores/collections/{collection}/sources", status_code=200)
+def delete_vs_source(
+    collection: str,
+    source: str,
+    store_type: str = "chroma",
+    persist_dir: Optional[str] = None,
+):
+    """Delete every chunk whose ``metadata.source`` equals ``source``."""
+    from src.rag.vectorstore import create_store
+    pd = persist_dir or os.getenv("WORKFLOW_PERSIST_DIR", "./data/workflow_vs")
+    try:
+        store = create_store(store_type=store_type, collection_id=collection, persist_dir=pd)
+        removed = store.delete_by_source(source)
+        return {"removed": removed, "remaining": store.count()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"delete_by_source failed: {e}")
 
 
 @app.post("/api/workflows/{workflow_id}/run")
