@@ -14,7 +14,7 @@ Key capabilities:
 - **Multi-strategy orchestration** — router_decides, sequential, parallel, supervisor (with ReAct step tracking + QA iteration cycle), and **auto** (LLM selects best strategy)
 - **Human-in-the-Loop (HITL)** — plan review, action confirmation, clarification, and tool output review via SSE interrupts
 - **RAG pipeline** — configurable embedding model, vector DB, chunking, and retrieval strategy with a chat interface
-- **GenAI Workflow builder** — LangFlow-style visual DAG for composing RAG / agent pipelines. Drag-and-drop components, typed per-port handles, server-side executor with layered topological scheduling, SSE live trajectory with per-node status animations, and JSON graphs persisted per team
+- **GenAI Workflow builder** — LangFlow-style visual DAG for composing RAG / agent pipelines. Drag-and-drop components, typed per-port handles, server-side executor with layered topological scheduling, SSE live trajectory with per-node status animations, and JSON graphs persisted per team. Includes full **undo / redo**, **interactive edge editing** (select, delete, reconnect), **node-config restore on re-add**, and an in-canvas **vector-store collection manager** (per-source chunk counts, drop a source, drop a collection)
 - **DeepEval-powered evaluation** — answer relevancy, faithfulness, and 8 agentic metrics with reasoning
 - **Golden dataset regression testing** — trace-level assertions, per-role prompt versioning, A/B comparison across model × prompt-version sets, and LLM-powered root cause analysis
 - **Prompt drift detection** — `sync_from_definitions` and `sync_routing_prompts` auto-bump a new version whenever code-level prompts diverge from the database, so `latest` always serves the current code
@@ -108,6 +108,10 @@ Highlights:
 - **Layered topological scheduler** — `layered_topo_sort` runs independent nodes in the same level concurrently via `asyncio.gather`; mode-aware filtering skips ingest nodes for query runs and vice-versa
 - **Reuses existing RAG primitives** — the executor composes `src/rag/chunker.py`, `src/rag/embeddings.py`, and `src/rag/vectorstore.py` so a workflow run produces the same artifacts as the RAG pipeline page
 - **JSON-first, team-scoped** — every graph is stored in `workflow_definitions.graph_json` and visible via "View JSON"; runs are persisted to `workflow_runs` with full node-level logs for debugging
+- **Undo / redo with debounced history** — `Cmd/Ctrl+Z` and `Shift+Cmd/Ctrl+Z` (also `Ctrl+Y`) walk a snapshot stack of `{nodes, edges}`. An 80 ms coalescing window collapses cascading changes (e.g. node delete → auto-removed edges, or rapid Inspector typing) into a single step. Toolbar Undo/Redo buttons reflect live availability via a render-trigger counter so disabled state never goes stale.
+- **Edge editing** — edges are selectable, deletable (`Backspace` / `Delete` / Inspector button), and **reconnectable** via React Flow's `onReconnect`. Dragging an edge endpoint into empty space deletes it. A dedicated `EdgeInspector` panel shows source/target node + handle ids and exposes a one-click delete.
+- **Re-add restores config** — when a node is deleted, its `data` (model, prompt, collection name, etc.) is cached in a `deletedDataRef` keyed by node id. Dragging the same node type back from the palette with the same id rehydrates the config, so a delete-then-readd round-trip preserves the previous wiring intent.
+- **In-canvas vector-store manager** — selecting a `vector_store` node opens a "Manage Collection" panel in the Inspector that lists per-source chunk counts (live from the backend), lets you remove a single source, or drop the entire collection without leaving the canvas.
 
 ### Monitoring
 Overview metrics, OTel span statistics, token/cost breakdown by model and agent, latency percentiles.
@@ -206,6 +210,45 @@ Golden Case ──► Agent Execution ──► HITL Auto-Approve ──► Trac
 ```
 
 Executor events stream as SSE (`run_start`, `node_start`, `node_end`, `run_end`) to the frontend, which updates node status pills, animates the active edges, and appends rows to a live trajectory panel.
+
+### Vector-store management (idempotent re-ingest + collection hygiene)
+
+Re-running an ingest workflow against the same collection used to silently duplicate every chunk. The vector-store layer (`src/rag/vectorstore.py`) is now **idempotent** across all three backends, and the workflow Inspector exposes a "Manage Collection" panel for in-place cleanup.
+
+```
+                ┌──────────────────────────────────────┐
+                │      Inspector › Manage Collection   │
+                │   total chunks · per-source counts   │
+                │   ▸ remove source   ▸ drop collection│
+                └────────────────┬─────────────────────┘
+                                 │  GET /api/vectorstores/collections{,/:name}
+                                 │  DELETE /api/vectorstores/collections/:name
+                                 │  DELETE /api/vectorstores/collections/:name/sources?source=…
+                                 ▼
+        ┌──────────── ChromaStore ─────┐ ┌──── FAISSStore ────┐ ┌───── QdrantStore ─────┐
+        │ stable id = sha256(src|idx)  │ │ in-memory rebuild  │ │ uint64(src|idx)       │
+        │ col.upsert(ids,…)            │ │ around new sources │ │ client.upsert(points) │
+        │ col.delete(where={source})   │ │ filter + reindex   │ │ FilterSelector delete │
+        │ paginated list_sources()     │ │ per-source tally   │ │ scroll → tally        │
+        └──────────────────────────────┘ └────────────────────┘ └───────────────────────┘
+```
+
+- **Idempotent `add()`** — every chunk gets a deterministic id derived from `(source, chunk_index)`, so re-ingesting the same document upserts in place instead of appending duplicates.
+- **`delete_by_source(source)`** — drop every chunk that came from a single file/URL using the backend's native filter (Chroma `where=`, Qdrant `FilterSelector`, FAISS reindex).
+- **`list_sources()`** — paginated metadata-only scan returning `[{source, count}]` so the Inspector can render per-source chunk counts at scale.
+- **`list_collections(store_type, persist_dir)`** — module-level helper that enumerates all collections at a path and their counts; used by the dropdown to pick existing collections.
+- **Same collection name = same store** — pointing two `vector_store` nodes at the same `(store_type, persist_dir, collection_name)` mounts the same underlying collection, so re-ingest cleanly updates content.
+
+New endpoints (mounted in `server.py`):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/api/vectorstores/collections` | List collections + counts for `(store_type, persist_dir)` |
+| `GET` | `/api/vectorstores/collections/{collection}` | Total + per-source chunk counts |
+| `DELETE` | `/api/vectorstores/collections/{collection}` | Drop the entire collection |
+| `DELETE` | `/api/vectorstores/collections/{collection}/sources?source=…` | Drop all chunks from one source |
+
+Frontend client: `api.vectorstores.{listCollections, getCollection, deleteCollection, deleteSource}` in `frontend/src/lib/api.ts`.
 
 ---
 
@@ -380,6 +423,25 @@ A new **LangFlow-style studio** (`/workflow`) lets teams compose and execute RAG
 - **Minimalist node UI** — custom `FlowNode` component with flat line-art SVG icons on accent-tinted squares, typed per-port handles color-coded by data type (`docs`, `chunks`, `embeddings`, `store`, `context`, `prompt`, `answer`), and vivid per-node selection glow driven by a `--wf-accent` CSS custom property. Palette + inspector share the same visual language.
 - **Team-scoped persistence** — graphs save to `workflow_definitions.graph_json`; each run persists to `workflow_runs` with status, per-node log, and final output. A "View JSON" button exposes the raw graph for copy/paste or audit.
 - **Test coverage** — `tests/test_workflow_executor.py` covers schema validation, mode filtering, and happy-path execution; `tests/test_async_parallelism.py` asserts that same-level nodes actually run concurrently via `asyncio.gather`.
+
+### Workflow editor — undo/redo, edge editing, and node-config restore
+
+The workflow canvas now behaves like a real editor instead of a one-shot graph form.
+
+- **Snapshot-based history with debouncing.** Every structural change pushes `{nodes, edges}` onto an undo stack; redo is the mirror. An 80 ms coalescing window collapses cascading React Flow events (deleting a node also removes its edges; rapid Inspector typing) into a single history entry, so one `Cmd/Ctrl+Z` reverses one user action. `Shift+Cmd/Ctrl+Z` and `Ctrl+Y` redo. A `histVersion` counter forces re-renders so the toolbar Undo/Redo buttons' `disabled` state never goes stale.
+- **Edges are first-class.** Edges are now selectable, deletable (`Backspace` / `Delete`, Inspector button, or by dragging an endpoint into empty space), and **reconnectable** via React Flow's `onReconnect`. A new `EdgeInspector` panel shows the source/target node + handle ids and exposes a one-click delete.
+- **Re-add restores config.** When a node is deleted its `data` (LLM model, prompt body, collection name, retriever k, etc.) is cached in a `deletedDataRef` keyed by node id. Dragging the same node from the palette with the same id rehydrates the saved config — so a "delete embedder, add it back" round-trip preserves the wiring intent and the previously-working pipeline keeps working.
+- **Keyboard shortcuts ignore form fields.** The global shortcut handler skips events originating from `input`, `textarea`, or `contenteditable` so typing in the Inspector doesn't trigger an undo.
+
+### Workflow vector-store hygiene (idempotent re-ingest + in-canvas cleanup)
+
+Re-ingesting the same source no longer duplicates chunks, and you can clean up a collection without leaving the workflow page.
+
+- **Idempotent `add()` across all backends.** `ChromaStore` derives a deterministic id `sha256(source|chunk_index)` and uses `upsert()`; `QdrantStore` uses a uint64 hash for point ids and `client.upsert()`; `FAISSStore` filters out vectors whose `source` is being re-added and rebuilds the in-memory index before appending the new ones. Same `(collection_name, persist_dir)` always points at the same logical store.
+- **`delete_by_source(source)` and `list_sources()`.** New per-store methods using each backend's native filter (Chroma `where=`, Qdrant `FilterSelector`, FAISS reindex). Chroma's `list_sources` paginates the metadata-only `.get(limit, offset)` so it scales past a single page.
+- **`list_collections(store_type, persist_dir)`.** Module-level helper that enumerates all collections at a path and their counts.
+- **Four new endpoints in `server.py`** — `GET /api/vectorstores/collections`, `GET /api/vectorstores/collections/{collection}`, `DELETE /api/vectorstores/collections/{collection}`, `DELETE /api/vectorstores/collections/{collection}/sources?source=…` — wired to the `api.vectorstores.*` client in `frontend/src/lib/api.ts`.
+- **"Manage Collection" panel** in the Inspector for any selected `vector_store` node. Live total + per-source chunk counts, a "remove" button per source, and a "drop all" button for the entire collection.
 
 ### Supervisor routing — lessons from debugging `67d59cee802a`
 
