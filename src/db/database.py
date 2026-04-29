@@ -73,6 +73,28 @@ def _migrate(engine):
             for col in ("strategy", "expected_strategy"):
                 if col not in cols:
                     conn.execute(text(f"ALTER TABLE golden_test_cases ADD COLUMN {col} TEXT"))
+            if "dataset_group" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE golden_test_cases ADD COLUMN dataset_group TEXT DEFAULT 'default'"
+                ))
+            conn.commit()
+
+    # Team.config_json — JSON blob for strategy-specific config + dataset_groups.
+    if "teams" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("teams")}
+        with engine.connect() as conn:
+            if "config_json" not in cols:
+                conn.execute(text("ALTER TABLE teams ADD COLUMN config_json TEXT DEFAULT '{}'"))
+            conn.commit()
+
+    # PromptVersionEntry.team_id — the registry already writes to this column
+    # but the ORM declaration only just caught up. Defensive ALTER ensures the
+    # SQL column exists for every DB.
+    if "prompt_version_entries" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("prompt_version_entries")}
+        with engine.connect() as conn:
+            if "team_id" not in cols:
+                conn.execute(text("ALTER TABLE prompt_version_entries ADD COLUMN team_id TEXT"))
             conn.commit()
 
     # RAG tables — created by Base.metadata.create_all but guarded here for safety
@@ -108,30 +130,6 @@ def _migrate(engine):
         with engine.connect() as conn:
             if "prompt_version" not in cols:
                 conn.execute(text("ALTER TABLE agents ADD COLUMN prompt_version TEXT DEFAULT 'v1'"))
-            conn.commit()
-
-    # Workflow tables — created by Base.metadata.create_all.  Migration
-    # block kept for future column additions (matches the RAG pattern above).
-    # No-op on fresh DBs; safe to leave in place.
-    if "workflow_definitions" in insp.get_table_names():
-        cols = {c["name"] for c in insp.get_columns("workflow_definitions")}
-        with engine.connect() as conn:
-            if "is_active" not in cols:
-                conn.execute(text("ALTER TABLE workflow_definitions ADD COLUMN is_active BOOLEAN DEFAULT 1"))
-            conn.commit()
-
-    # Patch 5: team-scope PromptVersionEntry.  Existing rows keep team_id = NULL
-    # (= "global"), which is the correct default — the agent-role prompts were
-    # never team-specific anyway, and the first orchestrator build after this
-    # migration will seed per-team supervisor/router rows on demand.
-    if "prompt_version_entries" in insp.get_table_names():
-        cols = {c["name"] for c in insp.get_columns("prompt_version_entries")}
-        with engine.connect() as conn:
-            if "team_id" not in cols:
-                conn.execute(text("ALTER TABLE prompt_version_entries ADD COLUMN team_id TEXT"))
-                # Backfill existing rows explicitly as NULL (global) — no-op in
-                # SQLite but keeps the intent obvious to future readers.
-                conn.execute(text("UPDATE prompt_version_entries SET team_id = NULL WHERE team_id IS NULL"))
             conn.commit()
 
 

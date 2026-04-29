@@ -1,6 +1,7 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { api } from "@/lib/api";
+import { useTeam } from "@/contexts/TeamContext";
 import { RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from "recharts";
 
 const RULE_KEYS = [
@@ -11,13 +12,10 @@ const RULE_KEYS = [
   { key: "reasoning_quality", label: "Reasoning", color: "#7c3aed" },
 ];
 
-const GEVAL_KEYS = [
-  { key: "correctness", label: "Correctness", color: "#2563eb" },
-  { key: "relevance", label: "Relevance", color: "#059669" },
-  { key: "coherence", label: "Coherence", color: "#7c3aed" },
-  { key: "tool_usage_quality", label: "Tool Quality", color: "#ca8a04" },
-  { key: "completeness", label: "Completeness", color: "#dc2626" },
-];
+// G-Eval (custom LLM-as-Judge with CoT) was removed from the backend —
+// DeepEval is now the single source of truth for trace-level evaluation.
+// The legacy GEVAL_KEYS / G-Eval radar / cross-validation panels were
+// removed from this page; only Rule-Based + DeepEval (External) remain.
 
 const DEEPEVAL_KEYS = [
   { key: "deepeval_relevancy", label: "Relevancy", color: "#0891b2" },
@@ -154,6 +152,7 @@ function AgentTraceTimeline({ agentTrace }: { agentTrace: any[] }) {
 }
 
 export default function EvaluationPage() {
+  const { teamId, setTeamId, teams } = useTeam();
   const [traces, setTraces] = useState<any[]>([]);
   const [ragQueries, setRagQueries] = useState<any[]>([]);
   const [ragStats, setRagStats] = useState<any>(null);
@@ -161,14 +160,13 @@ export default function EvaluationPage() {
   const [evalResult, setEvalResult] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [pageTab, setPageTab] = useState<"agent" | "rag">("agent");
-  const [activeTab, setActiveTab] = useState<"combined" | "geval" | "deepeval">("combined");
+  // G-Eval tab removed — only "Summary" + DeepEval radar remain.
+  const [activeTab, setActiveTab] = useState<"summary" | "deepeval">("summary");
   const [ragExpandedId, setRagExpandedId] = useState<string | null>(null);
 
-  useEffect(() => { load(); }, []);
-
-  async function load() {
+  const load = useCallback(async () => {
     const [t, rq, rs] = await Promise.allSettled([
-      api.traces.list(100),
+      api.traces.list(100, teamId || undefined),
       (api as any).rag.queries(30, 100),
       (api as any).rag.stats(30),
     ]);
@@ -178,11 +176,13 @@ export default function EvaluationPage() {
     }
     if (rq.status === "fulfilled") setRagQueries(rq.value);
     if (rs.status === "fulfilled") setRagStats(rs.value);
-  }
+  }, [teamId]);
+
+  useEffect(() => { if (teamId) load(); }, [teamId, load]);
 
   async function runEval() {
     setEvaluating(true);
-    setEvalResult("Running G-Eval + DeepEval...");
+    setEvalResult("Running DeepEval...");
     try {
       const r = await api.traces.evaluate();
       setEvalResult(`Evaluated ${r.evaluated} trace(s). ${r.remaining} remaining.`);
@@ -197,20 +197,9 @@ export default function EvaluationPage() {
 
   const pendingCount = traces.filter(t => t.eval_status !== "evaluated").length;
 
-  function getGEvalScores(t: any) {
-    return t.eval_scores?.geval_scores || {};
-  }
-  function getGEvalReasoning(t: any) {
-    return t.eval_scores?.geval_reasoning || {};
-  }
   function getDeepEvalScores(t: any) {
     return t.eval_scores?.deepeval_scores || {};
   }
-
-  const gevalAvgs = GEVAL_KEYS.map(gk => {
-    const vals = traces.map(t => getGEvalScores(t)[gk.key] || 0).filter(v => v > 0);
-    return { metric: gk.label, score: vals.length > 0 ? +(vals.reduce((a: number, b: number) => a + b, 0) / vals.length * 100).toFixed(1) : 0 };
-  });
 
   const deepevalAvgs = DEEPEVAL_KEYS.map(dk => {
     const vals = traces.map(t => getDeepEvalScores(t)[dk.key] || 0).filter(v => v > 0);
@@ -222,18 +211,6 @@ export default function EvaluationPage() {
     return { metric: rk.label, score: vals.length > 0 ? +(vals.reduce((a: number, b: number) => a + b, 0) / vals.length * 100).toFixed(1) : 0 };
   });
 
-  const combinedRadar = [
-    ...GEVAL_KEYS.map(gk => {
-      const gVal = gevalAvgs.find(a => a.metric === gk.label)?.score || 0;
-      return { metric: gk.label, "G-Eval": gVal, "DeepEval": 0 };
-    }),
-    ...DEEPEVAL_KEYS.map(dk => {
-      const dVal = deepevalAvgs.find(a => a.metric === dk.label)?.score || 0;
-      return { metric: dk.label, "G-Eval": 0, "DeepEval": dVal };
-    }),
-  ];
-
-  const hasGEval = gevalAvgs.some(g => g.score > 0);
   const hasDeepEval = deepevalAvgs.some(d => d.score > 0);
 
   const tip = { contentStyle: { background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 8, fontSize: 12 } };
@@ -283,6 +260,9 @@ export default function EvaluationPage() {
         </div>
         <div className="flex items-center gap-3">
           {evalResult && <span className={`text-xs ${evaluating ? "text-zinc-500" : evalResult.startsWith("Error") ? "text-[var(--error)]" : "text-[var(--success)]"}`}>{evalResult}</span>}
+          <select value={teamId} onChange={e => setTeamId(e.target.value)} className="input !w-auto">
+            {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
           <button onClick={load} className="btn-secondary">Refresh</button>
           {pageTab === "agent" && (
             <button onClick={runEval} disabled={evaluating} className="btn-primary">
@@ -463,22 +443,22 @@ export default function EvaluationPage() {
       {/* ── Agent Evaluation Tab ────────────────────────────────────────────────── */}
       {pageTab === "agent" && (
         <>
-      {/* Agent Evaluation Method Tabs */}
+      {/* Agent Evaluation Method Tabs — Summary + DeepEval (External). G-Eval removed. */}
       <div className="flex gap-1 border-b border-[var(--border)]">
-        {(["combined", "geval", "deepeval"] as const).map(tab => (
+        {(["summary", "deepeval"] as const).map(tab => (
           <button key={tab} onClick={() => setActiveTab(tab)}
             className={`px-4 py-2 text-sm font-medium border-b-2 transition-all ${
               activeTab === tab ? "border-zinc-900 text-zinc-900" : "border-transparent text-[var(--text-muted)] hover:text-[var(--text)]"
             }`}>
-            {tab === "combined" ? "Combined View" : tab === "geval" ? "G-Eval (LLM Judge)" : "DeepEval (External)"}
+            {tab === "summary" ? "Summary" : "DeepEval (External)"}
           </button>
         ))}
       </div>
 
-      {/* Combined View */}
-      {activeTab === "combined" && traces.length > 0 && (
+      {/* Summary View — Rule-Based + DeepEval averages side by side */}
+      {activeTab === "summary" && traces.length > 0 && (
         <div className="space-y-4">
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-2 gap-4">
             {/* Rule-Based */}
             <div className="card">
               <h3 className="text-xs font-medium text-[var(--text-muted)] mb-2">Rule-Based (avg)</h3>
@@ -487,17 +467,6 @@ export default function EvaluationPage() {
                   <ScoreBadge key={s.metric} value={Number(s.score) / 100} label={s.metric} />
                 ))}
               </div>
-            </div>
-            {/* G-Eval */}
-            <div className="card">
-              <h3 className="text-xs font-medium text-[var(--text-muted)] mb-2">G-Eval / LLM Judge (avg)</h3>
-              {hasGEval ? (
-                <div className="grid grid-cols-2 gap-1.5">
-                  {gevalAvgs.filter(s => s.score > 0).map(s => (
-                    <ScoreBadge key={s.metric} value={Number(s.score) / 100} label={s.metric} />
-                  ))}
-                </div>
-              ) : <div className="text-xs text-[var(--text-muted)] py-4 text-center">Click Evaluate to run G-Eval</div>}
             </div>
             {/* DeepEval */}
             <div className="card">
@@ -512,15 +481,14 @@ export default function EvaluationPage() {
             </div>
           </div>
 
-          {/* Cross-Validation Comparison Chart */}
-          {(hasGEval || hasDeepEval) && (
+          {/* Rule-Based vs DeepEval comparison chart */}
+          {hasDeepEval && (
             <div className="card">
-              <h3 className="text-xs text-[var(--text-muted)] mb-2">Cross-Validation: G-Eval vs DeepEval vs Rule-Based</h3>
+              <h3 className="text-xs text-[var(--text-muted)] mb-2">Rule-Based vs DeepEval (External)</h3>
               <ResponsiveContainer width="100%" height={240}>
                 <BarChart data={[
-                  ...ruleAvgs.map(r => ({ metric: r.metric, "Rule-Based": r.score, "G-Eval": 0, "DeepEval": 0 })),
-                  ...gevalAvgs.map(g => ({ metric: g.metric, "Rule-Based": 0, "G-Eval": g.score, "DeepEval": 0 })),
-                  ...deepevalAvgs.map(d => ({ metric: d.metric, "Rule-Based": 0, "G-Eval": 0, "DeepEval": d.score })),
+                  ...ruleAvgs.map(r => ({ metric: r.metric, "Rule-Based": r.score, "DeepEval": 0 })),
+                  ...deepevalAvgs.map(d => ({ metric: d.metric, "Rule-Based": 0, "DeepEval": d.score })),
                 ]}>
                   <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
                   <XAxis dataKey="metric" stroke="var(--text-muted)" fontSize={9} angle={-20} textAnchor="end" height={50} />
@@ -528,48 +496,11 @@ export default function EvaluationPage() {
                   <Tooltip {...tip} />
                   <Legend wrapperStyle={{ fontSize: 10 }} />
                   <Bar dataKey="Rule-Based" fill="#6b7280" radius={[2, 2, 0, 0]} />
-                  <Bar dataKey="G-Eval" fill="#2563eb" radius={[2, 2, 0, 0]} />
                   <Bar dataKey="DeepEval" fill="#7c3aed" radius={[2, 2, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
             </div>
           )}
-        </div>
-      )}
-
-      {/* G-Eval Tab */}
-      {activeTab === "geval" && traces.length > 0 && (
-        <div className="space-y-4">
-          <div className="grid grid-cols-2 gap-4">
-            <div className="card">
-              <h3 className="text-xs text-[var(--text-muted)] mb-2">G-Eval Radar (CoT + Per-Criterion)</h3>
-              <ResponsiveContainer width="100%" height={250}>
-                <RadarChart data={gevalAvgs}>
-                  <PolarGrid stroke="var(--border)" />
-                  <PolarAngleAxis dataKey="metric" tick={{ fontSize: 10, fill: "var(--text-muted)" }} />
-                  <PolarRadiusAxis angle={90} domain={[0, 100]} tick={{ fontSize: 9 }} />
-                  <Radar dataKey="score" stroke="#2563eb" fill="#2563eb" fillOpacity={0.15} strokeWidth={2} />
-                </RadarChart>
-              </ResponsiveContainer>
-            </div>
-            <div className="card">
-              <h3 className="text-xs text-[var(--text-muted)] mb-2">G-Eval Method</h3>
-              <div className="text-xs space-y-2 text-[var(--text-muted)]">
-                <div className="p-2 rounded bg-blue-50 border border-blue-100">
-                  <div className="font-medium text-blue-700 mb-1">Phase 1: CoT Step Generation</div>
-                  <div>Auto-generates evaluation steps from criteria before scoring. Each criterion gets its own reasoning chain.</div>
-                </div>
-                <div className="p-2 rounded bg-blue-50 border border-blue-100">
-                  <div className="font-medium text-blue-700 mb-1">Phase 2: Per-Criterion Scoring</div>
-                  <div>Each criterion evaluated independently (5 parallel LLM calls) to prevent cross-criterion interference.</div>
-                </div>
-                <div className="p-2 rounded bg-blue-50 border border-blue-100">
-                  <div className="font-medium text-blue-700 mb-1">Reasoning Before Score</div>
-                  <div>LLM reasons through evaluation steps before committing to a 1-5 score. Returns both score and explanation.</div>
-                </div>
-              </div>
-            </div>
-          </div>
         </div>
       )}
 
@@ -633,10 +564,7 @@ export default function EvaluationPage() {
           const allTools = flatToolCalls(t);
           const agentTrace = t.agent_trace || t.tool_calls || [];
           const isRichTrace = hasAgentTraceFormat(agentTrace);
-          const gScores = getGEvalScores(t);
-          const gReasoning = getGEvalReasoning(t);
           const dScores = getDeepEvalScores(t);
-          const hasG = Object.keys(gScores).length > 0;
           const hasD = Object.keys(dScores).length > 0;
 
           return (
@@ -730,35 +658,6 @@ export default function EvaluationPage() {
                         </div>
                       </div>
 
-                      {/* G-Eval */}
-                      <div className="px-4 py-2.5">
-                        <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide mb-1.5">
-                          <span className="inline-block w-2 h-2 rounded-full bg-blue-500 mr-1" />G-Eval (CoT + Per-Criterion LLM Judge)
-                        </div>
-                        {hasG ? (
-                          <div className="space-y-2">
-                            <div className="flex gap-1.5 flex-wrap">
-                              {GEVAL_KEYS.map(gk => gScores[gk.key] !== undefined && (
-                                <ScoreBadge key={gk.key} value={gScores[gk.key]} label={gk.label} />
-                              ))}
-                            </div>
-                            {Object.keys(gReasoning).length > 0 && (
-                              <details className="text-[10px]">
-                                <summary className="cursor-pointer text-zinc-500 hover:text-zinc-800 hover:underline">Show G-Eval reasoning</summary>
-                                <div className="mt-1 space-y-1">
-                                  {Object.entries(gReasoning).map(([k, v]) => (
-                                    <div key={k} className="p-1.5 rounded bg-blue-50 border border-blue-100">
-                                      <div className="font-medium text-blue-700 capitalize">{k.replace(/_/g, " ")}</div>
-                                      <div className="text-[var(--text-muted)] mt-0.5">{String(v).slice(0, 300)}</div>
-                                    </div>
-                                  ))}
-                                </div>
-                              </details>
-                            )}
-                          </div>
-                        ) : <div className="text-[10px] text-[var(--text-muted)]">Not yet evaluated</div>}
-                      </div>
-
                       {/* DeepEval */}
                       <div className="px-4 py-2.5">
                         <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide mb-1.5">
@@ -787,28 +686,6 @@ export default function EvaluationPage() {
                           </div>
                         ) : <div className="text-[10px] text-[var(--text-muted)]">Not yet evaluated</div>}
                       </div>
-
-                      {/* Cross-Validation Insight */}
-                      {hasG && hasD && (
-                        <div className="px-4 py-2.5">
-                          <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide mb-1.5">Cross-Validation Insight</div>
-                          {(() => {
-                            const gOverall = t.eval_scores?.geval_overall || 0;
-                            const dAvg = Object.values(dScores as Record<string, number>).reduce((a: number, b: number) => a + b, 0) / Math.max(Object.keys(dScores).length, 1);
-                            const gap = Math.abs(gOverall - dAvg);
-                            const biasFlag = gOverall > dAvg + 0.15;
-                            return (
-                              <div className={`p-2 rounded border text-xs ${biasFlag ? "bg-amber-50 border-amber-200 text-amber-800" : "bg-emerald-50 border-emerald-200 text-emerald-800"}`}>
-                                {biasFlag ? (
-                                  <div><span className="font-medium">Self-evaluation bias detected.</span> G-Eval ({(gOverall * 100).toFixed(0)}%) rated significantly higher than DeepEval ({(dAvg * 100).toFixed(0)}%). Gap: {(gap * 100).toFixed(0)}%. The agent may be overrating its own output quality.</div>
-                                ) : (
-                                  <div><span className="font-medium">Scores aligned.</span> G-Eval ({(gOverall * 100).toFixed(0)}%) and DeepEval ({(dAvg * 100).toFixed(0)}%) are consistent. Gap: {(gap * 100).toFixed(0)}%.</div>
-                                )}
-                              </div>
-                            );
-                          })()}
-                        </div>
-                      )}
 
                       {/* Meta */}
                       <div className="px-4 py-2.5">

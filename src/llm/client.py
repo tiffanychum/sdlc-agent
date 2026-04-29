@@ -55,23 +55,6 @@ def get_judge_llm(temperature: float = 0.0, max_tokens: int | None = None) -> Ch
     return get_llm(model=config.llm.judge_model, temperature=temperature, max_tokens=max_tokens)
 
 
-def get_rubric_judge_llm(
-    temperature: float = 0.0,
-    max_tokens: int | None = 8000,
-) -> ChatOpenAI:
-    """Opus-class judge for pairwise A/B output-quality analysis.
-
-    Separate from `get_judge_llm` so DeepEval / G-Eval scoring keeps its pinned
-    cheaper model while the A/B rubric judge can use Opus for better pairwise
-    reasoning — at user-triggered (not automatic) cost only.
-    """
-    return get_llm(
-        model=config.llm.rubric_judge_model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-
-
 def get_rca_llm(temperature: float = 0.0, max_tokens: int | None = None) -> ChatOpenAI:
     """LLM used for root-cause analysis on regression failures."""
     return get_llm(model=config.llm.rca_model, temperature=temperature, max_tokens=max_tokens)

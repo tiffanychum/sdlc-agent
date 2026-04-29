@@ -36,3 +36,7 @@ requests>=2.31.0
 numpy>=1.26.0
 # Optional: Voyage AI embeddings (best for code)
 # voyageai>=0.3.0
+# Finance Team — yfinance + stockstats back the finance MCP server
+# (no API key required; throttled by Yahoo so we 60s-cache at the tool layer).
+yfinance>=0.2.40
+stockstats>=0.6.0

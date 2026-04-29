@@ -76,22 +76,23 @@ export default function MonitoringPage() {
   const [promptAbLoading, setPromptAbLoading] = useState(false);
 
   const loadAll = useCallback(async () => {
-    try { const s = await api.traces.stats(); setStats(s); } catch { /* ignore */ }
-    try { const t = await api.traces.list(50); setTraces(t); } catch { /* ignore */ }
-    try { const o = await api.otel.spanStats(30); setOtelStats(o); } catch { /* ignore */ }
-    try { const e = await api.eval.runs(); setEvalRuns(e); } catch { /* ignore */ }
+    // Every fetch is now scoped to the currently-selected team so the
+    // dashboard reflects ONLY that team's traces / OTel spans / eval runs.
+    try { const s = await api.traces.stats(30, teamId || undefined); setStats(s); } catch { /* ignore */ }
+    try { const t = await api.traces.list(50, teamId || undefined); setTraces(t); } catch { /* ignore */ }
+    try { const o = await api.otel.spanStats(30, teamId || undefined); setOtelStats(o); } catch { /* ignore */ }
+    try { const e = await api.eval.runs(teamId || undefined); setEvalRuns(e); } catch { /* ignore */ }
     try { const r = await (api as any).rag.stats(30); setRagStats(r); } catch { /* ignore */ }
-  }, []);
+  }, [teamId]);
 
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
   const loadPerfReport = useCallback(async (days: number) => {
     try {
-      const res = await fetch(`${API_BASE}/api/traces/performance-report?days=${days}`);
-      const data = await res.json();
+      const data = await api.traces.perfReport(days, teamId || undefined);
       setPerfReport(data);
     } catch { /* ignore */ }
-  }, [API_BASE]);
+  }, [teamId]);
 
   const loadRegressionInsights = useCallback(async () => {
     try {
@@ -103,15 +104,14 @@ export default function MonitoringPage() {
 
   const loadAllEvalRuns = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/eval/runs`);
-      const data = await res.json();
+      const data = await api.eval.runs(teamId || undefined);
       setAllEvalRuns(data);
       if (data.length >= 2) {
         setAbRunA(data[1]?.id || "");
         setAbRunB(data[0]?.id || "");
       }
     } catch { /* ignore */ }
-  }, [API_BASE]);
+  }, [teamId]);
 
   const runAbCompare = useCallback(async () => {
     if (!abRunA || !abRunB) return;
@@ -283,6 +283,10 @@ export default function MonitoringPage() {
     tokens_in: data.tokens_in || 0,
     tokens_out: data.tokens_out || 0,
     cost: data.cost || 0,
+    tokens_per_sec: data.tokens_per_sec || 0,
+    avg_latency_ms: data.avg_latency_ms || 0,
+    error_rate: data.error_rate || 0,
+    raw_aliases: (data.raw_aliases || []) as string[],
     color: MODEL_COLORS[i % MODEL_COLORS.length],
   })).filter(m => m.model && m.model !== "") : [], [otelStats]);
 
@@ -510,7 +514,11 @@ export default function MonitoringPage() {
           {modelData.length > 0 && (
               <div className="card">
               <h2 className="text-sm font-medium mb-0.5">Per-Model Performance</h2>
-              <p className="text-[11px] text-[var(--text-muted)] mb-3">Aggregated cost, token usage and call volume per LLM model (30-day window)</p>
+              <p className="text-[11px] text-[var(--text-muted)] mb-3">
+                Aggregated cost, token usage, throughput and call volume per LLM model
+                (30-day window). Differently-spelled aliases of the same model
+                (e.g. <code>claude-sonnet-4-6</code>, <code>claude-sonnet-4.6</code>) are merged.
+              </p>
               <div className="overflow-x-auto">
                     <table className="w-full text-xs">
                       <thead>
@@ -519,26 +527,39 @@ export default function MonitoringPage() {
                       <th className="text-right px-3 py-2">LLM Calls</th>
                       <th className="text-right px-3 py-2">Tokens In</th>
                       <th className="text-right px-3 py-2">Tokens Out</th>
+                      <th className="text-right px-3 py-2" title="Output tokens / total decode time, per model">Tokens / sec</th>
                       <th className="text-right px-3 py-2">Total Cost</th>
                       <th className="text-right px-3 py-2">Cost/Call</th>
                       <th className="px-3 py-2">Distribution</th>
                         </tr>
                       </thead>
                       <tbody>
-                    {modelData.map((m, i) => {
+                    {modelData.map((m) => {
                       const totalCalls = modelData.reduce((s, x) => s + x.count, 0);
                       const pct = totalCalls > 0 ? m.count / totalCalls : 0;
+                      const consolidated = (m.raw_aliases || []).length > 1;
                       return (
                         <tr key={m.model} className="border-t border-[var(--border)]">
                             <td className="px-3 py-2">
                             <div className="flex items-center gap-2">
                               <span className="w-2.5 h-2.5 rounded-sm" style={{ background: m.color }} />
                               <span className="font-mono">{m.shortModel}</span>
+                              {consolidated && (
+                                <span
+                                  className="px-1 py-0.5 rounded text-[9px] bg-amber-50 text-amber-700 border border-amber-200"
+                                  title={`Merged from ${m.raw_aliases.length} aliases: ${m.raw_aliases.join(", ")}`}
+                                >
+                                  ⤳ {m.raw_aliases.length}
+                                </span>
+                              )}
                             </div>
                             </td>
                           <td className="text-right px-3 py-2 font-semibold">{m.count.toLocaleString()}</td>
                           <td className="text-right px-3 py-2">{m.tokens_in.toLocaleString()}</td>
                           <td className="text-right px-3 py-2">{m.tokens_out.toLocaleString()}</td>
+                          <td className="text-right px-3 py-2 font-mono">
+                            {m.tokens_per_sec > 0 ? m.tokens_per_sec.toFixed(1) : "—"}
+                          </td>
                           <td className="text-right px-3 py-2 font-semibold">${m.cost.toFixed(4)}</td>
                           <td className="text-right px-3 py-2">${m.count > 0 ? (m.cost / m.count).toFixed(5) : "—"}</td>
                           <td className="px-3 py-2">
@@ -669,6 +690,91 @@ export default function MonitoringPage() {
                                     </tr>
                           </tbody>
                         </table>
+
+            {/* Top-N error breakdown — expanded view of the Error Rate row */}
+            {((otelStats?.top_errors?.length || 0) > 0 || (otelStats?.hitl_pause_spans || 0) > 0) && (
+              <div className="mt-4 grid grid-cols-2 gap-4">
+                <div>
+                  <div className="flex items-baseline justify-between mb-1.5">
+                    <h3 className="text-xs font-medium">Top 10 Errors</h3>
+                    <span className="text-[10px] text-[var(--text-muted)] tabular-nums">
+                      {otelStats?.error_spans || 0} real ·{" "}
+                      <span className="text-amber-600">
+                        {(otelStats?.hitl_pause_spans || 0).toLocaleString()} HITL pauses excluded
+                      </span>
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-[var(--text-muted)] mb-2">
+                    Real exceptions only. HITL <code>action_confirmation</code> /
+                    <code> plan_review</code> pauses are surfaced separately — they're
+                    waiting on a user, not failures.
+                  </p>
+                  <div className="space-y-1">
+                    {(otelStats.top_errors as any[]).length === 0 && (
+                      <div className="text-[10px] text-[var(--text-muted)] py-3 text-center bg-emerald-50 border border-emerald-100 rounded">
+                        No real errors in this window — all <code>status=error</code> spans
+                        were HITL pauses awaiting user confirmation.
+                      </div>
+                    )}
+                    {(otelStats.top_errors as any[]).map((e, i) => {
+                      const totalErrSpans = otelStats.error_spans || 1;
+                      const pct = (e.count / totalErrSpans) * 100;
+                      return (
+                        <div key={i} className="flex items-center gap-2 text-[11px]">
+                          <span className="w-5 text-[var(--text-muted)] text-right">{i + 1}.</span>
+                          <span className="font-mono w-9 text-right tabular-nums font-semibold">{e.count}</span>
+                          <div className="flex-1 min-w-0">
+                            <div className="truncate" title={e.message}>{e.message}</div>
+                            {e.models && e.models.length > 0 && (
+                              <div className="text-[9px] text-[var(--text-muted)] truncate">
+                                models: {e.models.join(", ")}
+                              </div>
+                            )}
+                          </div>
+                          <div className="w-16 h-1.5 bg-gray-100 rounded-full overflow-hidden shrink-0">
+                            <div className="h-full bg-red-400 rounded-full" style={{ width: `${pct}%` }} />
+                          </div>
+                          <span className="text-[9px] text-[var(--text-muted)] w-9 text-right tabular-nums">{pct.toFixed(0)}%</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div>
+                  <h3 className="text-xs font-medium mb-1.5">Top 5 Errors per Model</h3>
+                  <p className="text-[10px] text-[var(--text-muted)] mb-2">
+                    Same categorisation, broken down by the model that produced
+                    the failing span.
+                  </p>
+                  <div className="space-y-2.5">
+                    {Object.entries(otelStats.errors_by_model || {})
+                      .sort(([, a]: any, [, b]: any) =>
+                        (b as any[]).reduce((s, e) => s + e.count, 0) -
+                        (a as any[]).reduce((s, e) => s + e.count, 0))
+                      .map(([model, errs]) => (
+                        <div key={model}>
+                          <div className="text-[10px] font-mono font-semibold">{model}</div>
+                          <div className="space-y-0.5 ml-2">
+                            {(errs as any[]).slice(0, 5).map((e, i) => (
+                              <div key={i} className="flex items-center gap-2 text-[10px]">
+                                <span className="font-mono w-7 text-right tabular-nums text-zinc-500">{e.count}</span>
+                                <span className="truncate flex-1" title={e.message}>{e.message}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    {Object.keys(otelStats.errors_by_model || {}).length === 0 && (
+                      <div className="text-[10px] text-[var(--text-muted)]">
+                        No errors with a known model attribution. Errors without a
+                        model are usually graph-level (routing, supervisor, plan-review).
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
                       </div>
 
           {/* Quality Trends */}
@@ -729,11 +835,15 @@ export default function MonitoringPage() {
       {activeTab === "otel" && (
         <div className="space-y-4">
           {/* KPIs */}
-          <div className="grid grid-cols-5 gap-3">
+          <div className="grid grid-cols-6 gap-3">
             <Metric label="Total Spans" value={String(otelStats?.total_spans || 0)} sub="Across all traces" />
             <Metric label="Total Traces" value={String(otelStats?.total_traces || 0)} />
             <Metric label="Error Spans" value={String(otelStats?.error_spans || 0)}
+              sub="Real exceptions only"
               accent={(otelStats?.error_spans || 0) > 0 ? "text-red-600" : "text-emerald-600"} />
+            <Metric label="HITL Pauses" value={(otelStats?.hitl_pause_spans || 0).toLocaleString()}
+              sub="Awaiting user confirmation"
+              accent="text-amber-600" />
             <Metric label="Span Types" value={String(spanTypeData.length)} sub="llm, tool, routing, etc." />
             <Metric label="Models Seen" value={String(modelData.length)}
               sub={modelData.slice(0, 2).map(m => m.shortModel).join(", ")} />

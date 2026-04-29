@@ -115,16 +115,42 @@ class ChromaStore:
         after = self._col.count()
         return max(0, before - after)
 
-    def list_sources(self) -> list[dict]:
-        """Return [{source, count}] grouped by the 'source' metadata field."""
-        # chromadb has no group-by, so pull metadatas and tally in memory.
-        # Good enough for dev / prototyping scale; for huge stores we'd
-        # paginate with .get(offset=,limit=).
-        got = self._col.get(include=["metadatas"])
+    def list_sources(self, *, page_size: int = 5000) -> list[dict]:
+        """Return [{source, count}] grouped by the 'source' metadata field.
+
+        Streams metadata in pages so a 1M-row collection doesn't blow up
+        process memory on a single ``.get()`` call. Each page only pulls
+        the ``metadatas`` projection — no embeddings or documents.
+        """
+        page_size = max(100, int(page_size))
         buckets: dict[str, int] = {}
-        for m in got.get("metadatas") or []:
-            s = str((m or {}).get("source", ""))
-            buckets[s] = buckets.get(s, 0) + 1
+        offset = 0
+        try:
+            total = self._col.count()
+        except Exception:
+            total = None
+        while True:
+            try:
+                got = self._col.get(include=["metadatas"], limit=page_size, offset=offset)
+            except TypeError:
+                # very old chroma versions — fall back to a single get()
+                got = self._col.get(include=["metadatas"])
+                metas = got.get("metadatas") or []
+                for m in metas:
+                    s = str((m or {}).get("source", ""))
+                    buckets[s] = buckets.get(s, 0) + 1
+                break
+            metas = got.get("metadatas") or []
+            if not metas:
+                break
+            for m in metas:
+                s = str((m or {}).get("source", ""))
+                buckets[s] = buckets.get(s, 0) + 1
+            offset += len(metas)
+            if total is not None and offset >= total:
+                break
+            if len(metas) < page_size:
+                break
         return [{"source": k, "count": v} for k, v in sorted(buckets.items())]
 
     def count(self) -> int:

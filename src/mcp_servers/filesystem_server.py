@@ -299,17 +299,12 @@ async def list_tools():
 
 
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    """Invoke a tool by name and return MCP-protocol TextContent results.
-
-    Ensures that a state record is appended even if the tool raises before
-    producing content, by always constructing a TextContent list.
-    """
+    """Invoke a tool by name and return MCP-protocol TextContent results."""
     try:
         result = await mcp.call_tool(name, arguments)
         text = result.content[0].text if result.content else "Done"
         state.record(name, arguments, text, success=True)
-        # Always return at least one TextContent entry for symmetry with error path
-        return list(result.content) if result.content else [TextContent(type="text", text=text)]
+        return list(result.content)
     except Exception as e:
         error_msg = f"Error in {name}: {str(e)}"
         state.record(name, arguments, error_msg, success=False)

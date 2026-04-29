@@ -9,7 +9,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Column, String, Text, Float, Integer, Boolean,
-    DateTime, ForeignKey, JSON, UniqueConstraint,
+    DateTime, ForeignKey, JSON,
 )
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -31,6 +31,11 @@ class Team(Base):
     decision_strategy = Column(
         String, default="router_decides",
     )
+    # Free-form per-team config blob. Used by strategies that need extra
+    # parameters (e.g. parallel_coordinator → coordinator_role / finalizer_role
+    # / parallel_pool / max_parallel) and by the regression engine to scope
+    # which dataset_groups apply to this team.
+    config_json = Column(JSON, default=dict)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     agents = relationship("Agent", back_populates="team", cascade="all, delete-orphan")
@@ -176,9 +181,14 @@ class GoldenTestCase(Base):
     complexity = Column(String, default="quick")
     version = Column(String, default="1.0")
     reference_output = Column(Text, default="")
-    # "auto", "supervisor", "sequential", "parallel", "router_decides", or None (team default)
+    # "auto", "supervisor", "sequential", "parallel", "parallel_coordinator",
+    # "router_decides", or None (team default)
     strategy = Column(String, nullable=True)
     expected_strategy = Column(String, nullable=True)
+    # Dataset group this case belongs to. Teams subscribe to one or many
+    # groups via Team.config_json["dataset_groups"]. Defaults to "default"
+    # so legacy cases stay fully backward-compatible.
+    dataset_group = Column(String, default="default", index=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -228,43 +238,6 @@ class RegressionResult(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     eval_run = relationship("EvalRun", back_populates="regression_results")
-
-
-# ── Adaptive A/B Judge Cache ─────────────────────────────────────
-#
-# One row per (run_a, run_b, golden_id) judgment. Keeps Opus-level pairwise
-# analyses reproducible + cheap on re-view. Use the ↻ button in the UI to
-# re-run a judgement; UniqueConstraint prevents duplicate cache entries.
-
-class ABJudgeResult(Base):
-    __tablename__ = "ab_judge_results"
-
-    id = Column(String, primary_key=True, default=_uuid)
-    run_a = Column(String, nullable=False, index=True)
-    run_b = Column(String, nullable=False, index=True)
-    golden_id = Column(String, nullable=False, index=True)
-    judge_model = Column(String, nullable=False)
-
-    # Convenience fields (denormalised from payload for quick lookups)
-    winner = Column(String, nullable=True)            # "A" | "B" | "tie"
-    confidence = Column(Float, nullable=True)
-    rubric_score_a = Column(Float, nullable=True)
-    rubric_score_b = Column(Float, nullable=True)
-
-    # Full judge JSON — task_dimensions / per_dimension / gap_analysis / verdict
-    payload = Column(JSON, nullable=False)
-
-    # Cross-team flag: true when run_a.team_id != run_b.team_id at judge time
-    cross_team = Column(Boolean, default=False)
-    team_a = Column(String, nullable=True)
-    team_b = Column(String, nullable=True)
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    __table_args__ = (
-        UniqueConstraint("run_a", "run_b", "golden_id", name="uq_ab_judge_triplet"),
-    )
 
 
 # ── RAG Pipeline ─────────────────────────────────────────────────
@@ -367,14 +340,6 @@ class PromptVersionEntry(Base):
     __tablename__ = "prompt_version_entries"
 
     id = Column(String, primary_key=True, default=_uuid)
-    # team_id scopes the prompt to a specific Team.id, or NULL for "global".
-    # Agent-role prompts (coder, qa, …) are currently stored globally.  The
-    # orchestration roles (supervisor, router) are seeded per-team on the
-    # first orchestrator build so each team can evolve them independently
-    # (dev team's `supervisor` uses the full 5-step pipeline template,
-    # sdlc_2_0's `supervisor` uses the 2-agent template).  meta_router
-    # remains global because its text is already team-agnostic.
-    team_id = Column(String, nullable=True, index=True)
     role = Column(String, nullable=False, index=True)       # e.g. "coder"
     version = Column(String, nullable=False)                # e.g. "v1", "v2"
     prompt_text = Column(Text, nullable=False)
@@ -386,6 +351,9 @@ class PromptVersionEntry(Base):
     created_by = Column(String, default="seed")             # seed | optimizer | human
     is_active = Column(Boolean, default=True)
     notes = Column(Text, default="")
+    # Optional team scoping. None = global (shared across teams). Set when a
+    # team registers a custom prompt that should not affect other teams.
+    team_id = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -408,52 +376,3 @@ class PromptFeedback(Base):
     overall_pass = Column(Boolean, default=True)
     embedding_text = Column(Text, default="")               # text indexed in ChromaDB
     created_at = Column(DateTime, default=datetime.utcnow)
-
-
-# ── No-Code Workflow Builder ─────────────────────────────────────
-
-class WorkflowDefinition(Base):
-    """LangFlow-style DAG definition for a RAG / GenAI workflow.
-
-    The `graph_json` payload is the exact shape React Flow emits on the
-    frontend: `{"nodes": [...], "edges": [...]}`.  Nodes carry their own
-    `type` + `data` (typed config) so the server-side executor can dispatch
-    without needing a parallel schema.  See `src/workflow/schema.py` for
-    the pydantic validators and `src/workflow/executor.py` for the layered
-    topological runner.
-    """
-    __tablename__ = "workflow_definitions"
-
-    id = Column(String, primary_key=True, default=_uuid)
-    team_id = Column(String, nullable=True, index=True)     # None = global / shared
-    name = Column(String, nullable=False)
-    description = Column(Text, default="")
-    graph_json = Column(JSON, nullable=False, default=dict) # {"nodes": [...], "edges": [...]}
-    is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    runs = relationship("WorkflowRun", back_populates="workflow", cascade="all, delete-orphan")
-
-
-class WorkflowRun(Base):
-    """One execution of a WorkflowDefinition.
-
-    Records the ingest-or-query mode, the user-supplied input, the final
-    output, and a per-node log (with timings + output previews) so the
-    Studio UI can render a post-run trace without re-executing.
-    """
-    __tablename__ = "workflow_runs"
-
-    id = Column(String, primary_key=True, default=_uuid)
-    workflow_id = Column(String, ForeignKey("workflow_definitions.id"), nullable=False, index=True)
-    mode = Column(String, nullable=False)                   # "ingest" | "query"
-    status = Column(String, default="running")              # running | success | error
-    input_json = Column(JSON, default=dict)                 # user-supplied input
-    output_json = Column(JSON, default=dict)                # final node's output (answer / ingest stats)
-    node_log_json = Column(JSON, default=list)              # [{node_id, node_type, status, duration_ms, preview, ...}]
-    error = Column(Text, nullable=True)
-    duration_ms = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    workflow = relationship("WorkflowDefinition", back_populates="runs")

@@ -456,10 +456,15 @@ class TraceAnalyzer:
         since = datetime.utcnow() - timedelta(days=days)
         spans = self._load_spans(since=since, span_type="llm_call")
 
-        # Group token_in values by model
+        # Group token_in values by model. Normalise so multiple spellings
+        # of the same model don't produce separate context-utilisation
+        # rows in the dashboard.
+        from src.utils.model_names import normalize_model_name
+
         by_model: dict[str, list[int]] = {}
         for s in spans:
-            model = s["model"] or "default"
+            raw = s["model"] or "default"
+            model = normalize_model_name(raw) or "default"
             if s["tokens_in"] > 0:
                 by_model.setdefault(model, []).append(s["tokens_in"])
 
@@ -524,11 +529,17 @@ class TraceAnalyzer:
             ) if stats["count"] else 0.0
             stats["total_cost_usd"] = round(stats["total_cost_usd"], 6)
 
-        # Per-model breakdown from spans
+        # Per-model breakdown from spans. We normalise the model name so
+        # different spellings of the same underlying model (e.g.
+        # "claude-sonnet-4-6" and "claude-sonnet-4.6") collapse into one
+        # row, matching what the OTel Observability tab shows.
+        from src.utils.model_names import normalize_model_name
+
         spans = self._load_spans(since=since, span_type="llm_call")
         by_model: dict[str, dict] = {}
         for s in spans:
-            model = s["model"] or "unknown"
+            raw = s["model"] or "unknown"
+            model = normalize_model_name(raw) or "unknown"
             if model not in by_model:
                 by_model[model] = {"total_cost_usd": 0.0, "calls": 0}
             by_model[model]["total_cost_usd"] += s["cost"]

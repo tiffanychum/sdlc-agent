@@ -289,23 +289,40 @@ def _extract_tool_calls_from_trace(agent_trace: list[dict]) -> list[dict]:
 
 
 def _extract_plan_from_trace(agent_trace: list[dict]) -> str:
-    """Extract plan steps from agent trace if a planner was used."""
+    """Extract plan steps from agent trace if a planner was used.
+
+    The agent label can take several forms across teams (``planner``,
+    ``planner_v2``, ``Planner``, ``planner-builder/planner`` …) — what
+    actually identifies a plan is the ``create_plan`` /
+    ``update_plan_step`` tool call. So we key off the tool name and only
+    use the agent string as a tie-breaker.
+    """
     plan_parts: list[str] = []
     for entry in (agent_trace or []):
-        if entry.get("step") == "execution" and entry.get("agent") == "planner":
-            for tc in entry.get("tool_calls", []):
-                if tc.get("tool") == "create_plan":
-                    steps = tc.get("args", {}).get("steps", [])
-                    for s in steps:
-                        if isinstance(s, dict):
-                            plan_parts.append(str(s.get("step", s)))
-                        else:
-                            plan_parts.append(str(s))
-                elif tc.get("tool") == "update_plan_step":
-                    step_name = tc.get("args", {}).get("step_name", "")
-                    status = tc.get("args", {}).get("status", "")
-                    if step_name:
-                        plan_parts.append(f"[{status}] {step_name}")
+        if entry.get("step") != "execution":
+            continue
+        agent_label = str(entry.get("agent") or "").lower()
+        for tc in entry.get("tool_calls", []):
+            tool_name = str(tc.get("tool") or "")
+            if tool_name == "create_plan":
+                steps = tc.get("args", {}).get("steps", [])
+                for s in steps:
+                    if isinstance(s, dict):
+                        plan_parts.append(str(s.get("step", s)))
+                    else:
+                        plan_parts.append(str(s))
+            elif tool_name == "update_plan_step":
+                step_name = tc.get("args", {}).get("step_name", "")
+                status = tc.get("args", {}).get("status", "")
+                if step_name:
+                    plan_parts.append(f"[{status}] {step_name}")
+            else:
+                continue
+            # If we ever surface plan steps from a non-planner agent, the
+            # downstream judge sees the agent label too; we don't filter
+            # by `agent_label` so non-standard planner names ("planner_v2",
+            # "Planner Agent", etc.) still produce a plan.
+            _ = agent_label  # retained for potential debug logging
     return "\n".join(plan_parts) if plan_parts else ""
 
 

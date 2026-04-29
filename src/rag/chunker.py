@@ -206,11 +206,14 @@ def chunk_documents(
         pages: output of load_source()
         chunk_size: max characters per chunk
         chunk_overlap: characters of overlap between consecutive chunks
-        strategy: "recursive" | "fixed" | "semantic" | "code"
+        strategy: "recursive" | "fixed" | "semantic" | "code" | "parent_child"
 
     Returns:
         List of Chunk objects ready for embedding.
     """
+    if strategy == "parent_child":
+        return _parent_child_chunks(pages, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
     all_chunks: list[Chunk] = []
 
     for page_text, meta in pages:
@@ -242,3 +245,64 @@ def chunk_documents(
             ))
 
     return all_chunks
+
+
+# ── Parent-child hierarchical chunking ────────────────────────────────────────
+#
+# Why parent-child for large corpora:
+#   * Embed *small* children → high precision retrieval, no semantic dilution.
+#   * Carry the surrounding *parent* text in metadata → the LLM still sees full
+#     context at generation time without requiring two index lookups.
+#
+# This is the same pattern LangChain's `ParentDocumentRetriever` uses, kept
+# intentionally simple here so we don't pull in another LangChain abstraction
+# just to glue parents and children together.
+
+def _parent_child_chunks(
+    pages: list[tuple[str, dict]],
+    chunk_size: int = 1000,
+    chunk_overlap: int = 200,
+    parent_multiplier: int = 4,
+) -> list[Chunk]:
+    """Build child chunks tagged with their parent's text and id.
+
+    Parent size = chunk_size * parent_multiplier (default 4×). Each child is
+    a recursive sub-split of one parent. The parent text and id ride along in
+    `metadata` so the retrieval layer can return either the child snippet or
+    the wider parent context for generation.
+    """
+    parent_size = max(chunk_size * 2, chunk_size * parent_multiplier)
+    parent_overlap = min(parent_size // 4, chunk_overlap * 2)
+
+    parent_splitter = _get_recursive_splitter(parent_size, parent_overlap)
+    child_splitter = _get_recursive_splitter(chunk_size, chunk_overlap)
+
+    all_children: list[Chunk] = []
+
+    for page_text, meta in pages:
+        if not page_text.strip():
+            continue
+        source = meta.get("source", "text")
+        parents = [p.strip() for p in parent_splitter.split_text(page_text) if p.strip()]
+        for p_idx, parent_text in enumerate(parents):
+            parent_id = f"{source}::p{p_idx}"
+            children = [c.strip() for c in child_splitter.split_text(parent_text) if c.strip()]
+            for c_idx, child_text in enumerate(children):
+                all_children.append(Chunk(
+                    text=child_text,
+                    source=source,
+                    chunk_index=c_idx,
+                    total_chunks=len(children),
+                    page=meta.get("page"),
+                    metadata={
+                        **meta,
+                        "chunk_strategy": "parent_child",
+                        "parent_id": parent_id,
+                        "parent_index": p_idx,
+                        # Cap parent text in metadata to keep payloads manageable
+                        # (Chroma metadata is stored as JSON in SQLite-backed mode).
+                        "parent_text": parent_text[:4000],
+                    },
+                ))
+
+    return all_children
