@@ -9,62 +9,10 @@ cost/latency regressions.
 
 import asyncio
 import logging
-import re
 import time
 import uuid
 from datetime import datetime
 from typing import AsyncIterator, Callable, Awaitable
-
-# ── Regression-mode HITL auto-confirm (Fix #2) ────────────────────────────
-# Some agents end a turn with a plain-text confirmation prompt ("Shall I
-# proceed with step 2?", "Please confirm before I push", etc.) instead of
-# calling ask_human.  In interactive chat the user answers; in regression
-# mode the graph terminates and we record the task as incomplete.
-#
-# When that signature is detected at the end of a run, we inject ONE
-# deterministic "Yes, proceed" message and re-invoke the graph.  Capped at
-# one retry per case so we can never loop.
-# Quote-char class covering straight + smart/curly quotes (Claude & GPT both
-# use curly quotes in natural prose).  [" ' " ' " ]  ↓
-_Q = "['\"\u2018\u2019\u201c\u201d\u2032\u2033]"
-_CONFIRM_TRIGGERS = (
-    re.compile(r"\bshall i (proceed|execute|continue|run|do)\b", re.I),
-    re.compile(r"\bshould i (proceed|execute|continue|run|do)\b", re.I),
-    re.compile(r"\bdo you want me to (proceed|continue|execute|run)\b", re.I),
-    # "Please confirm ..." in any common framing (including "or adjust")
-    re.compile(r"\bplease confirm\b", re.I),
-    re.compile(r"\bawait(ing)? (your )?confirmation\b", re.I),
-    # Reply "Yes" / reply yes / reply with yes — straight or curly quotes.
-    # Also handle "Reply 'Approved'" (past tense) and "approve" alone.
-    re.compile(rf"\breply (with )?{_Q}?(yes|proceed|confirm|approv(e|ed))\b", re.I),
-    # "If approved, I will ..." and "Approved?" variants used by gpt-5
-    re.compile(r"\bif approved,?\s*i['\u2019]?ll\b", re.I),
-    re.compile(r"\bif approved,?\s*i will\b", re.I),
-    re.compile(r"\bconfirm (this )?(plan|before proceeding|and i will)\b", re.I),
-    re.compile(r"\bwould you like me to (proceed|continue|execute|run)\b", re.I),
-    # Cursor/OpenCode-style plan-approval gate: "Approve this plan?" / "A) Approve"
-    re.compile(r"\bapprove (this )?plan\b", re.I),
-    re.compile(r"^\s*A\)\s*Approve\b", re.I | re.M),
-    re.compile(r"\bproceed\?\s*$", re.I | re.M),
-)
-
-
-def _looks_like_hitl_wait(messages: list) -> bool:
-    """True when the run ended on a plain-text confirmation question with no
-    tool_calls attached (i.e. the agent asked the user a question instead of
-    calling ask_human).  Only checks the LAST AIMessage.
-    """
-    from langchain_core.messages import AIMessage
-    if not messages:
-        return False
-    last = messages[-1]
-    if not isinstance(last, AIMessage):
-        return False
-    if getattr(last, "tool_calls", None):
-        return False
-    text = _extract_text(last.content if hasattr(last, "content") else "") or ""
-    tail = text[-1500:]  # scan end of message — that's where the question lives
-    return any(p.search(tail) for p in _CONFIRM_TRIGGERS)
 
 from src.db.database import get_session
 
@@ -94,28 +42,35 @@ _GOLDEN_EXTRAS_CACHE: dict[str, dict] | None = None
 
 
 def _load_golden_extras() -> dict[str, dict]:
-    """Read golden_dataset.json and return a dict keyed by case id with the
-    extras fields we care about (teams / safety / category / team_skip_reason).
-    Result is cached for the process lifetime — the JSON is git-tracked source
-    of truth so reloading would only matter on hot-edit (developer flow).
+    """Read every known golden JSON (SDLC + extra groups like finance) and
+    return a dict keyed by case id with the extras fields we care about
+    (teams / safety / category / team_skip_reason / dataset_group).
+
+    Result is cached for the process lifetime — the JSON files are
+    git-tracked sources of truth so reloading would only matter on
+    hot-edit (developer flow).
     """
     global _GOLDEN_EXTRAS_CACHE
     if _GOLDEN_EXTRAS_CACHE is not None:
         return _GOLDEN_EXTRAS_CACHE
     try:
-        from src.evaluation.golden import load_golden_dataset
-        raw = load_golden_dataset()
+        from src.evaluation.golden import load_all_grouped_datasets
+        rows = load_all_grouped_datasets()
     except Exception as e:
-        logger.warning("Could not read golden_dataset.json for extras: %s", e)
+        logger.warning("Could not read golden datasets for extras: %s", e)
         _GOLDEN_EXTRAS_CACHE = {}
         return _GOLDEN_EXTRAS_CACHE
     out: dict[str, dict] = {}
-    for c in raw or []:
+    for c, group in rows or []:
         cid = c.get("id")
         if not cid:
             continue
         out[cid] = {
-            "teams": c.get("teams") or ["default", "sdlc_2_0"],
+            # Keep ``teams`` if explicitly authored, but no longer hard-code a
+            # default — cross-team gating is delegated to the dataset_group
+            # subscription check in ``_is_case_team_compatible``.
+            "teams": c.get("teams") or [],
+            "dataset_group": c.get("dataset_group") or group or "sdlc_v2",
             "safety": c.get("safety") or {},
             "category": c.get("category") or "uncategorised",
             "team_skip_reason": c.get("team_skip_reason") or "",
@@ -128,14 +83,62 @@ def _case_extras(case_id: str) -> dict:
     return _load_golden_extras().get(case_id, {})
 
 
+def _team_subscribes_to_group(team_id: str, group: str) -> bool:
+    """True if ``team`` subscribes to ``group`` via Team.config_json, OR if
+    the team has no subscription configured (legacy: see every group).
+    """
+    from src.db.database import get_session
+    from src.db.models import Team
+    session = get_session()
+    try:
+        t = session.query(Team).filter_by(id=team_id).one_or_none()
+        if t is None:
+            return True  # unknown team — don't block; the orchestrator will fail loudly
+        cfg = dict(t.config_json or {})
+        groups = cfg.get("dataset_groups")
+        if not groups:
+            # Legacy team with no subscription — keep historical behaviour and
+            # only run the canonical SDLC group, otherwise we'd dump finance
+            # cases into the SDLC team's regression list.
+            return group == "sdlc_v2"
+        return group in [str(g) for g in groups]
+    finally:
+        session.close()
+
+
 def _is_case_team_compatible(case_id: str, team_id: str) -> tuple[bool, str]:
-    """Return (is_compatible, reason-if-incompatible)."""
+    """Return (is_compatible, reason-if-incompatible).
+
+    A case is compatible with a team when EITHER:
+      - the case explicitly lists the team in ``teams: [...]``, OR
+      - the team subscribes (via ``config_json["dataset_groups"]``) to the
+        case's ``dataset_group`` (e.g. ``finance_team`` → ``finance_v1``).
+
+    Cases that omit ``teams`` and live in the legacy ``sdlc_v2`` group are
+    treated as "all SDLC teams" so existing default/sdlc_2_0 regressions
+    behave identically to before.
+    """
     extras = _case_extras(case_id)
-    teams = extras.get("teams") or ["default", "sdlc_2_0"]
-    if team_id in teams:
+    teams = extras.get("teams") or []
+    if teams:
+        if team_id in teams:
+            return True, ""
+        # Explicit team list and our team isn't on it → not compatible.
+        reason = extras.get("team_skip_reason") or (
+            f"case is tagged for teams={teams}, not '{team_id}'"
+        )
+        return False, reason
+
+    group = extras.get("dataset_group") or "sdlc_v2"
+    # Backward-compat: SDLC v2 cases with no teams field stay open to the
+    # historical default + sdlc_2_0 teams even when those teams don't
+    # currently configure a dataset_groups subscription.
+    if group == "sdlc_v2" and team_id in ("default", "sdlc_2_0"):
+        return True, ""
+    if _team_subscribes_to_group(team_id, group):
         return True, ""
     reason = extras.get("team_skip_reason") or (
-        f"case is tagged for teams={teams}, not '{team_id}'"
+        f"case in dataset_group={group!r} is not subscribed by team {team_id!r}"
     )
     return False, reason
 
@@ -208,8 +211,7 @@ class RegressionRunner:
         prompt_version: str = "v1",
         team_id: str = "default",
         prompt_versions_by_role: dict = None,
-        prompt_text_overrides: dict = None,
-        persist: bool = True,
+        dataset_groups: list[str] | None = None,
     ):
         self.model = model or config.llm.model
         self.prompt_version = prompt_version
@@ -217,13 +219,9 @@ class RegressionRunner:
         # Per-role overrides take priority over the global prompt_version.
         # e.g. {"coder": "v3", "planner": "v2"}
         self.prompt_versions_by_role = prompt_versions_by_role or {}
-        # In-memory prompt-text overrides (role -> full prompt text). Used by
-        # the global Prompt Optimizer to validate a candidate prompt WITHOUT
-        # registering it in the DB. Takes precedence over version lookup.
-        self.prompt_text_overrides = prompt_text_overrides or {}
-        # When False, no EvalRun / RegressionResult rows are written — used by
-        # dry-run / in-memory cycle validation to keep the DB clean.
-        self.persist = persist
+        # Optional filter: only golden cases whose ``dataset_group`` is in
+        # this list will be considered. None = legacy / all-groups.
+        self.dataset_groups = list(dataset_groups) if dataset_groups else None
 
     async def run_subset(
         self,
@@ -246,7 +244,7 @@ class RegressionRunner:
         max_parallel: int = 1,
     ) -> dict:
         """Run regression suite on selected golden cases. Returns full results."""
-        cases = get_active_cases(case_ids)
+        cases = get_active_cases(case_ids, dataset_groups=self.dataset_groups)
         if not cases:
             return {"error": "No golden test cases found"}
 
@@ -319,7 +317,6 @@ class RegressionRunner:
                     model_override=self.model or None,
                     strategy_override=strat,
                     prompt_versions_by_role=self.prompt_versions_by_role or None,
-                    prompt_text_overrides=self.prompt_text_overrides or None,
                 )
                 orchestrator_cache[strat] = graph
                 routing_versions_cache[strat] = getattr(
@@ -374,11 +371,7 @@ class RegressionRunner:
             results.extend(gathered)
 
         summary = self._build_summary(run_id, results, cases)
-        if self.persist:
-            # A2: sync SQLAlchemy writes go to a worker thread so a long commit
-            # doesn't block the event loop (other concurrent runs, chat SSE
-            # streams, and health checks keep progressing).
-            await asyncio.to_thread(self._persist, run_id, results, summary)
+        self._persist(run_id, results, summary)
 
         return {
             "run_id": run_id,
@@ -452,7 +445,6 @@ class RegressionRunner:
                     model_override=self.model or None,
                     strategy_override=strat,
                     prompt_versions_by_role=self.prompt_versions_by_role or None,
-                    prompt_text_overrides=self.prompt_text_overrides or None,
                 )
                 orchestrator_cache[strat] = graph
                 routing_versions_cache[strat] = getattr(
@@ -540,9 +532,7 @@ class RegressionRunner:
         await asyncio.gather(*[_run_one(case, i) for i, case in enumerate(cases)])
 
         summary = self._build_summary(run_id, results, cases)
-        if self.persist:
-            # A2: offload SQLAlchemy writes so SSE event delivery stays smooth.
-            await asyncio.to_thread(self._persist, run_id, results, summary)
+        self._persist(run_id, results, summary)
 
         await emit("run_done", {
             "run_id": run_id,
@@ -681,15 +671,7 @@ class RegressionRunner:
         tokens_in, tokens_out, model_used = _extract_token_meta(messages)
         total_cost = estimate_cost(model_used or self.model, tokens_in, tokens_out)
 
-        # A1 + A2: run the two independent eval LLMs concurrently, then push the
-        # sync SQLAlchemy save off the event loop.  See the detailed comment in
-        # `_run_single_case` for why `save()` runs *after* the gather (avoids a
-        # `collector.spans` mutation race with `_run_deepeval`).
-        similarity, deepeval_scores = await asyncio.gather(
-            self._compute_semantic_similarity(case.reference_output, actual_output),
-            self._run_deepeval(case.prompt, actual_output, agent_trace, collector),
-        )
-        await asyncio.to_thread(collector.save)
+        collector.save()
 
         span_data = [s.copy() for s in collector.spans]
         for s in span_data:
@@ -697,6 +679,8 @@ class RegressionRunner:
                 if isinstance(s.get(k), datetime):
                     s[k] = s[k].isoformat()
 
+        similarity = await self._compute_semantic_similarity(case.reference_output, actual_output)
+        deepeval_scores = await self._run_deepeval(case.prompt, actual_output, agent_trace, collector)
         quality_scores: dict = {}
         eval_reasoning: dict = {}
 
@@ -814,50 +798,6 @@ class RegressionRunner:
 
                 result = await orchestrator.ainvoke(resume_cmd, config=config)
 
-            # Fix #2: HITL auto-confirm.  If the graph finished (no interrupts)
-            # but the final AI message is a plain-text confirmation question
-            # — "shall I proceed?", "please confirm", etc. — inject ONE
-            # deterministic approval and re-invoke.  Only runs once per case.
-            try:
-                from langchain_core.messages import HumanMessage as _HM
-                final_msgs = list(result.get("messages", []) or [])
-                if _looks_like_hitl_wait(final_msgs):
-                    logger.info(
-                        "HITL auto-confirm fired for case %s — injecting "
-                        "deterministic approval.", getattr(case, "id", "?"),
-                    )
-                    result = await orchestrator.ainvoke(
-                        {"messages": [*final_msgs, _HM(content=(
-                            "Yes, proceed exactly as planned. Execute now and "
-                            "complete the task end-to-end without asking for "
-                            "further confirmation."
-                        ))]},
-                        config=config,
-                    )
-                    # After the re-invoke we may have generated new interrupts —
-                    # drain up to 5 of them the same way as the main loop above.
-                    for _ in range(5):
-                        state = await orchestrator.aget_state(config)
-                        if not state.next:
-                            break
-                        interrupt_map: dict = {}
-                        if state.tasks:
-                            for task in state.tasks:
-                                if hasattr(task, "interrupts") and task.interrupts:
-                                    for intr in task.interrupts:
-                                        iv = intr.value if hasattr(intr, "value") else intr
-                                        interrupt_map[intr.id] = _auto_approve_hitl(iv, case)
-                        if not interrupt_map:
-                            resume_cmd = LGCommand(resume={"approved": True,
-                                                           "answer": "auto-approved for regression test"})
-                        elif len(interrupt_map) == 1:
-                            resume_cmd = LGCommand(resume=next(iter(interrupt_map.values())))
-                        else:
-                            resume_cmd = LGCommand(resume=interrupt_map)
-                        result = await orchestrator.ainvoke(resume_cmd, config=config)
-            except Exception as _e:
-                logger.warning("HITL auto-confirm path raised %s — continuing with previous result.", _e)
-
         except Exception as e:
             return self._error_result(case, str(e), time.time() - start)
 
@@ -873,22 +813,7 @@ class RegressionRunner:
         tokens_in, tokens_out, model_used = _extract_token_meta(messages)
         total_cost = estimate_cost(model_used or self.model, tokens_in, tokens_out)
 
-        # A1: semantic similarity and DeepEval are independent LLM calls — run
-        # them concurrently instead of awaiting one after the other (~40-50% cut
-        # on the eval phase per case).
-        #
-        # Note: we intentionally do NOT launch `collector.save()` concurrently
-        # here — `save()` calls `_merge_otel_span_data(self.spans, …)` which
-        # mutates `collector.spans`, and `_run_deepeval` iterates the same list
-        # to extract tool outputs.  Concurrent mutation would race.  Instead we
-        # let both evals finish, THEN push the DB write off the event loop (A2)
-        # so other cases on the same loop can keep progressing while SQLite is
-        # being written.
-        similarity, deepeval_scores = await asyncio.gather(
-            self._compute_semantic_similarity(case.reference_output, actual_output),
-            self._run_deepeval(case.prompt, actual_output, agent_trace, collector),
-        )
-        await asyncio.to_thread(collector.save)
+        collector.save()
 
         span_data = [s.copy() for s in collector.spans]
         for s in span_data:
@@ -896,6 +821,9 @@ class RegressionRunner:
                 if isinstance(s.get(k), datetime):
                     s[k] = s[k].isoformat()
 
+        similarity = await self._compute_semantic_similarity(case.reference_output, actual_output)
+
+        deepeval_scores = await self._run_deepeval(case.prompt, actual_output, agent_trace, collector)
         quality_scores: dict = {}   # G-Eval removed; kept for DB compat only
         eval_reasoning: dict = {}
 

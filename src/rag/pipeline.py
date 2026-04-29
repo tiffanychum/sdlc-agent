@@ -324,6 +324,87 @@ class RAGPipeline:
                 span.record_exception(e)
                 raise
 
+    async def ingest_paths(
+        self,
+        paths: list[str],
+        *,
+        recursive: bool = True,
+        extensions: tuple[str, ...] = (".md", ".txt", ".rst", ".json", ".csv", ".pdf"),
+        skip_hidden: bool = True,
+    ) -> dict:
+        """Batch-ingest one or many file/directory paths.
+
+        Designed for large finance / docs corpora where the user has a folder
+        of dozens or hundreds of documents and a single ``ingest`` call per
+        file would be too noisy.
+
+        Args:
+            paths:      List of file or directory paths.
+            recursive:  Walk directories recursively (default True).
+            extensions: Whitelist of suffixes to ingest. Set to ``()`` to accept
+                        every file (use with care — node_modules-sized trees can
+                        blow up the index).
+            skip_hidden: Skip dotfiles + dot-prefixed directories.
+
+        Returns:
+            Aggregate summary: ``{"files_ingested", "files_skipped",
+            "total_chunks", "errors": [...]}``.
+        """
+        from pathlib import Path
+
+        targets: list[Path] = []
+        for p_str in paths:
+            p = Path(p_str).expanduser().resolve()
+            if not p.exists():
+                continue
+            if p.is_file():
+                targets.append(p)
+                continue
+            iterator = p.rglob("*") if recursive else p.iterdir()
+            for child in iterator:
+                if not child.is_file():
+                    continue
+                if skip_hidden and any(part.startswith(".") for part in child.parts):
+                    continue
+                if extensions and child.suffix.lower() not in extensions:
+                    continue
+                targets.append(child)
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique_targets = []
+        for t in targets:
+            key = str(t)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_targets.append(t)
+
+        files_ingested = 0
+        files_skipped = 0
+        total_chunks = 0
+        errors: list[dict] = []
+
+        for path in unique_targets:
+            try:
+                summary = await self.ingest("file", str(path))
+                if summary.get("chunks", 0) > 0:
+                    files_ingested += 1
+                    total_chunks += int(summary["chunks"])
+                else:
+                    files_skipped += 1
+            except Exception as exc:
+                errors.append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
+                files_skipped += 1
+
+        return {
+            "files_ingested": files_ingested,
+            "files_skipped": files_skipped,
+            "total_chunks": total_chunks,
+            "total_files_seen": len(unique_targets),
+            "errors": errors[:25],  # cap so a bad mount point doesn't return MBs
+        }
+
     # ── Retrieve ──────────────────────────────────────────────────────────────
 
     async def retrieve(self, query: str) -> list[SearchResult]:

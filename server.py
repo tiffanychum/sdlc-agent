@@ -12,27 +12,21 @@ Provides REST APIs for:
 
 import asyncio
 import json
-import logging
-import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 
-logger = logging.getLogger(__name__)
-
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from src.db.database import init_db, seed_defaults, update_agent_data, get_session
 from src.db.models import (
     Team, Agent, AgentToolMapping, Skill, AgentSkillMapping,
     Trace, Span, EvalRun, GoldenTestCase, RegressionResult, PromptVersion,
-    ABJudgeResult,
     RagConfig as RagConfigModel, RagSource, RagQuery,
-    WorkflowDefinition, WorkflowRun,
 )
 from src.orchestrator import build_orchestrator_from_team, _extract_text, get_graph_config
 from src.tracing.collector import TraceCollector, _flush_pending_spans, estimate_cost
@@ -125,11 +119,13 @@ class TeamCreate(BaseModel):
     name: str
     description: str = ""
     decision_strategy: str = "router_decides"
+    config_json: Optional[dict] = None
 
 class TeamUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     decision_strategy: Optional[str] = None
+    config_json: Optional[dict] = None
 
 class AgentCreate(BaseModel):
     name: str
@@ -225,6 +221,10 @@ class RegressionRunRequest(BaseModel):
     prompt_version: str = "v1"
     prompt_versions_by_role: Optional[dict] = None  # e.g. {"coder": "v3", "planner": "v2"}
     baseline_run_id: Optional[str] = None
+    # Optional dataset-group filter (e.g. ["finance_v1"]). When omitted the
+    # endpoint falls back to the team's ``config_json["dataset_groups"]`` so
+    # the UI doesn't need to send it explicitly for already-subscribed teams.
+    dataset_groups: Optional[list[str]] = None
 
 
 # RCARequest removed — RCA tab deleted, replaced by A/B Comparison
@@ -289,7 +289,12 @@ def list_teams():
 @app.post("/api/teams")
 def create_team(data: TeamCreate):
     session = get_session()
-    team = Team(name=data.name, description=data.description, decision_strategy=data.decision_strategy)
+    team = Team(
+        name=data.name,
+        description=data.description,
+        decision_strategy=data.decision_strategy,
+        config_json=data.config_json or {},
+    )
     session.add(team)
     session.commit()
     tid = team.id
@@ -322,6 +327,9 @@ def get_team(team_id: str):
     result = {
         "id": team.id, "name": team.name, "description": team.description,
         "decision_strategy": team.decision_strategy, "agents": agents_data,
+        # Surface config_json so Studio can read the parallel_coordinator
+        # block and the team's dataset_groups subscription.
+        "config_json": team.config_json or {},
     }
     session.close()
     return result
@@ -336,6 +344,7 @@ def update_team(team_id: str, data: TeamUpdate):
     if data.name is not None: team.name = data.name
     if data.description is not None: team.description = data.description
     if data.decision_strategy is not None: team.decision_strategy = data.decision_strategy
+    if data.config_json is not None: team.config_json = data.config_json
     session.commit()
     session.close()
     return {"status": "updated"}
@@ -698,21 +707,10 @@ async def chat_stream(team_id: str, request: ChatStreamRequest):
     graph = orchestrators[team_id]
     thread_id = request.thread_id or uuid.uuid4().hex[:12]
 
-    # A4: bounded queue applies back-pressure instead of growing unbounded when
-    # the frontend consumer stalls.  512 is generous for a single chat turn (a
-    # busy multi-agent run emits ~50-100 span events); at the cap we drop rather
-    # than OOM the worker.
-    span_queue: asyncio.Queue = asyncio.Queue(maxsize=512)
+    span_queue: asyncio.Queue = asyncio.Queue()
 
     def on_span_event(event_type: str, span_data: dict):
-        try:
-            span_queue.put_nowait({"event": event_type, "span": span_data})
-        except asyncio.QueueFull:
-            # Trace events are telemetry, not data — dropping is preferable to
-            # blocking the tracing callback (which runs on the event loop or a
-            # LangChain worker thread depending on the provider).
-            logger.warning("chat_stream span_queue full (team=%s); dropping span event %s",
-                           team_id, event_type)
+        span_queue.put_nowait({"event": event_type, "span": span_data})
 
     collector = TraceCollector(team_id=team_id, user_prompt=request.message,
                                on_span_event=on_span_event)
@@ -799,9 +797,7 @@ async def chat_stream(team_id: str, request: ChatStreamRequest):
             while not span_queue.empty():
                 sq = span_queue.get_nowait()
                 yield _sse_event("trace_span", sq)
-            # A2: offload sync SQLAlchemy write so other concurrent streams
-            # keep progressing on the event loop during the commit.
-            await asyncio.to_thread(collector.save)
+            collector.save()
             yield _sse_event("done", {"thread_id": thread_id, "partial": True})
             return
 
@@ -844,8 +840,7 @@ async def chat_stream(team_id: str, request: ChatStreamRequest):
                     last.content if hasattr(last, "content") else str(last)
                 )
 
-            # A2: offload sync SQLAlchemy write — same rationale as above.
-            await asyncio.to_thread(collector.save)
+            collector.save()
 
             yield _sse_event("response", {
                 "content": response_text,
@@ -875,15 +870,10 @@ async def chat_resume(team_id: str, request: ChatResumeRequest):
 
     from langgraph.types import Command
 
-    # A4: bounded queue — see chat_stream for rationale.
-    span_queue: asyncio.Queue = asyncio.Queue(maxsize=512)
+    span_queue: asyncio.Queue = asyncio.Queue()
 
     def on_span_event(event_type: str, span_data: dict):
-        try:
-            span_queue.put_nowait({"event": event_type, "span": span_data})
-        except asyncio.QueueFull:
-            logger.warning("chat_resume span_queue full (team=%s); dropping span event %s",
-                           team_id, event_type)
+        span_queue.put_nowait({"event": event_type, "span": span_data})
 
     collector = TraceCollector(team_id=team_id, user_prompt="[HITL resume]",
                                on_span_event=on_span_event)
@@ -935,7 +925,7 @@ async def chat_resume(team_id: str, request: ChatResumeRequest):
             while not span_queue.empty():
                 sq = span_queue.get_nowait()
                 yield _sse_event("trace_span", sq)
-            await asyncio.to_thread(collector.save)
+            collector.save()
             yield _sse_event("done", {"thread_id": thread_id, "partial": True})
             return
 
@@ -976,7 +966,7 @@ async def chat_resume(team_id: str, request: ChatResumeRequest):
                     last.content if hasattr(last, "content") else str(last)
                 )
 
-            await asyncio.to_thread(collector.save)
+            collector.save()
 
             yield _sse_event("response", {
                 "content": response_text,
@@ -994,9 +984,21 @@ async def chat_resume(team_id: str, request: ChatResumeRequest):
 # ── Traces API ──────────────────────────────────────────────────
 
 @app.get("/api/traces")
-def list_traces(limit: int = 50, offset: int = 0):
+def list_traces(limit: int = 50, offset: int = 0, team_id: str = None):
+    """List the most-recent traces, newest first.
+
+    Args:
+        limit:    page size.
+        offset:   page offset.
+        team_id:  when provided, only traces for that team are returned.
+                  Omitted = combined view (all teams), which preserves the
+                  endpoint's pre-existing behaviour.
+    """
     session = get_session()
-    traces = session.query(Trace).order_by(Trace.created_at.desc()).offset(offset).limit(limit).all()
+    q = session.query(Trace)
+    if team_id:
+        q = q.filter(Trace.team_id == team_id)
+    traces = q.order_by(Trace.created_at.desc()).offset(offset).limit(limit).all()
     result = []
     for t in traces:
         spans = session.query(Span).filter_by(trace_id=t.id).order_by(Span.start_time).all()
@@ -1091,18 +1093,20 @@ def trace_stats(days: int = 30, team_id: str = None):
 async def prompt_versions(role: str = None, team_id: str = None):
     """List all prompt versions. Optionally filter by role and/or team.
 
-    Patch 5 scoping:
-      - team_id omitted → return global rows (backwards-compatible).
-      - team_id given  → for each role, return that team's rows (with
-        automatic fallback to global rows if the team has no row for the
-        role).  This is what the Regression UI passes so a user on the
-        sdlc_2_0 team sees sdlc_2_0's supervisor history, not the dev team's.
+    When ``team_id`` is supplied the registry returns the team-scoped rows
+    first and falls back to the global rows so the UI shows the right
+    versions (e.g. ``finance_team`` agents see their own ``v1/v2``
+    prompts instead of the global SDLC ones).
     """
     try:
         from src.prompts.registry import get_registry
         reg = get_registry()
         if role:
-            return {"role": role, "team_id": team_id, "versions": reg.list_versions(role, team_id=team_id)}
+            return {
+                "role": role,
+                "team_id": team_id,
+                "versions": reg.list_versions(role, team_id=team_id),
+            }
         roles = reg.list_all_roles(team_id=team_id)
         return {
             "team_id": team_id,
@@ -1112,74 +1116,45 @@ async def prompt_versions(role: str = None, team_id: str = None):
         return {"error": str(e), "roles": {}}
 
 
-_ROUTING_ROLES = ("supervisor", "meta_router", "router")
-# Roles whose rows are team-scoped.  meta_router stays global because its
-# template has no team-specific placeholders.
-_TEAM_SCOPED_ROUTING_ROLES = {"supervisor", "router"}
-
-
-def _scope_for_routing_role(role: str, team_id: str | None) -> str | None:
-    """Return the registry scope (team_id or None) used for a routing role."""
-    if role in _TEAM_SCOPED_ROUTING_ROLES:
-        return team_id
-    return None
-
-
 @app.get("/api/prompts/routing")
-async def get_routing_prompts(team_id: str = None):
-    """Return current routing prompt versions + text for supervisor, meta_router, router.
-
-    When team_id is provided, supervisor + router resolve at that team's
-    scope (with global fallback for brand-new teams before their first
-    orchestrator build).  meta_router is always resolved globally.
-    """
+async def get_routing_prompts():
+    """Return current routing prompt versions and text for supervisor, meta_router, and router."""
     try:
         from src.prompts.registry import get_registry
         reg = get_registry()
+        routing_roles = ("supervisor", "meta_router", "router")
         result = {}
-        for role in _ROUTING_ROLES:
-            scope = _scope_for_routing_role(role, team_id)
-            versions = reg.list_versions(role, team_id=scope)
-            latest_ver = reg.latest_version(role, team_id=scope) if versions else None
-            text_val = reg.get_prompt(role, "latest", team_id=scope) if latest_ver else None
+        for role in routing_roles:
+            versions = reg.list_versions(role)
+            latest_ver = reg.latest_version(role) if versions else None
+            text_val = reg.get_prompt(role, "latest") if latest_ver else None
             result[role] = {
                 "versions": versions,
                 "active_version": latest_ver,
                 "text": text_val or "",
-                "team_id": scope,
             }
-        return {"routing": result, "team_id": team_id}
+        return {"routing": result}
     except Exception as e:
         return {"error": str(e), "routing": {}}
 
 
 @app.put("/api/prompts/routing/{role}")
 async def set_routing_prompt_version(role: str, data: dict):
-    """Set the active version for a routing prompt role.
-
-    Accepts ``team_id`` in the request body.  For supervisor/router the
-    activation is scoped to that team.  For meta_router the team_id is
-    ignored and the activation always happens on the global row.
-    """
+    """Set the active version for a routing prompt role (supervisor/meta_router/router)."""
     try:
-        from src.prompts.registry import get_registry  # noqa: F401 (consistency)
+        from src.prompts.registry import get_registry
+        reg = get_registry()
         version = data.get("version")
-        team_id = data.get("team_id")
         if not version:
             raise HTTPException(400, "version is required")
-        if role not in _ROUTING_ROLES:
+        if role not in ("supervisor", "meta_router", "router"):
             raise HTTPException(400, f"Unknown routing role: {role}")
-        scope = _scope_for_routing_role(role, team_id)
+        # Deactivate all versions for this role and activate the selected one
         from src.db.models import PromptVersionEntry
         from src.db.database import get_session
         session = get_session()
         try:
-            q = session.query(PromptVersionEntry).filter(PromptVersionEntry.role == role)
-            if scope is None:
-                q = q.filter(PromptVersionEntry.team_id.is_(None))
-            else:
-                q = q.filter(PromptVersionEntry.team_id == scope)
-            entries = q.all()
+            entries = session.query(PromptVersionEntry).filter_by(role=role).all()
             for e in entries:
                 e.is_active = (e.version == version)
             session.commit()
@@ -1194,21 +1169,14 @@ async def set_routing_prompt_version(role: str, data: dict):
 
 @app.get("/api/prompts/text")
 async def prompt_text(role: str, version: str = "latest", team_id: str = None):
-    """Return the full prompt text for a given role + version + optional team.
-
-    For team-scoped roles (supervisor, router) ``team_id`` routes the lookup
-    to that team's rows with automatic global fallback.  For everything else
-    (agent roles, meta_router) ``team_id`` has no effect today — those rows
-    are still global.
-    """
+    """Return the full prompt text for a given role + version (+team)."""
     try:
         from src.prompts.registry import get_registry
         reg = get_registry()
-        scope = _scope_for_routing_role(role, team_id) if role in _ROUTING_ROLES else team_id
-        text_val = reg.get_prompt(role, version, team_id=scope)
+        text_val = reg.get_prompt(role, version, team_id=team_id)
         if text_val is None:
-            return {"error": f"No prompt found for role={role} version={version} team={scope}", "text": ""}
-        return {"role": role, "version": version, "team_id": scope, "text": text_val}
+            return {"error": f"No prompt found for role={role} version={version}", "text": ""}
+        return {"role": role, "version": version, "team_id": team_id, "text": text_val}
     except Exception as e:
         return {"error": str(e), "text": ""}
 
@@ -1380,20 +1348,14 @@ async def prompt_ab_compare(role: str, version_a: str = "v1", version_b: str = "
 
 
 @app.get("/api/prompts/diff")
-async def prompt_diff(role: str, version_old: str = "v1", version_new: str = "v2", team_id: str = None):
-    """Return a unified diff between two prompt versions for a role.
-
-    team_id is threaded through the registry lookup for team-scoped roles so
-    the diff reflects the correct per-team prompt history (e.g. sdlc_2_0's
-    supervisor v1 → v2, not the dev team's).
-    """
+async def prompt_diff(role: str, version_old: str = "v1", version_new: str = "v2"):
+    """Return a unified diff between two prompt versions for a role."""
     try:
         import difflib
         from src.prompts.registry import get_registry
         reg = get_registry()
-        scope = _scope_for_routing_role(role, team_id) if role in _ROUTING_ROLES else team_id
-        old_p = reg.get_prompt(role, version_old, team_id=scope) or ""
-        new_p = reg.get_prompt(role, version_new, team_id=scope) or ""
+        old_p = reg.get_prompt(role, version_old) or ""
+        new_p = reg.get_prompt(role, version_new) or ""
         if not old_p:
             return {"error": f"Version {version_old} not found for role={role}"}
         if not new_p:
@@ -1420,9 +1382,8 @@ async def prompt_diff(role: str, version_old: str = "v1", version_new: str = "v2
 @app.post("/api/prompts/optimize")
 async def prompt_optimize(request: Request):
     """
-    Non-streaming optimization endpoint — returns the full structured
-    OptimizationReport synchronously (no SSE). Shares the same implementation
-    as ``/stream``; use this for programmatic / scripted access.
+    Non-streaming optimization endpoint (kept for backward compat).
+    Prefer /api/prompts/optimize/stream for real-time trajectory.
     """
     try:
         body = await request.json()
@@ -1430,64 +1391,103 @@ async def prompt_optimize(request: Request):
         metric = body.get("metric", "step_efficiency")
         threshold = float(body.get("threshold", 0.7))
         model = body.get("model", "claude-sonnet-4.6")
-        version = body.get("version")
-        team_id = body.get("team_id") or "default"
-        baseline_run_id = body.get("baseline_run_id") or None
-        golden_ids = body.get("golden_ids") or []
-        early_exit = bool(body.get("early_exit", True))
-        commit_on_plateau = bool(body.get("commit_on_plateau", False))
-        dry_run = bool(body.get("dry_run", False))
+        version = body.get("version")  # target prompt version to optimize (optional)
 
-        from src.optimization.optimizer import run_optimization_loop
-        report = await run_optimization_loop(
-            role=role,
-            metric=metric,
-            threshold=threshold,
-            version=version,
-            team_id=team_id,
-            baseline_run_id=baseline_run_id,
-            golden_ids=list(golden_ids) if golden_ids else None,
-            early_exit=early_exit,
-            commit_on_plateau=commit_on_plateau,
-            dry_run=dry_run,
-            model=model,
+        prompt = _build_optimize_prompt(role, metric, threshold, version)
+
+        from src.orchestrator import build_orchestrator_from_team
+        orchestrator = await build_orchestrator_from_team(
+            team_id="default", model_override=model
         )
-        return {"status": "completed", "report": report.model_dump()}
+        result = await orchestrator.ainvoke({
+            "messages": [{"role": "user", "content": prompt}],
+            "agent_trace": [],
+            "completed_steps": [],
+            "supervisor_iterations": 0,
+        })
+        last_msg = result["messages"][-1]
+        response_text = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+        agents = list(dict.fromkeys([
+            e.get("agent") for e in result.get("agent_trace", [])
+            if e.get("step") == "execution"
+        ]))
+        return {
+            "status": "completed",
+            "role": role,
+            "metric": metric,
+            "agents_used": agents,
+            "response": response_text[:4000],
+        }
     except Exception as e:
-        logger.exception("prompt_optimize failed")
         return {"status": "error", "error": str(e)}
+
+
+def _build_optimize_prompt(
+    role: str,
+    metric: str,
+    threshold: float,
+    version: str | None,
+    *,
+    team_id: str = "default",
+    baseline_run_id: str | None = None,
+    golden_ids: list[str] | None = None,
+    early_exit: bool = True,
+) -> str:
+    """Build the user prompt for the PromptOptimizer agent.
+
+    All parameters are echoed into the prompt so the optimizer's Phase 0
+    confirmation block can pass them straight through to its tool calls
+    without another ask_human round-trip.
+    """
+    version_clause = (
+        f"target prompt version: {version}" if version else "the latest available version"
+    )
+    goldens_clause = (
+        f"GOLDEN_IDS={list(golden_ids)}" if golden_ids else "GOLDEN_IDS=auto (derived from baseline failures)"
+    )
+    baseline_clause = (
+        f"BASELINE_RUN_ID={baseline_run_id}" if baseline_run_id else "BASELINE_RUN_ID=none (fresh bootstrap)"
+    )
+    return (
+        f"Run a full prompt optimization loop for the **{role}** agent ({version_clause}). "
+        f"Target metric: **{metric}** (improvement threshold: {threshold}). "
+        f"Follow the SETUP → LOOP (up to 3 cycles) → FINAL OUTPUT protocol exactly as specified in your instructions.\n\n"
+        f"Pre-resolved SETUP parameters (use directly, do NOT ask_human for any of these):\n"
+        f"  TARGET_ROLE={role}\n"
+        f"  TARGET_VERSION={version or 'latest'}\n"
+        f"  TARGET_METRIC={metric}\n"
+        f"  THRESHOLD={threshold}\n"
+        f"  TEAM_ID={team_id}\n"
+        f"  {baseline_clause}\n"
+        f"  {goldens_clause}\n"
+        f"  EARLY_EXIT={'true' if early_exit else 'false'}\n\n"
+        f"Always pass team_id and max_parallel=3 into run_regression_subset. "
+        f"Report the full iteration summary, root cause, changes per cycle, and final diff."
+    )
 
 
 @app.post("/api/prompts/optimize/stream")
 async def prompt_optimize_stream(request: Request):
     """
-    SSE streaming endpoint for the global Prompt Optimizer function.
+    SSE streaming version of the PromptOptimizer.
 
-    Unlike the previous version, this does NOT build an agent orchestrator.
-    It calls ``src.optimization.optimizer.run_optimization_loop(...)`` directly,
-    which guarantees:
-      * No supervisor misrouting (no graph involved at all).
-      * One LLM call per cycle (the drafter) — deterministic control flow.
-      * At most ONE new ``PromptVersionEntry`` row per run (or zero if no
-        improvement).
+    Body supports **both** legacy single-role and new multi-role shapes:
 
-    Body (all legacy fields still accepted):
-      {
-        "roles":          ["coder", "planner"],
-        "metric":         "step_efficiency",
-        "threshold":      0.7,
-        "model":          "claude-sonnet-4.6",
-        "versions":       {"coder": "latest", "planner": "v2"},
-        "team_id":        "sdlc_2_0",
-        "baseline_run_id": "ab12cd34ef56" | null,
-        "golden_ids":     ["golden_001", "golden_004"],
-        "early_exit":     true,
-        "commit_on_plateau": false,
-        "dry_run":        false
-      }
+      Legacy (still accepted):
+        {"role": "coder", "metric": "step_efficiency", "threshold": 0.7,
+         "model": "claude-sonnet-4.6", "version": "v4"}
 
-    Every SSE event is tagged with ``role`` so the UI can render per-role panels.
-    Roles run concurrently with a cap of 2.
+      New:
+        {"roles": ["coder", "planner"], "metric": "step_efficiency",
+         "threshold": 0.7, "model": "claude-sonnet-4.6",
+         "versions": {"coder": "latest", "planner": "latest"},
+         "team_id": "default",
+         "baseline_run_id": "ab12cd34ef56"  # optional
+         "golden_ids": ["golden_001", "golden_004"]  # optional, empty = auto
+         "early_exit": true}
+
+    Every SSE event is tagged with `role` so the UI can render per-role panels.
+    Roles run concurrently with a cap of 2 (C1).
     """
     body = await request.json()
 
@@ -1505,15 +1505,16 @@ async def prompt_optimize_stream(request: Request):
     baseline_run_id = body.get("baseline_run_id") or None
     golden_ids = body.get("golden_ids") or []
     early_exit = bool(body.get("early_exit", True))
-    commit_on_plateau = bool(body.get("commit_on_plateau", False))
-    dry_run = bool(body.get("dry_run", False))
 
     versions_map: dict[str, str | None] = body.get("versions") or {}
     if not versions_map and body.get("version"):
         versions_map = {roles[0]: body.get("version")}
 
-    from src.optimization.optimizer import run_optimization_loop
+    from src.orchestrator import build_orchestrator_from_team
 
+    # One orchestrator per sub-task — prompt versions are read at build time,
+    # so sharing would leak versions between roles if two roles touch the
+    # same cached graph. Building per-role is cheap (cached downstream).
     async def _run_one_role(
         role: str,
         emit_queue: asyncio.Queue,
@@ -1521,6 +1522,24 @@ async def prompt_optimize_stream(request: Request):
     ) -> None:
         async with sem:
             version = versions_map.get(role)
+            user_prompt = _build_optimize_prompt(
+                role, metric, threshold, version,
+                team_id=team_id,
+                baseline_run_id=baseline_run_id,
+                golden_ids=list(golden_ids) if golden_ids else None,
+                early_exit=early_exit,
+            )
+            orchestrator = await build_orchestrator_from_team(
+                team_id=team_id, model_override=model
+            )
+            thread_id = uuid.uuid4().hex[:12]
+            config = get_graph_config(thread_id)
+            initial_input = {
+                "messages": [{"role": "user", "content": user_prompt}],
+                "agent_trace": [],
+                "completed_steps": [],
+                "supervisor_iterations": 0,
+            }
 
             async def emit(ev: str, payload: dict):
                 # Stamp every event with the role so the UI can route it to
@@ -1528,6 +1547,7 @@ async def prompt_optimize_stream(request: Request):
                 payload = {**payload, "role": role}
                 await emit_queue.put((ev, payload))
 
+            await emit("thread_id", {"thread_id": thread_id})
             await emit("optimize_start", {
                 "metric": metric, "threshold": threshold,
                 "version": version or "latest", "model": model,
@@ -1535,32 +1555,87 @@ async def prompt_optimize_stream(request: Request):
                 "baseline_run_id": baseline_run_id,
                 "golden_ids": list(golden_ids) if golden_ids else [],
                 "early_exit": early_exit,
-                "commit_on_plateau": commit_on_plateau,
-                "dry_run": dry_run,
             })
 
+            current_agent = ""
+            token_buf = ""
             try:
-                await run_optimization_loop(
-                    role=role,
-                    metric=metric,
-                    threshold=threshold,
-                    version=version,
-                    team_id=team_id,
-                    baseline_run_id=baseline_run_id,
-                    golden_ids=list(golden_ids) if golden_ids else None,
-                    early_exit=early_exit,
-                    commit_on_plateau=commit_on_plateau,
-                    dry_run=dry_run,
-                    model=model,
-                    progress_cb=emit,
-                )
+                async for event in orchestrator.astream_events(
+                    initial_input, config=config, version="v2"
+                ):
+                    kind = event.get("event", "")
+                    name = event.get("name", "")
+                    data = event.get("data", {})
+                    meta = event.get("metadata", {})
+                    lg_node = meta.get("langgraph_node", "")
+
+                    if (kind == "on_chain_start" and lg_node
+                            and lg_node not in _GRAPH_SYSTEM_NODES
+                            and not lg_node.startswith("_")
+                            and name == lg_node):
+                        current_agent = lg_node
+                        await emit("agent_start", {"agent": lg_node})
+
+                    elif kind == "on_tool_start":
+                        tool_input = data.get("input", {})
+                        safe_input = {
+                            k: str(v)[:300]
+                            for k, v in (tool_input.items() if isinstance(tool_input, dict) else {}.items())
+                        }
+                        await emit("tool_start", {
+                            "agent": current_agent, "tool": name, "args": safe_input,
+                        })
+                        if name == "register_prompt_version":
+                            await emit("version_registering", {
+                                "target_role": safe_input.get("role", role),
+                                "rationale": safe_input.get("rationale", "")[:200],
+                            })
+
+                    elif kind == "on_tool_end":
+                        output = str(data.get("output", ""))
+                        await emit("tool_end", {
+                            "agent": current_agent, "tool": name,
+                            "output_preview": output[:400],
+                        })
+                        if name == "run_regression_subset":
+                            await emit("regression_result", {"tool_output": output[:600]})
+                        elif name == "register_prompt_version":
+                            import re
+                            m = re.search(r'as\s+(v\d+)', output)
+                            if m:
+                                await emit("version_registered", {
+                                    "target_role": role, "version": m.group(1),
+                                })
+
+                    elif kind == "on_chat_model_stream":
+                        chunk = data.get("chunk")
+                        if chunk:
+                            token = chunk.content if hasattr(chunk, "content") else ""
+                            if token:
+                                token_buf += token
+                                if len(token_buf) >= 40 or token.endswith(("\n", ".")):
+                                    await emit("thinking", {
+                                        "delta": token_buf, "agent": current_agent,
+                                    })
+                                    token_buf = ""
             except Exception as e:
                 await emit("error", {"message": str(e)})
+                return
+
+            if token_buf:
+                await emit("thinking", {"delta": token_buf, "agent": current_agent})
+
+            await emit("done", {"status": "completed", "metric": metric})
 
     async def event_generator():
+        # Multi-role fan-out: cap concurrency at 2 (C1 — deeper parallelism
+        # risks token bursts / rate-limits for a marginal wall-clock gain).
         sem = asyncio.Semaphore(2)
         emit_queue: asyncio.Queue = asyncio.Queue()
 
+        # Sentinel pushed after every role finishes (success or error) so the
+        # consumer knows when to stop draining. Using a producer task + sentinel
+        # avoids the classic asyncio.wait-on-tasks repeated-ready gotcha.
         _DONE_SENTINEL = ("__fanout_done__", None)
 
         async def _producer():
@@ -1581,8 +1656,6 @@ async def prompt_optimize_stream(request: Request):
             "baseline_run_id": baseline_run_id,
             "golden_ids": list(golden_ids) if golden_ids else [],
             "early_exit": early_exit,
-            "commit_on_plateau": commit_on_plateau,
-            "dry_run": dry_run,
         })
 
         try:
@@ -1729,22 +1802,116 @@ def get_trace(trace_id: str):
 
 
 @app.get("/api/otel/spans/stats")
-def otel_span_stats(days: int = 30):
-    """OTel span-level analytics with GenAI semantic convention breakdowns."""
+def otel_span_stats(days: int = 30, team_id: str = None):
+    """OTel span-level analytics with GenAI semantic convention breakdowns.
+
+    Args:
+        days:    look-back window.
+        team_id: when provided, restrict the aggregation to the given team
+                 so the OTel Observability tab matches the team selector
+                 at the top of the Monitoring page.
+
+    The endpoint also:
+      * Normalises model names so different spellings of the same model
+        ("claude-sonnet-4-6", "claude-sonnet-4.6", "Claude-Sonnet-4-6",
+        and Poe's accidentally-doubled "claude-sonnet-4-6claude-sonnet-4-6")
+        collapse into a single row.
+      * Tracks per-model decode latency so the dashboard can compute
+        tokens-per-second throughput per model.
+      * Aggregates the most common error messages into a top-10 list and
+        per-model top-5 lists so the failure tail is actionable.
+    """
+    import re as _re
+    from collections import defaultdict
+    from src.utils.model_names import normalize_model_name
+
     session = get_session()
     cutoff = datetime.utcnow() - timedelta(days=days)
 
-    spans = session.query(Span).join(Trace).filter(Trace.created_at >= cutoff).all()
-    traces = session.query(Trace).filter(Trace.created_at >= cutoff).all()
+    span_q = session.query(Span).join(Trace).filter(Trace.created_at >= cutoff)
+    trace_q = session.query(Trace).filter(Trace.created_at >= cutoff)
+    if team_id:
+        span_q = span_q.filter(Trace.team_id == team_id)
+        trace_q = trace_q.filter(Trace.team_id == team_id)
+    spans = span_q.all()
+    traces = trace_q.all()
 
     if not spans:
         session.close()
-        return {"total_spans": 0, "by_type": {}, "by_model": {}, "token_flow": [],
-                "cost_breakdown": [], "latency_by_type": {}, "error_spans": 0}
+        return {"total_spans": 0, "total_traces": len(traces), "by_type": {},
+                "by_model": {}, "token_flow": [], "cost_breakdown": [],
+                "latency_by_type": {}, "error_spans": 0, "hitl_pause_spans": 0,
+                "top_errors": [], "errors_by_model": {}}
 
     by_type: dict = {}
     by_model: dict = {}
-    errors = 0
+    errors = 0          # real errors only — HITL pauses are NOT errors
+    hitl_pauses = 0     # surfaced separately so they're still observable
+
+    # Error aggregation buckets — only real (non-HITL) errors land here.
+    error_counts: dict[str, int] = defaultdict(int)
+    error_samples: dict[str, list[str]] = defaultdict(list)
+    error_models: dict[str, set[str]] = defaultdict(set)
+    errors_by_model_raw: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    # Pre-compile interrupt pattern once. We extract the interrupt `type`
+    # and `tool_name` so HITL pauses for the SAME tool are grouped
+    # together regardless of which path/args the agent passed.
+    _INTERRUPT_PATTERN = _re.compile(
+        r"Interrupt\(value=\{'type': '(?P<type>[^']+)'"
+        r"(?:.*?'tool_name': '(?P<tool>[^']+)')?",
+    )
+    _EXCEPTION_PREFIX = _re.compile(r"^([A-Z][A-Za-z0-9]*Error|GraphInterrupt|RuntimeError):\s*")
+
+    def _classify_error(raw: str | None) -> tuple[str, str | None]:
+        """Return ``(kind, label)`` for an error string.
+
+        ``kind`` is one of:
+          * ``"hitl"``    — a Human-in-the-Loop pause (NOT a real error).
+          * ``"real"``    — an actual exception we want surfaced.
+          * ``"unknown"`` — could not classify; treated as ``real`` to be
+                            safe but kept identifiable.
+
+        ``label`` is the bucket name to group by (None when the error
+        string is empty).
+        """
+        if not raw:
+            return ("unknown", None)
+        cleaned = _re.sub(r"\s+", " ", str(raw).strip())
+        # Strip Python tracebacks — they vary by file/line and would
+        # cause two reports of the same error to land in different
+        # buckets.
+        for marker in ("Traceback (most recent call last)", " File \"/"):
+            idx = cleaned.find(marker)
+            if idx > 0:
+                cleaned = cleaned[:idx].rstrip(" \"')")
+                break
+
+        # 1) HITL Interrupts — these are PAUSES, not errors. The agent
+        #    is waiting for the user to confirm an action; the underlying
+        #    "error" column was just LangGraph's way of persisting the
+        #    interrupt control-flow signal.
+        m = _INTERRUPT_PATTERN.search(cleaned)
+        if m:
+            kind = m.group("type") or "unknown"
+            tool = m.group("tool")
+            label = f"HITL pause: {kind}"
+            if tool:
+                label += f" (tool: {tool})"
+            return ("hitl", label)
+
+        # 2) Real exception — strip the leading class name so different
+        #    stack traces of the same error type collapse, while keeping
+        #    the class visible for context.
+        cls_match = _EXCEPTION_PREFIX.match(cleaned)
+        if cls_match:
+            cls = cls_match.group(1)
+            rest = cleaned[cls_match.end():]
+            return ("real", f"{cls}: {rest[:120]}" if rest else cls)
+
+        # 3) Generic — cap to 160 chars; treat as real until proven otherwise.
+        return ("real", cleaned[:160] or None)
+
     for s in spans:
         st = s.span_type or "unknown"
         by_type.setdefault(st, {"count": 0, "tokens_in": 0, "tokens_out": 0, "cost": 0.0, "latency_ms": []})
@@ -1752,25 +1919,148 @@ def otel_span_stats(days: int = 30):
         by_type[st]["tokens_in"] += s.tokens_in or 0
         by_type[st]["tokens_out"] += s.tokens_out or 0
         by_type[st]["cost"] += s.cost or 0
+        dur_ms = 0.0
         if s.start_time and s.end_time:
-            dur = (s.end_time - s.start_time).total_seconds() * 1000
-            by_type[st]["latency_ms"].append(dur)
-        if s.status == "error":
+            dur_ms = (s.end_time - s.start_time).total_seconds() * 1000
+            by_type[st]["latency_ms"].append(dur_ms)
+
+        # Classify the span: a status="error" span MAY actually be a
+        # benign HITL pause. We only count real exceptions as errors.
+        kind, label = _classify_error(s.error) if s.status == "error" else ("none", None)
+        is_real_error = (kind == "real")
+        is_hitl_pause = (kind == "hitl")
+        if is_real_error:
             errors += 1
+        elif is_hitl_pause:
+            hitl_pauses += 1
+
+        # ── per-model aggregation ──
         if s.model:
-            by_model.setdefault(s.model, {"count": 0, "tokens_in": 0, "tokens_out": 0, "cost": 0.0})
-            by_model[s.model]["count"] += 1
-            by_model[s.model]["tokens_in"] += s.tokens_in or 0
-            by_model[s.model]["tokens_out"] += s.tokens_out or 0
-            by_model[s.model]["cost"] += s.cost or 0
+            model = normalize_model_name(s.model)
+            if model:
+                bucket = by_model.setdefault(model, {
+                    "count": 0, "tokens_in": 0, "tokens_out": 0, "cost": 0.0,
+                    "latency_ms_total": 0.0, "latency_samples": 0,
+                    "errors": 0, "hitl_pauses": 0, "raw_aliases": set(),
+                })
+                bucket["count"] += 1
+                bucket["tokens_in"] += s.tokens_in or 0
+                bucket["tokens_out"] += s.tokens_out or 0
+                bucket["cost"] += s.cost or 0
+                if dur_ms > 0:
+                    bucket["latency_ms_total"] += dur_ms
+                    bucket["latency_samples"] += 1
+                if is_real_error:
+                    bucket["errors"] += 1
+                elif is_hitl_pause:
+                    bucket["hitl_pauses"] += 1
+                bucket["raw_aliases"].add(s.model)
+
+        # ── error aggregation (REAL errors only) ──
+        if is_real_error and label:
+            error_counts[label] += 1
+            if len(error_samples[label]) < 3:
+                error_samples[label].append(s.trace_id)
+            if s.model:
+                norm = normalize_model_name(s.model)
+                error_models[label].add(norm)
+                errors_by_model_raw[norm][label] += 1
+
+    # Also surface trace-level real failures whose root span didn't carry
+    # an error string. We DON'T add HITL-only traces here — a trace whose
+    # only "error" was a confirmation pause is not a failure, even if its
+    # `status` column says "error".
+    spans_by_trace: dict[str, list[Span]] = defaultdict(list)
+    for s in spans:
+        spans_by_trace[s.trace_id].append(s)
+    for t in traces:
+        if t.status != "error":
+            continue
+        trace_spans = spans_by_trace.get(t.id, [])
+
+        # Find the FIRST real (non-HITL) error span; if none exists, the
+        # trace was only paused for HITL — skip it.
+        real_err_text = None
+        for s in trace_spans:
+            if s.status != "error" or not s.error:
+                continue
+            kind, _ = _classify_error(s.error)
+            if kind == "real":
+                real_err_text = s.error
+                break
+        if not real_err_text:
+            # Try the trace's response only as a last resort. If that ALSO
+            # decodes as a HITL pause we genuinely have no real error.
+            fallback = t.agent_response or ""
+            kind, _ = _classify_error(fallback)
+            if kind != "real":
+                continue
+            real_err_text = fallback
+
+        kind, label = _classify_error(real_err_text)
+        if kind != "real" or not label:
+            continue
+        already_counted_traces = {tid for samples in error_samples.values() for tid in samples}
+        if t.id in already_counted_traces:
+            continue
+        error_counts[label] += 1
+        if len(error_samples[label]) < 3:
+            error_samples[label].append(t.id)
+        candidate_models = {s.model for s in trace_spans if s.model}
+        for raw in candidate_models:
+            norm = normalize_model_name(raw)
+            error_models[label].add(norm)
+            errors_by_model_raw[norm][label] += 1
 
     for st_data in by_type.values():
         lats = st_data.pop("latency_ms")
         st_data["avg_latency_ms"] = round(sum(lats) / len(lats), 1) if lats else 0
         st_data["cost"] = round(st_data["cost"], 6)
 
-    for m_data in by_model.values():
+    for m, m_data in by_model.items():
         m_data["cost"] = round(m_data["cost"], 6)
+        # Tokens / second using output tokens over total decode time —
+        # this matches the convention used by most LLM observability
+        # tools (DeepEval, Helicone). Fall back to 0 when we have no
+        # latency samples.
+        total_lat_s = m_data["latency_ms_total"] / 1000.0
+        if total_lat_s > 0 and m_data["tokens_out"] > 0:
+            m_data["tokens_per_sec"] = round(m_data["tokens_out"] / total_lat_s, 1)
+        else:
+            m_data["tokens_per_sec"] = 0.0
+        m_data["avg_latency_ms"] = round(
+            m_data["latency_ms_total"] / m_data["latency_samples"], 1
+        ) if m_data["latency_samples"] else 0.0
+        # Sort + freeze the alias set for JSON output so callers can see
+        # which raw spellings were collapsed into this canonical row.
+        m_data["raw_aliases"] = sorted(m_data.pop("raw_aliases"))
+        # Error rate uses ONLY real errors — HITL pauses don't count.
+        m_data["error_rate"] = round(m_data["errors"] / m_data["count"], 3) if m_data["count"] else 0.0
+        m_data["hitl_pause_rate"] = round(m_data["hitl_pauses"] / m_data["count"], 3) if m_data["count"] else 0.0
+        # Drop the running totals — we only expose the derived metrics.
+        m_data.pop("latency_ms_total", None)
+        m_data.pop("latency_samples", None)
+
+    # Top-10 most common errors with sample trace ids and which models
+    # produced them.
+    top_errors = sorted(
+        ({
+            "message": msg,
+            "count": cnt,
+            "models": sorted(error_models[msg]),
+            "sample_trace_ids": error_samples[msg],
+        } for msg, cnt in error_counts.items()),
+        key=lambda x: -x["count"],
+    )[:10]
+
+    # Per-model top-5 errors.
+    errors_by_model: dict[str, list[dict]] = {
+        model: sorted(
+            ({"message": msg, "count": cnt} for msg, cnt in d.items()),
+            key=lambda x: -x["count"],
+        )[:5]
+        for model, d in errors_by_model_raw.items()
+    }
 
     token_flow = []
     for t in sorted(traces, key=lambda x: x.created_at or datetime.min)[-30:]:
@@ -1793,10 +2083,13 @@ def otel_span_stats(days: int = 30):
     return {
         "total_spans": len(spans),
         "total_traces": len(traces),
-        "error_spans": errors,
+        "error_spans": errors,            # real exceptions only
+        "hitl_pause_spans": hitl_pauses,  # interrupt-confirmation pauses
         "by_type": by_type,
         "by_model": by_model,
         "token_flow": token_flow,
+        "top_errors": top_errors,
+        "errors_by_model": errors_by_model,
     }
 
 
@@ -1823,23 +2116,10 @@ async def evaluate_traces():
         if isinstance(existing, str):
             existing = _json.loads(existing) if existing else {}
 
-        # ── G-Eval (LLM-as-Judge with CoT) ──
-        try:
-            from src.evaluation.llm_judge import judge_response
-            geval_result = await judge_response(
-                user_prompt=tr.user_prompt or "",
-                agent_response=tr.agent_response or "",
-                tool_calls=tr.tool_calls_json or [],
-            )
-            geval_scores = geval_result.get("scores", {})
-            geval_reasoning = geval_result.get("reasoning", {})
-            existing["geval_scores"] = geval_scores
-            existing["geval_reasoning"] = geval_reasoning
-            existing["geval_overall"] = geval_result.get("overall", 0.5)
-            for k, v in geval_scores.items():
-                existing[f"judge_{k}"] = v
-        except Exception as e:
-            errors.append(f"geval:{tr.id}:{str(e)[:100]}")
+        # G-Eval (custom LLM-as-Judge with CoT) was removed — DeepEval is the
+        # single source of truth for trace-level evaluation. Existing eval_scores
+        # may still contain legacy `geval_*` keys; the frontend short-circuits
+        # cleanly when they are missing.
 
         # ── DeepEval (All Agentic Metrics) ──
         try:
@@ -1884,9 +2164,18 @@ async def evaluate_traces():
 # ── Evaluation API ──────────────────────────────────────────────
 
 @app.get("/api/eval/runs")
-def list_eval_runs():
+def list_eval_runs(team_id: str = None):
+    """List EvalRuns, newest first.
+
+    Args:
+        team_id: when provided, only EvalRuns for that team are returned.
+                 Omitted = combined view across teams (unchanged default).
+    """
     session = get_session()
-    runs = session.query(EvalRun).order_by(EvalRun.created_at.desc()).all()
+    q = session.query(EvalRun)
+    if team_id:
+        q = q.filter(EvalRun.team_id == team_id)
+    runs = q.order_by(EvalRun.created_at.desc()).all()
     result = []
     for r in runs:
         rj = r.results_json or {}
@@ -2194,24 +2483,81 @@ def get_current_prompts():
 # ── Golden Dataset API ──────────────────────────────────────────
 
 @app.get("/api/golden")
-def list_golden_cases():
+def list_golden_cases(
+    dataset_group: Optional[str] = None,
+    team_id: Optional[str] = None,
+):
+    """List golden cases.
+
+    Filters (all optional, AND-combined):
+      * ``dataset_group`` — single group label (e.g. ``finance_v1``).
+      * ``team_id`` — resolves the team's ``config_json["dataset_groups"]``
+        and applies it as an OR filter. Lets the UI scope the picker to
+        a team's subscribed groups in one call.
+    """
     session = get_session()
-    cases = session.query(GoldenTestCase).order_by(GoldenTestCase.id).all()
-    result = [{
-        "id": c.id, "name": c.name, "prompt": c.prompt,
-        "expected_agent": c.expected_agent, "expected_tools": c.expected_tools or [],
-        "expected_output_keywords": c.expected_output_keywords or [],
-        "expected_delegation_pattern": c.expected_delegation_pattern or [],
-        "quality_thresholds": c.quality_thresholds or {},
-        "max_llm_calls": c.max_llm_calls, "max_tool_calls": c.max_tool_calls,
-        "max_tokens": c.max_tokens, "max_latency_ms": c.max_latency_ms,
-        "complexity": c.complexity, "version": c.version,
-        "reference_output": c.reference_output, "is_active": c.is_active,
-        "strategy": getattr(c, "strategy", None),
-        "expected_strategy": getattr(c, "expected_strategy", None),
-    } for c in cases]
-    session.close()
-    return result
+    try:
+        q = session.query(GoldenTestCase)
+        if dataset_group:
+            q = q.filter(GoldenTestCase.dataset_group == dataset_group)
+        if team_id:
+            team = session.query(Team).filter_by(id=team_id).one_or_none()
+            if team is not None:
+                cfg = dict(team.config_json or {})
+                groups = cfg.get("dataset_groups") or []
+                if isinstance(groups, list) and groups:
+                    q = q.filter(GoldenTestCase.dataset_group.in_(groups))
+        cases = q.order_by(GoldenTestCase.id).all()
+        return [{
+            "id": c.id, "name": c.name, "prompt": c.prompt,
+            "expected_agent": c.expected_agent, "expected_tools": c.expected_tools or [],
+            "expected_output_keywords": c.expected_output_keywords or [],
+            "expected_delegation_pattern": c.expected_delegation_pattern or [],
+            "quality_thresholds": c.quality_thresholds or {},
+            "max_llm_calls": c.max_llm_calls, "max_tool_calls": c.max_tool_calls,
+            "max_tokens": c.max_tokens, "max_latency_ms": c.max_latency_ms,
+            "complexity": c.complexity, "version": c.version,
+            "reference_output": c.reference_output, "is_active": c.is_active,
+            "strategy": getattr(c, "strategy", None),
+            "expected_strategy": getattr(c, "expected_strategy", None),
+            "dataset_group": getattr(c, "dataset_group", "default"),
+        } for c in cases]
+    finally:
+        session.close()
+
+
+@app.get("/api/regression/groups")
+def list_regression_groups():
+    """Return ``[{group, count, teams_subscribed}]`` for the goldenset picker.
+
+    Used by the regression page to populate the dataset-group filter
+    dropdown without scanning every active case in the browser.
+    """
+    session = get_session()
+    try:
+        from collections import defaultdict
+        counts: dict[str, int] = defaultdict(int)
+        for c in session.query(GoldenTestCase).filter_by(is_active=True).all():
+            counts[getattr(c, "dataset_group", None) or "default"] += 1
+
+        subscribed: dict[str, list[str]] = defaultdict(list)
+        for t in session.query(Team).all():
+            cfg = dict(t.config_json or {})
+            groups = cfg.get("dataset_groups") or []
+            if isinstance(groups, list):
+                for g in groups:
+                    subscribed[str(g)].append(t.id)
+
+        return [
+            {
+                "group": g,
+                "count": counts[g],
+                "teams_subscribed": subscribed.get(g, []),
+            }
+            for g in sorted(counts.keys())
+        ]
+    finally:
+        session.close()
 
 
 @app.post("/api/golden")
@@ -2304,6 +2650,28 @@ def _sync_db_to_json():
 
 # ── Regression Testing API ──────────────────────────────────────
 
+def _resolve_dataset_groups(request: "RegressionRunRequest") -> Optional[list[str]]:
+    """Resolve which dataset_groups a regression run should filter by.
+
+    Precedence:
+      1. Explicit ``request.dataset_groups`` (UI override).
+      2. ``Team.config_json["dataset_groups"]`` for the requested team.
+      3. ``None`` — runner sees every active case (legacy behaviour).
+    """
+    if request.dataset_groups:
+        return [str(g) for g in request.dataset_groups]
+    session = get_session()
+    try:
+        team = session.query(Team).filter_by(id=request.team_id or "default").one_or_none()
+        if team is None:
+            return None
+        cfg = dict(team.config_json or {})
+        groups = cfg.get("dataset_groups") or []
+        return [str(g) for g in groups] if isinstance(groups, list) and groups else None
+    finally:
+        session.close()
+
+
 @app.post("/api/regression/run")
 async def run_regression(request: RegressionRunRequest):
     from src.evaluation.regression import RegressionRunner
@@ -2331,6 +2699,7 @@ async def run_regression(request: RegressionRunRequest):
         prompt_version=request.prompt_version,
         team_id=request.team_id,
         prompt_versions_by_role=effective_versions,
+        dataset_groups=_resolve_dataset_groups(request),
     )
     result = await runner.run(
         case_ids=request.case_ids,
@@ -2379,6 +2748,7 @@ async def run_regression_stream(request: RegressionRunRequest):
         prompt_version=request.prompt_version,
         team_id=request.team_id,
         prompt_versions_by_role=effective_versions,
+        dataset_groups=_resolve_dataset_groups(request),
     )
 
     # Use an asyncio Queue to bridge the async generator from run_streaming
@@ -2721,202 +3091,6 @@ def regression_ab_compare(
         "side_a": side_a,
         "side_b": side_b,
         "metric_diff": metric_diff,
-    }
-
-
-# ── A/B v2: cross-project picker + overlap + adaptive LLM judge ───
-
-
-@app.get("/api/regression/ab/runs")
-def ab_v2_runs(scope: str = "same", team_id: Optional[str] = None, limit: int = 80):
-    """
-    List regression runs available for the A/B picker.
-
-    - scope="same"  (default): runs filtered to the given team_id (or the
-                               caller can pass team_id=None for legacy/no-team runs)
-    - scope="cross": runs across ALL teams; each row carries its team_id so
-                     the UI can tag which project each run belongs to.
-
-    Returns newest-first. Each row includes lightweight summary for the dropdown.
-    """
-    session = get_session()
-    try:
-        # Only include EvalRuns that actually have regression results
-        reg_run_ids = {r[0] for r in session.query(RegressionResult.run_id).distinct().all()}
-        q = session.query(EvalRun).filter(EvalRun.id.in_(reg_run_ids))
-        if scope == "same" and team_id:
-            q = q.filter(EvalRun.team_id == team_id)
-        rows = q.order_by(EvalRun.created_at.desc()).limit(limit).all()
-
-        options = []
-        for r in rows:
-            cases = session.query(RegressionResult).filter_by(run_id=r.id).all()
-            total = len(cases)
-            passed = sum(1 for c in cases if c.overall_pass)
-            rj = r.results_json or {}
-            options.append({
-                "run_id": r.id,
-                "team_id": getattr(r, "team_id", None),
-                "model": r.model or "",
-                "prompt_version": r.prompt_version or "v1",
-                "passed": passed,
-                "failed": total - passed,
-                "total": total,
-                "pass_rate": round(passed / total, 2) if total else 0.0,
-                "avg_latency_ms": rj.get("avg_latency_ms", r.avg_latency_ms) or 0.0,
-                "total_cost": r.total_cost or 0.0,
-                "started_at": r.created_at.isoformat() if r.created_at else None,
-            })
-        return {"scope": scope, "team_id": team_id, "options": options}
-    finally:
-        session.close()
-
-
-@app.get("/api/regression/ab/overlap")
-def ab_v2_overlap(run_a: str, run_b: str):
-    """
-    Return goldens present in BOTH runs, with per-side pass/fail flags so the
-    dropdown can render entries like `#007 · Code review · A:✗ B:✓`.
-    """
-    session = get_session()
-    try:
-        a_rows = {r.golden_case_id: r for r in session.query(RegressionResult).filter_by(run_id=run_a).all()}
-        b_rows = {r.golden_case_id: r for r in session.query(RegressionResult).filter_by(run_id=run_b).all()}
-        overlap_ids = sorted(set(a_rows.keys()) & set(b_rows.keys()))
-
-        items = []
-        for gid in overlap_ids:
-            golden = session.query(GoldenTestCase).filter_by(id=gid).first()
-            items.append({
-                "golden_id": gid,
-                "name": golden.name if golden else gid,
-                "complexity": golden.complexity if golden else "",
-                "side_a_pass": bool(a_rows[gid].overall_pass),
-                "side_b_pass": bool(b_rows[gid].overall_pass),
-                "side_a_similarity": a_rows[gid].semantic_similarity,
-                "side_b_similarity": b_rows[gid].semantic_similarity,
-            })
-        return {
-            "run_a": run_a, "run_b": run_b,
-            "overlap_count": len(overlap_ids),
-            "only_in_a": sorted(set(a_rows.keys()) - set(b_rows.keys())),
-            "only_in_b": sorted(set(b_rows.keys()) - set(a_rows.keys())),
-            "items": items,
-        }
-    finally:
-        session.close()
-
-
-class AbJudgeRequest(BaseModel):
-    run_a: str
-    run_b: str
-    golden_id: str
-    force_refresh: bool = False
-
-
-@app.post("/api/regression/ab/judge")
-async def ab_v2_judge(req: AbJudgeRequest):
-    """
-    Run (or fetch from cache) the adaptive pairwise LLM judge for one
-    golden across two runs. Uses claude-opus-4.7 by default (configurable
-    via LLM_RUBRIC_JUDGE_MODEL).
-
-    Cache key: (run_a, run_b, golden_id). Set force_refresh=True to recompute.
-    """
-    from src.evaluation.judge_ab import (
-        judge_ab, build_golden_input, build_side_input,
-    )
-    from src.config import config as app_config
-
-    session = get_session()
-    try:
-        # Short-circuit: fetch cached result if any and not forcing refresh
-        existing = session.query(ABJudgeResult).filter_by(
-            run_a=req.run_a, run_b=req.run_b, golden_id=req.golden_id,
-        ).first()
-        if existing and not req.force_refresh:
-            return {
-                "cached": True,
-                "judge_model": existing.judge_model,
-                "payload": existing.payload,
-                "cross_team": bool(existing.cross_team),
-                "team_a": existing.team_a, "team_b": existing.team_b,
-                "created_at": existing.created_at.isoformat() if existing.created_at else None,
-                "updated_at": existing.updated_at.isoformat() if existing.updated_at else None,
-            }
-
-        # Fetch the two RegressionResult rows
-        a_row = session.query(RegressionResult).filter_by(
-            run_id=req.run_a, golden_case_id=req.golden_id,
-        ).first()
-        b_row = session.query(RegressionResult).filter_by(
-            run_id=req.run_b, golden_case_id=req.golden_id,
-        ).first()
-        if not a_row:
-            raise HTTPException(404, f"No RegressionResult for run_a={req.run_a}, golden={req.golden_id}")
-        if not b_row:
-            raise HTTPException(404, f"No RegressionResult for run_b={req.run_b}, golden={req.golden_id}")
-
-        golden_row = session.query(GoldenTestCase).filter_by(id=req.golden_id).first()
-        if not golden_row:
-            raise HTTPException(404, f"Golden {req.golden_id} not found")
-
-        # Attach team_ids via EvalRun for cross-team flag
-        a_eval = session.query(EvalRun).filter_by(id=req.run_a).first()
-        b_eval = session.query(EvalRun).filter_by(id=req.run_b).first()
-        team_a = getattr(a_eval, "team_id", None) if a_eval else None
-        team_b = getattr(b_eval, "team_id", None) if b_eval else None
-        cross_team = bool(team_a and team_b and team_a != team_b)
-
-        # Build judge inputs
-        golden_input = build_golden_input(golden_row)
-        a_input = build_side_input("A", a_row, team_a or "")
-        b_input = build_side_input("B", b_row, team_b or "")
-    finally:
-        session.close()
-
-    # Run the judge (outside the session — long-running Opus call)
-    try:
-        payload = await judge_ab(golden_input, a_input, b_input)
-    except Exception as exc:
-        logger.exception("ab_v2_judge failed for run_a=%s run_b=%s golden=%s", req.run_a, req.run_b, req.golden_id)
-        raise HTTPException(500, f"LLM judge failed: {type(exc).__name__}: {exc}")
-
-    # Persist (upsert)
-    session = get_session()
-    try:
-        existing = session.query(ABJudgeResult).filter_by(
-            run_a=req.run_a, run_b=req.run_b, golden_id=req.golden_id,
-        ).first()
-        rs = payload.get("rubric_score", {}) or {}
-        fields = dict(
-            judge_model=app_config.llm.rubric_judge_model,
-            payload=payload,
-            winner=payload.get("winner"),
-            confidence=payload.get("confidence"),
-            rubric_score_a=rs.get("side_a"),
-            rubric_score_b=rs.get("side_b"),
-            cross_team=cross_team,
-            team_a=team_a, team_b=team_b,
-        )
-        if existing:
-            for k, v in fields.items():
-                setattr(existing, k, v)
-        else:
-            session.add(ABJudgeResult(
-                run_a=req.run_a, run_b=req.run_b, golden_id=req.golden_id,
-                **fields,
-            ))
-        session.commit()
-    finally:
-        session.close()
-
-    return {
-        "cached": False,
-        "judge_model": app_config.llm.rubric_judge_model,
-        "payload": payload,
-        "cross_team": cross_team,
-        "team_a": team_a, "team_b": team_b,
     }
 
 
@@ -3903,465 +4077,6 @@ def list_rag_queries(days: int = 30, limit: int = 100):
         return [_query_to_dict(r) for r in rows]
     finally:
         session.close()
-
-
-# ── No-Code Workflow Builder API ─────────────────────────────────
-#
-# LangFlow-style DAG builder.  Routes under /api/workflows/* — none of
-# the existing route prefixes collide.  The graph payload is stored as
-# JSON (matching React Flow's wire format) in `WorkflowDefinition.graph_json`
-# and executed server-side by `src.workflow.executor.WorkflowExecutor`.
-
-class _WorkflowCreate(BaseModel):
-    name: str
-    description: str = ""
-    graph: dict = Field(default_factory=dict)
-    team_id: Optional[str] = None
-
-
-class _WorkflowUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    graph: Optional[dict] = None
-
-
-class _WorkflowRunRequest(BaseModel):
-    mode: str = Field(..., description="ingest | query")
-    input: dict = Field(default_factory=dict)
-
-
-def _wf_row_to_dict(row: WorkflowDefinition, *, include_graph: bool = True) -> dict:
-    out = {
-        "id": row.id,
-        "name": row.name,
-        "description": row.description or "",
-        "team_id": row.team_id,
-        "is_active": bool(row.is_active),
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
-    }
-    if include_graph:
-        out["graph"] = row.graph_json or {"nodes": [], "edges": []}
-    return out
-
-
-def _wf_run_to_dict(row: WorkflowRun) -> dict:
-    return {
-        "id": row.id,
-        "workflow_id": row.workflow_id,
-        "mode": row.mode,
-        "status": row.status,
-        "input": row.input_json or {},
-        "output": row.output_json or {},
-        "node_log": row.node_log_json or [],
-        "error": row.error,
-        "duration_ms": row.duration_ms or 0,
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-    }
-
-
-@app.get("/api/workflows/catalog")
-def get_workflow_catalog():
-    """Return the node type catalogue for the frontend palette + inspector."""
-    from src.workflow.schema import NODE_TYPE_CATALOG, REQUIRED_DATA_KEYS
-    from src.rag.embeddings import EMBEDDING_MODELS
-    from src.rag.vectorstore import VECTOR_STORES
-    return {
-        "node_types": NODE_TYPE_CATALOG,
-        "required_fields": REQUIRED_DATA_KEYS,
-        "embedding_models": {k: v for k, v in EMBEDDING_MODELS.items()},
-        "vector_stores": VECTOR_STORES,
-        "chunk_strategies": ["recursive", "fixed", "semantic", "code"],
-        "source_types": ["text", "file", "url"],
-    }
-
-
-@app.get("/api/workflows")
-def list_workflows(team_id: Optional[str] = None):
-    """List workflows, optionally scoped to a team.
-
-    Matches the RAG pattern: rows with team_id IS NULL are visible to
-    everyone (shared) and team-tagged rows are only visible to matching
-    teams.
-    """
-    session = get_session()
-    try:
-        q = session.query(WorkflowDefinition)
-        if team_id:
-            q = q.filter(
-                (WorkflowDefinition.team_id == team_id)
-                | (WorkflowDefinition.team_id.is_(None))
-            )
-        rows = q.order_by(WorkflowDefinition.updated_at.desc()).all()
-        return [_wf_row_to_dict(r, include_graph=False) for r in rows]
-    finally:
-        session.close()
-
-
-@app.post("/api/workflows", status_code=201)
-def create_workflow(body: _WorkflowCreate):
-    from src.workflow.schema import validate_graph, GraphValidationError
-    # Allow empty graphs on create — UI saves a skeleton before any wiring.
-    if body.graph and (body.graph.get("nodes") or body.graph.get("edges")):
-        try:
-            validate_graph(body.graph)
-        except GraphValidationError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-    session = get_session()
-    try:
-        row = WorkflowDefinition(
-            name=body.name,
-            description=body.description or "",
-            graph_json=body.graph or {"nodes": [], "edges": []},
-            team_id=body.team_id,
-        )
-        session.add(row)
-        session.commit()
-        session.refresh(row)
-        return _wf_row_to_dict(row)
-    finally:
-        session.close()
-
-
-@app.get("/api/workflows/{workflow_id}")
-def get_workflow(workflow_id: str):
-    session = get_session()
-    try:
-        row = session.query(WorkflowDefinition).filter_by(id=workflow_id).first()
-        if not row:
-            raise HTTPException(status_code=404, detail="Workflow not found")
-        return _wf_row_to_dict(row)
-    finally:
-        session.close()
-
-
-@app.put("/api/workflows/{workflow_id}")
-def update_workflow(workflow_id: str, body: _WorkflowUpdate):
-    from src.workflow.schema import validate_graph, GraphValidationError
-    session = get_session()
-    try:
-        row = session.query(WorkflowDefinition).filter_by(id=workflow_id).first()
-        if not row:
-            raise HTTPException(status_code=404, detail="Workflow not found")
-        if body.name is not None:
-            row.name = body.name
-        if body.description is not None:
-            row.description = body.description
-        if body.graph is not None:
-            if body.graph.get("nodes") or body.graph.get("edges"):
-                try:
-                    validate_graph(body.graph)
-                except GraphValidationError as e:
-                    raise HTTPException(status_code=400, detail=str(e))
-            row.graph_json = body.graph
-        session.commit()
-        session.refresh(row)
-        return _wf_row_to_dict(row)
-    finally:
-        session.close()
-
-
-@app.delete("/api/workflows/{workflow_id}", status_code=204)
-def delete_workflow(workflow_id: str):
-    session = get_session()
-    try:
-        row = session.query(WorkflowDefinition).filter_by(id=workflow_id).first()
-        if not row:
-            raise HTTPException(status_code=404, detail="Workflow not found")
-        session.delete(row)
-        session.commit()
-        return None
-    finally:
-        session.close()
-
-
-# ── Vector store management (for workflow vector_store nodes) ─────
-#
-# These endpoints give the workflow Inspector a "Manage Collection" pane
-# without requiring a full ingest re-run. They wrap the same
-# `src.rag.vectorstore` factory the executor uses, so a collection opened
-# here is the same one the workflow writes/reads.
-
-
-class _VectorStoreQuery(BaseModel):
-    store_type: str = "chroma"
-    persist_dir: Optional[str] = None
-
-
-@app.get("/api/vectorstores/collections")
-def list_vs_collections(store_type: str = "chroma", persist_dir: Optional[str] = None):
-    from src.rag.vectorstore import list_collections
-    pd = persist_dir or os.getenv("WORKFLOW_PERSIST_DIR", "./data/workflow_vs")
-    try:
-        return {
-            "store_type": store_type,
-            "persist_dir": pd,
-            "collections": list_collections(store_type, persist_dir=pd),
-        }
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"list_collections failed: {e}")
-
-
-@app.get("/api/vectorstores/collections/{collection}")
-def get_vs_collection(
-    collection: str,
-    store_type: str = "chroma",
-    persist_dir: Optional[str] = None,
-):
-    """Return per-source counts + total row count for a collection."""
-    from src.rag.vectorstore import create_store
-    pd = persist_dir or os.getenv("WORKFLOW_PERSIST_DIR", "./data/workflow_vs")
-    try:
-        store = create_store(store_type=store_type, collection_id=collection, persist_dir=pd)
-        return {
-            "name": collection,
-            "store_type": store_type,
-            "persist_dir": pd,
-            "count": store.count(),
-            "sources": store.list_sources(),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"get_vs_collection failed: {e}")
-
-
-@app.delete("/api/vectorstores/collections/{collection}", status_code=204)
-def delete_vs_collection(
-    collection: str,
-    store_type: str = "chroma",
-    persist_dir: Optional[str] = None,
-):
-    """Drop an entire collection."""
-    from src.rag.vectorstore import create_store
-    pd = persist_dir or os.getenv("WORKFLOW_PERSIST_DIR", "./data/workflow_vs")
-    try:
-        store = create_store(store_type=store_type, collection_id=collection, persist_dir=pd)
-        store.delete_collection()
-        return None
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"delete_collection failed: {e}")
-
-
-@app.delete("/api/vectorstores/collections/{collection}/sources", status_code=200)
-def delete_vs_source(
-    collection: str,
-    source: str,
-    store_type: str = "chroma",
-    persist_dir: Optional[str] = None,
-):
-    """Delete every chunk whose ``metadata.source`` equals ``source``."""
-    from src.rag.vectorstore import create_store
-    pd = persist_dir or os.getenv("WORKFLOW_PERSIST_DIR", "./data/workflow_vs")
-    try:
-        store = create_store(store_type=store_type, collection_id=collection, persist_dir=pd)
-        removed = store.delete_by_source(source)
-        return {"removed": removed, "remaining": store.count()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"delete_by_source failed: {e}")
-
-
-@app.post("/api/workflows/{workflow_id}/run")
-async def run_workflow(workflow_id: str, body: _WorkflowRunRequest):
-    """Execute a workflow in ingest or query mode.
-
-    Runs synchronously (awaited) for v1 — the layered executor handles
-    parallel same-layer nodes internally.  For long ingests we'd add
-    SSE streaming later; v1 returns the full payload on completion.
-    """
-    from src.workflow.executor import WorkflowExecutor
-    from src.workflow.schema import GraphValidationError
-
-    if body.mode not in ("ingest", "query"):
-        raise HTTPException(status_code=400, detail="mode must be 'ingest' or 'query'")
-
-    session = get_session()
-    try:
-        row = session.query(WorkflowDefinition).filter_by(id=workflow_id).first()
-        if not row:
-            raise HTTPException(status_code=404, detail="Workflow not found")
-        graph = row.graph_json or {"nodes": [], "edges": []}
-    finally:
-        session.close()
-
-    executor = WorkflowExecutor()
-    try:
-        result = await executor.execute(graph, mode=body.mode, user_input=body.input)
-    except GraphValidationError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        # Any runtime error → record a failed run row + propagate 500 so
-        # the UI can surface a banner.
-        _persist_workflow_run(
-            workflow_id=workflow_id, mode=body.mode, input_json=body.input,
-            output_json={}, node_log=[], status="error",
-            error=str(e), duration_ms=0,
-        )
-        raise HTTPException(status_code=500, detail=f"workflow execution failed: {e}")
-
-    run_row = _persist_workflow_run(
-        workflow_id=workflow_id, mode=body.mode, input_json=body.input,
-        output_json=result.get("output") or {},
-        node_log=result.get("node_log") or [],
-        status=result["status"],
-        error=result.get("error"),
-        duration_ms=result.get("duration_ms", 0),
-    )
-    return {"run_id": run_row["id"], **result}
-
-
-@app.post("/api/workflows/{workflow_id}/run/stream")
-async def run_workflow_stream(workflow_id: str, body: _WorkflowRunRequest):
-    """Execute a workflow with live-trajectory SSE events.
-
-    The executor pushes ``run_start / node_start / node_end / run_end``
-    events as they happen; the UI renders node colours + edge animation
-    in real time instead of waiting for the full response.  On
-    completion we persist the same ``WorkflowRun`` row as the non-stream
-    sibling so the History / Trajectory view stays consistent.
-    """
-    from src.workflow.executor import WorkflowExecutor
-    from src.workflow.schema import GraphValidationError
-
-    if body.mode not in ("ingest", "query"):
-        raise HTTPException(status_code=400, detail="mode must be 'ingest' or 'query'")
-
-    session = get_session()
-    try:
-        row = session.query(WorkflowDefinition).filter_by(id=workflow_id).first()
-        if not row:
-            raise HTTPException(status_code=404, detail="Workflow not found")
-        graph = row.graph_json or {"nodes": [], "edges": []}
-    finally:
-        session.close()
-
-    # Bridge: executor's `on_event` callback pushes into an asyncio.Queue,
-    # the SSE generator drains the queue.  `None` sentinel = stream end.
-    queue: "asyncio.Queue[Optional[dict]]" = asyncio.Queue()
-
-    async def _emit(evt: dict) -> None:
-        # _json_safe strips live Chunk / store-handle objects from the
-        # preview so they can be JSON-encoded for SSE.
-        await queue.put(_json_safe(evt))
-
-    async def _run() -> None:
-        executor = WorkflowExecutor()
-        try:
-            result = await executor.execute(
-                graph, mode=body.mode, user_input=body.input, on_event=_emit,
-            )
-            run_row = _persist_workflow_run(
-                workflow_id=workflow_id, mode=body.mode, input_json=body.input,
-                output_json=result.get("output") or {},
-                node_log=result.get("node_log") or [],
-                status=result["status"],
-                error=result.get("error"),
-                duration_ms=result.get("duration_ms", 0),
-            )
-            await queue.put({"event": "run_persisted", "run_id": run_row["id"]})
-        except GraphValidationError as e:
-            await queue.put({"event": "run_end", "status": "error", "error": str(e)})
-        except Exception as e:
-            _persist_workflow_run(
-                workflow_id=workflow_id, mode=body.mode, input_json=body.input,
-                output_json={}, node_log=[], status="error",
-                error=str(e), duration_ms=0,
-            )
-            await queue.put({"event": "run_end", "status": "error", "error": str(e)})
-        finally:
-            await queue.put(None)
-
-    async def event_generator():
-        task = asyncio.create_task(_run())
-        try:
-            while True:
-                evt = await queue.get()
-                if evt is None:
-                    break
-                yield _sse_event(evt.get("event", "message"), evt)
-            yield _sse_event("done", {})
-        finally:
-            if not task.done():
-                task.cancel()
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-@app.get("/api/workflows/{workflow_id}/runs")
-def list_workflow_runs(workflow_id: str, limit: int = 50):
-    session = get_session()
-    try:
-        rows = (
-            session.query(WorkflowRun)
-            .filter_by(workflow_id=workflow_id)
-            .order_by(WorkflowRun.created_at.desc())
-            .limit(max(1, min(limit, 500)))
-            .all()
-        )
-        return [_wf_run_to_dict(r) for r in rows]
-    finally:
-        session.close()
-
-
-def _persist_workflow_run(
-    *, workflow_id: str, mode: str, input_json: dict, output_json: dict,
-    node_log: list, status: str, error: Optional[str], duration_ms: int,
-) -> dict:
-    session = get_session()
-    try:
-        row = WorkflowRun(
-            workflow_id=workflow_id,
-            mode=mode,
-            status=status,
-            input_json=input_json or {},
-            output_json=_json_safe(output_json or {}),
-            node_log_json=_json_safe(node_log or []),
-            error=error,
-            duration_ms=int(duration_ms or 0),
-        )
-        session.add(row)
-        session.commit()
-        session.refresh(row)
-        return _wf_run_to_dict(row)
-    finally:
-        session.close()
-
-
-def _json_safe(value):
-    """Strip non-JSON-serialisable objects (Chunks, store handles) from run outputs.
-
-    The executor returns live Chunk objects / store handles in a couple of
-    intermediate node payloads — fine for in-process use but those can't
-    be JSON-encoded for DB storage or the HTTP response.  We keep
-    primitives + dict/list recursion and stringify everything else.
-    """
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    if isinstance(value, dict):
-        return {k: _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
-    if hasattr(value, "text") and hasattr(value, "source"):
-        # src.rag.chunker.Chunk dataclass
-        return {
-            "text": value.text[:500],
-            "source": value.source,
-            "chunk_index": getattr(value, "chunk_index", 0),
-        }
-    if hasattr(value, "text") and hasattr(value, "score"):
-        # src.rag.vectorstore.SearchResult dataclass
-        return {
-            "text": value.text[:500],
-            "source": value.source,
-            "score": float(value.score),
-            "chunk_index": getattr(value, "chunk_index", 0),
-        }
-    return str(value)[:500]
 
 
 if __name__ == "__main__":

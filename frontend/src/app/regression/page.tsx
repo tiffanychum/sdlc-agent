@@ -79,11 +79,12 @@ const DEEPEVAL_METRICS = [
 ];
 
 const STRAT_INFO: Record<string, { label: string; desc: string; cls: string }> = {
-  router_decides: { label: "Router Decides", desc: "LLM routes to one agent per request", cls: "bg-blue-50 text-blue-700 border-blue-200" },
-  sequential:     { label: "Sequential",     desc: "Agents execute in a fixed pipeline order", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" },
-  parallel:       { label: "Parallel",       desc: "All agents run simultaneously", cls: "bg-amber-50 text-amber-700 border-amber-200" },
-  supervisor:     { label: "Supervisor",     desc: "Supervisor dynamically delegates between agents", cls: "bg-violet-50 text-violet-700 border-violet-200" },
-  auto:           { label: "Auto",           desc: "Meta-router AI picks strategy per request", cls: "bg-orange-50 text-orange-700 border-orange-200" },
+  router_decides:        { label: "Router Decides",        desc: "LLM routes to one agent per request", cls: "bg-blue-50 text-blue-700 border-blue-200" },
+  sequential:            { label: "Sequential",            desc: "Agents execute in a fixed pipeline order", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" },
+  parallel:              { label: "Parallel",              desc: "All agents run simultaneously", cls: "bg-amber-50 text-amber-700 border-amber-200" },
+  supervisor:            { label: "Supervisor",            desc: "Supervisor dynamically delegates between agents", cls: "bg-violet-50 text-violet-700 border-violet-200" },
+  parallel_coordinator:  { label: "Coordinator",           desc: "Coordinator picks subset → parallel → finalizer", cls: "bg-cyan-50 text-cyan-700 border-cyan-200" },
+  auto:                  { label: "Auto",                  desc: "Meta-router AI picks strategy per request", cls: "bg-orange-50 text-orange-700 border-orange-200" },
 };
 
 // ── Main Page ────────────────────────────────────────────────────────────────
@@ -100,6 +101,11 @@ export default function RegressionPage() {
   // golden dataset
   const [goldenCases, setGoldenCases] = useState<any[]>([]);
   const [expandedCaseId, setExpandedCaseId] = useState<string | null>(null);
+  // Dataset group filter — reads team subscriptions from /api/regression/groups.
+  // "all" = no filter (legacy behaviour); a specific tag (e.g. "finance_v1") =
+  // only cases in that group.
+  const [datasetGroups, setDatasetGroups] = useState<{ group: string; count: number; teams_subscribed: string[] }[]>([]);
+  const [datasetGroupFilter, setDatasetGroupFilter] = useState<string>("all");
 
   // run tests — default model: claude-sonnet-4-6
   const [regModels, setRegModels] = useState<Set<string>>(new Set(["claude-sonnet-4-6"]));
@@ -321,6 +327,10 @@ export default function RegressionPage() {
     try { const c = await api.golden.list(); setGoldenCases(c); } catch { /* ignore */ }
   }, []);
 
+  const loadDatasetGroups = useCallback(async () => {
+    try { const g = await api.regression.groups(); setDatasetGroups(g); } catch { /* ignore */ }
+  }, []);
+
   const loadRegRuns = useCallback(async () => {
     try { const r = await api.regression.runs(teamId || undefined); setRegRuns(r); } catch { /* ignore */ }
   }, [teamId]);
@@ -329,11 +339,13 @@ export default function RegressionPage() {
 
   const loadPerfReport = useCallback(async (days: number) => {
     try {
-      const res = await fetch(`${API_BASE}/api/traces/performance-report?days=${days}`);
-      setPerfReport(await res.json());
+      // Scope the perf report to the active team so the Performance
+      // Analysis sub-tab matches the team selector at the top.
+      const data = await api.traces.perfReport(days, teamId || undefined);
+      setPerfReport(data);
       setExpandedAnomalies(new Set());
     } catch { /* ignore */ }
-  }, [API_BASE]);
+  }, [teamId]);
 
   const loadRegressionInsights = useCallback(async () => {
     try {
@@ -524,7 +536,8 @@ export default function RegressionPage() {
   useEffect(() => {
     loadGolden();
     loadRegRuns();
-  }, [loadGolden, loadRegRuns]);
+    loadDatasetGroups();
+  }, [loadGolden, loadRegRuns, loadDatasetGroups]);
 
   // Refresh run history when the active session finishes
   useEffect(() => {
@@ -558,6 +571,10 @@ export default function RegressionPage() {
       prompt_version: !hasPvByRole ? (globalVersion || "v1") : "v1",
       prompt_versions_by_role: hasPvByRole ? pvByRole : undefined,
       baseline_run_id: regBaselineRunId || undefined,
+      // Pass the dataset-group filter when the user explicitly picked one;
+      // when "all" is selected we let the backend fall back to the team's
+      // configured ``dataset_groups`` (or no filter at all).
+      dataset_groups: datasetGroupFilter !== "all" ? [datasetGroupFilter] : undefined,
     };
 
     try {
@@ -694,11 +711,18 @@ export default function RegressionPage() {
 
   const filteredCases = useMemo(() => {
     const q = caseSearch.toLowerCase();
-    return goldenCases.filter(c => c.is_active && (
-      !q || c.name.toLowerCase().includes(q) || c.id.toLowerCase().includes(q) ||
-      (c.expected_agent || "").toLowerCase().includes(q) || c.prompt.toLowerCase().includes(q)
-    ));
-  }, [goldenCases, caseSearch]);
+    return goldenCases.filter(c => {
+      if (!c.is_active) return false;
+      if (datasetGroupFilter !== "all" && (c.dataset_group || "default") !== datasetGroupFilter) return false;
+      if (!q) return true;
+      return (
+        c.name.toLowerCase().includes(q) ||
+        c.id.toLowerCase().includes(q) ||
+        (c.expected_agent || "").toLowerCase().includes(q) ||
+        c.prompt.toLowerCase().includes(q)
+      );
+    });
+  }, [goldenCases, caseSearch, datasetGroupFilter]);
 
   const sortedRuns = useMemo(() => {
     const q = runsSearch.toLowerCase();
@@ -936,6 +960,19 @@ export default function RegressionPage() {
                   </span>
                 </div>
                 <div className="flex items-center gap-2">
+                  <select
+                    value={datasetGroupFilter}
+                    onChange={e => setDatasetGroupFilter(e.target.value)}
+                    className="input !py-1 !px-2 text-[11px] !w-44"
+                    title="Filter golden cases by dataset group (e.g. sdlc_v2, finance_v1)"
+                  >
+                    <option value="all">All groups</option>
+                    {datasetGroups.map(g => (
+                      <option key={g.group} value={g.group}>
+                        {g.group} ({g.count})
+                      </option>
+                    ))}
+                  </select>
                   <input value={caseSearch} onChange={e => setCaseSearch(e.target.value)} placeholder="Search cases…"
                     className="input !py-1 !px-2 text-[11px] !w-44" />
                   <button onClick={() => {
@@ -982,7 +1019,14 @@ export default function RegressionPage() {
                     <div className="min-w-0">
                       <div className="font-medium truncate">{c.name}</div>
                       <div className="text-[10px] text-[var(--text-muted)] truncate">{c.prompt}</div>
-                      <div className="text-[10px] text-[var(--text-muted)] font-mono">{c.id}</div>
+                      <div className="text-[10px] text-[var(--text-muted)] font-mono flex items-center gap-1.5">
+                        <span>{c.id}</span>
+                        {c.dataset_group && c.dataset_group !== "default" && (
+                          <span className="px-1 rounded bg-zinc-100 text-zinc-600 border border-zinc-200" title="Dataset group">
+                            {c.dataset_group}
+                          </span>
+                        )}
+                      </div>
                     </div>
                     <div className="text-center">
                       {c.strategy ? (

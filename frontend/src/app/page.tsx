@@ -8,6 +8,7 @@ const TEAM_STRATEGIES = [
   { v: "sequential", l: "Sequential", d: "Agents run in order" },
   { v: "parallel", l: "Parallel", d: "All agents run at once" },
   { v: "supervisor", l: "Supervisor", d: "Supervisor delegates and reviews" },
+  { v: "parallel_coordinator", l: "Coordinator", d: "Coordinator picks pool → parallel → finalizer" },
   { v: "auto", l: "Auto", d: "AI picks the best strategy per request" },
 ];
 
@@ -300,29 +301,27 @@ export default function StudioPage() {
 
   useEffect(() => { load(); }, []);
 
-  // Re-fetch the routing-prompt panel whenever the active team changes so
-  // supervisor/router rows show the team-scoped versions (Patch 5).  Each
-  // team has its own supervisor/router rows in the registry; meta_router is
-  // global but the endpoint still returns it here for a single combined view.
+  // Re-fetch the prompt-version map whenever the active team changes so the
+  // role dropdowns surface team-scoped versions (e.g. finance_team v1/v2).
   useEffect(() => {
     if (!team?.id) return;
-    api.prompts.routing(team.id)
-      .then(routing => {
-        if (routing?.routing) setRoutingPrompts(routing.routing);
-      })
-      .catch(() => { /* ignore — panel keeps previous state */ });
+    api.prompts.versions(undefined, team.id)
+      .then(res => { if (res?.roles) setAgentVersions(res.roles); })
+      .catch(() => {});
   }, [team?.id]);
 
   async function load() {
-    const [t, s, tl, models, llmCfg, allVersions] = await Promise.all([
+    const [t, s, tl, models, llmCfg, allVersions, routing] = await Promise.all([
       refreshTeams(), api.skills.list(), api.tools.list(),
       api.models.list(), api.config.llm(),
       api.prompts.versions().catch(() => ({ roles: {} })),
+      fetch("/api/prompts/routing").then(r => r.json()).catch(() => ({ routing: {} })),
     ]);
     setSkills(s); setTools(tl);
     setAvailableModels(models);
     setDefaultModelName(llmCfg.default_model_name || llmCfg.default_model || "from .env");
     if (allVersions?.roles) setAgentVersions(allVersions.roles);
+    if (routing?.routing) setRoutingPrompts(routing.routing);
     if (t.length > 0 && !team) {
       // Prefer whatever the global context was already showing so navigation
       // from another page keeps the same team active here.
@@ -341,32 +340,35 @@ export default function StudioPage() {
   }
 
   // ── Prompt versions per agent role ──────────────────────────────
+  // Always pass the active team id so the registry returns the
+  // team-scoped versions first (e.g. finance_team's market_analyst v1/v2)
+  // and falls back to global rows only when the team has none.
   const loadVersionsForRole = useCallback(async (role: string, force = false) => {
     if (!role || (agentVersions[role] && !force)) return;
     try {
-      const res = await api.prompts.versions(role);
+      const res = await api.prompts.versions(role, team?.id);
       const versions = res?.versions || [];
       setAgentVersions(prev => ({ ...prev, [role]: versions }));
     } catch {
       setAgentVersions(prev => ({ ...prev, [role]: [] }));
     }
-  }, [agentVersions]);
+  }, [agentVersions, team?.id]);
 
   const loadPromptText = useCallback(async (role: string, version: string) => {
-    const key = `${role}::${version}`;
+    const key = `${team?.id || ""}::${role}::${version}`;
     if (promptTextCacheRef.current[key]) {
       setViewingPrompt(prev => ({ ...prev, [role]: promptTextCacheRef.current[key] }));
       return;
     }
     try {
-      const res = await api.prompts.text(role, version);
+      const res = await api.prompts.text(role, version, team?.id);
       const txt = res?.text || "(empty)";
       setPromptTextCache(prev => ({ ...prev, [key]: txt }));
       setViewingPrompt(prev => ({ ...prev, [role]: txt }));
     } catch {
       setViewingPrompt(prev => ({ ...prev, [role]: "(failed to load)" }));
     }
-  }, []);
+  }, [team?.id]);
 
   // ── Team operations ──────────────────────────────────────────────
   async function selectTeam(id: string) {
@@ -472,12 +474,12 @@ export default function StudioPage() {
     if (!version) return;
     setSavingRouting(role);
     try {
-      // Scope the activation to the current team.  For supervisor/router
-      // this flips is_active only on that team's rows; for meta_router the
-      // backend silently ignores team_id and flips the global row.
-      const tid = team?.id || undefined;
-      await api.prompts.setRoutingVersion(role, version, tid);
-      const routing = await api.prompts.routing(tid).catch(() => ({ routing: {} }));
+      await fetch(`/api/prompts/routing/${role}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version }),
+      });
+      const routing = await fetch("/api/prompts/routing").then(r => r.json()).catch(() => ({ routing: {} }));
       if (routing?.routing) setRoutingPrompts(routing.routing);
       setRoutingPendingVersion(prev => { const n = { ...prev }; delete n[role]; return n; });
     } finally {

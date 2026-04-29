@@ -125,29 +125,12 @@ class AgentEvaluator:
 
             task.completed = self._check_success(task.final_response, scenario)
 
-            # ── G-Eval (LLM-as-Judge with CoT + Per-Criterion) ──
-            if self.use_llm_judge and task.final_response:
-                try:
-                    from src.evaluation.llm_judge import judge_response, judge_trajectory
-
-                    geval_result = await judge_response(
-                        user_prompt=scenario.prompt,
-                        agent_response=task.final_response,
-                        tool_calls=[{"tool": tc.tool_name, "args": tc.arguments} for tc in task.tool_calls],
-                        tool_outputs=task.tool_outputs,
-                    )
-                    task.llm_judge_scores = geval_result
-
-                    trajectory_result = await judge_trajectory(
-                        user_prompt=scenario.prompt,
-                        trace_steps=trace_steps,
-                        final_response=task.final_response,
-                    )
-                    task.trajectory_scores = trajectory_result
-
-                except Exception:
-                    task.llm_judge_scores = {}
-                    task.trajectory_scores = {}
+            # G-Eval (custom LLM-as-Judge with CoT) removed — DeepEval is now
+            # the single source of truth. `llm_judge_scores` and
+            # `trajectory_scores` remain on the metric for backward
+            # compatibility with old serialized runs but stay empty here.
+            task.llm_judge_scores = {}
+            task.trajectory_scores = {}
 
             # ── DeepEval Metrics ──
             if self.use_deepeval and task.final_response:
