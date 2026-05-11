@@ -13,6 +13,7 @@ const NAV = [
   { href: "/", label: "Studio" },
   { href: "/chat", label: "Chat" },
   { href: "/rag", label: "RAG" },
+  { href: "/workflow", label: "Workflow" },
   { href: "/monitoring", label: "Monitoring" },
   { href: "/regression", label: "Regression" },
   { href: "/evaluation", label: "Evaluation" },

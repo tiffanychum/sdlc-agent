@@ -132,6 +132,13 @@ def _migrate(engine):
                 conn.execute(text("ALTER TABLE agents ADD COLUMN prompt_version TEXT DEFAULT 'v1'"))
             conn.commit()
 
+    if "workflow_definitions" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("workflow_definitions")}
+        with engine.connect() as conn:
+            if "is_active" not in cols:
+                conn.execute(text("ALTER TABLE workflow_definitions ADD COLUMN is_active BOOLEAN DEFAULT 1"))
+            conn.commit()
+
 
 def get_session() -> Session:
     engine = get_engine()
